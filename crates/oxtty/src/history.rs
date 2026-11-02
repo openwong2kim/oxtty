@@ -812,9 +812,9 @@ impl Out<'_> {
         self.word(u32::from_le_bytes(bytes), len);
     }
 
-    /// Writes a run header (two bytes for the unit count after the kind and
-    /// the attributes that changed from the previous run) and returns where
-    /// it starts.
+    /// Writes a run header (kind, two bytes for the unit count, the
+    /// attributes that changed from the previous run) and returns where it
+    /// starts.
     #[inline(always)]
     fn head(&mut self, prev: &mut (Color, Color, Flags), key: (Color, Color, Flags)) -> usize {
         let head = self.at;
@@ -848,7 +848,7 @@ impl Out<'_> {
 /// branches: in mixed text the kind and the length change all the time.
 #[inline(always)]
 fn unit(c: char, wide: bool) -> (u32, usize) {
-    let (n, w) = (c as u32, (wide as u32) << 5);
+    let (n, w) = (c as u32, if wide { WIDE as u32 } else { 0 });
     // The marked first byte goes first, then the rest of the character, highest byte first. Below U+2000 the
     // first of the three bytes is the marker alone, and the other two are the two-byte form but for its marker.
     let three = ((UNIT_3 as u32 | w) << 16 | n).swap_bytes() >> 8;
@@ -1026,6 +1026,13 @@ fn encode(
         return out.at;
     }
     out.at = head;
+    runs(cells, out, extras)
+}
+
+/// `encode` for the other rows: the runs of `cells` from `out.at` on.
+#[inline(never)]
+fn runs(cells: &[Cell], mut out: Out, extras: &mut Vec<(u16, Arc<CellExtra>)>) -> usize {
+    let scan = cells.len();
     let mut prev = (DEFAULT_FG, DEFAULT_BG, Flags::empty());
     let mut start = 0;
     while start < scan {
