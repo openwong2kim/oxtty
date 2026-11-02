@@ -240,8 +240,36 @@ fn color(out: &mut String, value: Color, foreground: bool) {
     }
 }
 
-fn style(cell: &Cell) -> String {
-    let mut out = String::from("\x1b[0");
+/// The attributes [`style`] writes. Cells with the same pen get the same SGR.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Pen {
+    flags: Flags,
+    fg: Color,
+    bg: Color,
+    underline: Option<Color>,
+}
+
+impl Pen {
+    fn of(cell: &Cell) -> Self {
+        let sgr = Flags::BOLD
+            | Flags::DIM
+            | Flags::ITALIC
+            | Flags::BLINK
+            | Flags::INVERSE
+            | Flags::HIDDEN
+            | Flags::STRIKEOUT
+            | Flags::ALL_UNDERLINES;
+        Self {
+            flags: cell.flags & sgr,
+            fg: cell.fg,
+            bg: cell.bg,
+            underline: cell.underline_color(),
+        }
+    }
+}
+
+fn style(out: &mut String, cell: &Cell) {
+    out.push_str("\x1b[0");
     for (flag, code) in [
         (Flags::BOLD, 1),
         (Flags::DIM, 2),
@@ -271,8 +299,8 @@ fn style(cell: &Cell) -> String {
     if let Some(kind) = underline {
         let _ = write!(out, ";4:{kind}");
     }
-    color(&mut out, cell.fg, true);
-    color(&mut out, cell.bg, false);
+    color(out, cell.fg, true);
+    color(out, cell.bg, false);
     if let Some(value) = cell.underline_color() {
         match value {
             Color::Spec(rgb) => {
@@ -285,7 +313,6 @@ fn style(cell: &Cell) -> String {
         }
     }
     out.push('m');
-    out
 }
 
 /// Opens `link` or closes the open one. A program's own id is kept so separate runs of one
@@ -325,7 +352,7 @@ fn cursor(out: &mut String, grid: &Grid<Cell>) {
     // CUP clears the pending wrap at line end, so rewrite the edge cell to restore that state.
     if grid.cursor.input_needs_wrap {
         let cell = &grid[point.line][Column(col)];
-        out.push_str(&style(cell));
+        style(out, cell);
         let edge = cell.hyperlink();
         if edge.is_some() {
             link(out, edge.as_ref());
@@ -335,7 +362,7 @@ fn cursor(out: &mut String, grid: &Grid<Cell>) {
             link(out, None);
         }
     }
-    out.push_str(&style(&grid.cursor.template));
+    style(out, &grid.cursor.template);
     // The program may be in the middle of writing a link.
     if let Some(open) = grid.cursor.template.hyperlink() {
         link(out, Some(&open));
@@ -354,17 +381,28 @@ fn erased(cell: &Cell) -> bool {
 
 /// Writes rows one after another, keeping the pen and link between them.
 struct Rows {
+    /// The pen of the last SGR written; `None` writes the next one.
+    previous_pen: Option<Pen>,
     previous_style: String,
+    /// Where the next SGR is built, to compare with the last one.
+    next_style: String,
     previous_link: Option<Hyperlink>,
     columns: usize,
 }
 
 impl Rows {
     fn pen(&mut self, out: &mut String, cell: &Cell) {
-        let next_style = style(cell);
-        if next_style != self.previous_style {
-            out.push_str(&next_style);
-            self.previous_style = next_style;
+        let pen = Pen::of(cell);
+        if self.previous_pen == Some(pen) {
+            return;
+        }
+        self.previous_pen = Some(pen);
+        // Pens can differ and still write the same SGR (colours it leaves out).
+        self.next_style.clear();
+        style(&mut self.next_style, cell);
+        if self.next_style != self.previous_style {
+            out.push_str(&self.next_style);
+            std::mem::swap(&mut self.next_style, &mut self.previous_style);
         }
     }
 
@@ -433,6 +471,7 @@ impl Rows {
                 // Clear attributes before scrolling. Otherwise a colored blank template
                 // paints cells outside the serialized content.
                 out.push_str("\x1b[0m\r\n");
+                self.previous_pen = None;
                 self.previous_style.clear();
             }
             return;
@@ -465,7 +504,9 @@ impl Rows {
 /// are left out.
 fn screen(out: &mut String, grid: &Grid<Cell>, older: Option<&History>, skip: usize) {
     let mut rows = Rows {
+        previous_pen: None,
         previous_style: String::new(),
+        next_style: String::new(),
         previous_link: None,
         columns: grid.columns(),
     };
