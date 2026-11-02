@@ -1598,7 +1598,8 @@ where
             }
         }
 
-        // oxtty: cursor position and scrolling region, the commonest, without the parameter iterator.
+        // oxtty: cursor position, scrolling region and short SGRs, the commonest, without the parameter
+        // iterator.
         if let (Some([first, second]), []) = (params.two(), intermediates) {
             let or = |param: u16, default: u16| if param == 0 { default } else { param };
             match action {
@@ -1611,6 +1612,15 @@ where
                 },
                 'r' => {
                     self.handler.set_scrolling_region(or(first, 1) as usize, (second != 0).then_some(second as usize));
+                    return;
+                },
+                // The colors 38, 48 and 58 take the parameters after them.
+                'm' if ![first, second].iter().any(|param| matches!(param, 38 | 48 | 58)) => {
+                    for &param in &[first, second][..params.len().max(1)] {
+                        if let Some(attr) = sgr_attr(param) {
+                            self.handler.terminal_attribute(attr);
+                        }
+                    }
                     return;
                 },
                 _ => (),
@@ -1898,57 +1908,22 @@ where
 fn attrs_from_sgr_parameters<H: Handler>(handler: &mut H, params: &mut ParamsIter<'_>) {
     while let Some(param) = params.next() {
         let attr = match param {
-            [0] => Some(Attr::Reset),
-            [1] => Some(Attr::Bold),
-            [2] => Some(Attr::Dim),
-            [3] => Some(Attr::Italic),
             [4, 0] => Some(Attr::CancelUnderline),
             [4, 2] => Some(Attr::DoubleUnderline),
             [4, 3] => Some(Attr::Undercurl),
             [4, 4] => Some(Attr::DottedUnderline),
             [4, 5] => Some(Attr::DashedUnderline),
             [4, ..] => Some(Attr::Underline),
-            [5] => Some(Attr::BlinkSlow),
-            [6] => Some(Attr::BlinkFast),
-            [7] => Some(Attr::Reverse),
-            [8] => Some(Attr::Hidden),
-            [9] => Some(Attr::Strike),
-            [21] => Some(Attr::CancelBold),
-            [22] => Some(Attr::CancelBoldDim),
-            [23] => Some(Attr::CancelItalic),
-            [24] => Some(Attr::CancelUnderline),
-            [25] => Some(Attr::CancelBlink),
-            [27] => Some(Attr::CancelReverse),
-            [28] => Some(Attr::CancelHidden),
-            [29] => Some(Attr::CancelStrike),
-            [30] => Some(Attr::Foreground(Color::Named(NamedColor::Black))),
-            [31] => Some(Attr::Foreground(Color::Named(NamedColor::Red))),
-            [32] => Some(Attr::Foreground(Color::Named(NamedColor::Green))),
-            [33] => Some(Attr::Foreground(Color::Named(NamedColor::Yellow))),
-            [34] => Some(Attr::Foreground(Color::Named(NamedColor::Blue))),
-            [35] => Some(Attr::Foreground(Color::Named(NamedColor::Magenta))),
-            [36] => Some(Attr::Foreground(Color::Named(NamedColor::Cyan))),
-            [37] => Some(Attr::Foreground(Color::Named(NamedColor::White))),
             [38] => {
                 let mut iter = params.map(|param| param[0]);
                 parse_sgr_color(&mut iter).map(Attr::Foreground)
             },
             [38, params @ ..] => handle_colon_rgb(params).map(Attr::Foreground),
-            [39] => Some(Attr::Foreground(Color::Named(NamedColor::Foreground))),
-            [40] => Some(Attr::Background(Color::Named(NamedColor::Black))),
-            [41] => Some(Attr::Background(Color::Named(NamedColor::Red))),
-            [42] => Some(Attr::Background(Color::Named(NamedColor::Green))),
-            [43] => Some(Attr::Background(Color::Named(NamedColor::Yellow))),
-            [44] => Some(Attr::Background(Color::Named(NamedColor::Blue))),
-            [45] => Some(Attr::Background(Color::Named(NamedColor::Magenta))),
-            [46] => Some(Attr::Background(Color::Named(NamedColor::Cyan))),
-            [47] => Some(Attr::Background(Color::Named(NamedColor::White))),
             [48] => {
                 let mut iter = params.map(|param| param[0]);
                 parse_sgr_color(&mut iter).map(Attr::Background)
             },
             [48, params @ ..] => handle_colon_rgb(params).map(Attr::Background),
-            [49] => Some(Attr::Background(Color::Named(NamedColor::Background))),
             [58] => {
                 let mut iter = params.map(|param| param[0]);
                 parse_sgr_color(&mut iter).map(|color| Attr::UnderlineColor(Some(color)))
@@ -1956,23 +1931,7 @@ fn attrs_from_sgr_parameters<H: Handler>(handler: &mut H, params: &mut ParamsIte
             [58, params @ ..] => {
                 handle_colon_rgb(params).map(|color| Attr::UnderlineColor(Some(color)))
             },
-            [59] => Some(Attr::UnderlineColor(None)),
-            [90] => Some(Attr::Foreground(Color::Named(NamedColor::BrightBlack))),
-            [91] => Some(Attr::Foreground(Color::Named(NamedColor::BrightRed))),
-            [92] => Some(Attr::Foreground(Color::Named(NamedColor::BrightGreen))),
-            [93] => Some(Attr::Foreground(Color::Named(NamedColor::BrightYellow))),
-            [94] => Some(Attr::Foreground(Color::Named(NamedColor::BrightBlue))),
-            [95] => Some(Attr::Foreground(Color::Named(NamedColor::BrightMagenta))),
-            [96] => Some(Attr::Foreground(Color::Named(NamedColor::BrightCyan))),
-            [97] => Some(Attr::Foreground(Color::Named(NamedColor::BrightWhite))),
-            [100] => Some(Attr::Background(Color::Named(NamedColor::BrightBlack))),
-            [101] => Some(Attr::Background(Color::Named(NamedColor::BrightRed))),
-            [102] => Some(Attr::Background(Color::Named(NamedColor::BrightGreen))),
-            [103] => Some(Attr::Background(Color::Named(NamedColor::BrightYellow))),
-            [104] => Some(Attr::Background(Color::Named(NamedColor::BrightBlue))),
-            [105] => Some(Attr::Background(Color::Named(NamedColor::BrightMagenta))),
-            [106] => Some(Attr::Background(Color::Named(NamedColor::BrightCyan))),
-            [107] => Some(Attr::Background(Color::Named(NamedColor::BrightWhite))),
+            &[value] => sgr_attr(value),
             _ => None,
         };
 
@@ -1980,6 +1939,68 @@ fn attrs_from_sgr_parameters<H: Handler>(handler: &mut H, params: &mut ParamsIte
             Some(attr) => handler.terminal_attribute(attr),
             None => continue,
         }
+    }
+}
+
+/// The attribute of an SGR parameter without sub-parameters, other than the colors 38, 48 and 58 that take the
+/// parameters after them (oxtty: shared with the direct path in `csi_dispatch`).
+#[inline]
+fn sgr_attr(value: u16) -> Option<Attr> {
+    match value {
+        0 => Some(Attr::Reset),
+        1 => Some(Attr::Bold),
+        2 => Some(Attr::Dim),
+        3 => Some(Attr::Italic),
+        4 => Some(Attr::Underline),
+        5 => Some(Attr::BlinkSlow),
+        6 => Some(Attr::BlinkFast),
+        7 => Some(Attr::Reverse),
+        8 => Some(Attr::Hidden),
+        9 => Some(Attr::Strike),
+        21 => Some(Attr::CancelBold),
+        22 => Some(Attr::CancelBoldDim),
+        23 => Some(Attr::CancelItalic),
+        24 => Some(Attr::CancelUnderline),
+        25 => Some(Attr::CancelBlink),
+        27 => Some(Attr::CancelReverse),
+        28 => Some(Attr::CancelHidden),
+        29 => Some(Attr::CancelStrike),
+        30 => Some(Attr::Foreground(Color::Named(NamedColor::Black))),
+        31 => Some(Attr::Foreground(Color::Named(NamedColor::Red))),
+        32 => Some(Attr::Foreground(Color::Named(NamedColor::Green))),
+        33 => Some(Attr::Foreground(Color::Named(NamedColor::Yellow))),
+        34 => Some(Attr::Foreground(Color::Named(NamedColor::Blue))),
+        35 => Some(Attr::Foreground(Color::Named(NamedColor::Magenta))),
+        36 => Some(Attr::Foreground(Color::Named(NamedColor::Cyan))),
+        37 => Some(Attr::Foreground(Color::Named(NamedColor::White))),
+        39 => Some(Attr::Foreground(Color::Named(NamedColor::Foreground))),
+        40 => Some(Attr::Background(Color::Named(NamedColor::Black))),
+        41 => Some(Attr::Background(Color::Named(NamedColor::Red))),
+        42 => Some(Attr::Background(Color::Named(NamedColor::Green))),
+        43 => Some(Attr::Background(Color::Named(NamedColor::Yellow))),
+        44 => Some(Attr::Background(Color::Named(NamedColor::Blue))),
+        45 => Some(Attr::Background(Color::Named(NamedColor::Magenta))),
+        46 => Some(Attr::Background(Color::Named(NamedColor::Cyan))),
+        47 => Some(Attr::Background(Color::Named(NamedColor::White))),
+        49 => Some(Attr::Background(Color::Named(NamedColor::Background))),
+        59 => Some(Attr::UnderlineColor(None)),
+        90 => Some(Attr::Foreground(Color::Named(NamedColor::BrightBlack))),
+        91 => Some(Attr::Foreground(Color::Named(NamedColor::BrightRed))),
+        92 => Some(Attr::Foreground(Color::Named(NamedColor::BrightGreen))),
+        93 => Some(Attr::Foreground(Color::Named(NamedColor::BrightYellow))),
+        94 => Some(Attr::Foreground(Color::Named(NamedColor::BrightBlue))),
+        95 => Some(Attr::Foreground(Color::Named(NamedColor::BrightMagenta))),
+        96 => Some(Attr::Foreground(Color::Named(NamedColor::BrightCyan))),
+        97 => Some(Attr::Foreground(Color::Named(NamedColor::BrightWhite))),
+        100 => Some(Attr::Background(Color::Named(NamedColor::BrightBlack))),
+        101 => Some(Attr::Background(Color::Named(NamedColor::BrightRed))),
+        102 => Some(Attr::Background(Color::Named(NamedColor::BrightGreen))),
+        103 => Some(Attr::Background(Color::Named(NamedColor::BrightYellow))),
+        104 => Some(Attr::Background(Color::Named(NamedColor::BrightBlue))),
+        105 => Some(Attr::Background(Color::Named(NamedColor::BrightMagenta))),
+        106 => Some(Attr::Background(Color::Named(NamedColor::BrightCyan))),
+        107 => Some(Attr::Background(Color::Named(NamedColor::BrightWhite))),
+        _ => None,
     }
 }
 
@@ -2176,6 +2197,39 @@ mod tests {
             let mut handler = MoveHandler::default();
             Processor::new().advance(&mut handler, input);
             assert_eq!(handler.0, expected, "{input:?}");
+        }
+    }
+
+    /// Every attribute set, in order.
+    #[derive(Default)]
+    struct AttrHandler(Vec<Attr>);
+
+    impl Handler for AttrHandler {
+        fn terminal_attribute(&mut self, attr: Attr) {
+            self.0.push(attr);
+        }
+    }
+
+    #[test]
+    fn short_sgr_matches_parameter_iterator() {
+        // One or two plain parameters take the direct path; with a third, `0`, the iterator takes them all.
+        let attrs = |input: String| {
+            let mut handler = AttrHandler::default();
+            Processor::new().advance(&mut handler, input.as_bytes());
+            handler.0
+        };
+        // The colors 38, 48 and 58 read the parameters after them, so they take the iterator either way.
+        let values = (0..=110).filter(|v| ![38, 48, 58].contains(v)).map(|v| v.to_string());
+        let values: Vec<String> = values.chain([String::new(), "65535".into()]).collect();
+        for a in &values {
+            let mut expected = attrs(format!("\x1b[{a};0;0m"));
+            expected.truncate(expected.len() - 2);
+            assert_eq!(attrs(format!("\x1b[{a}m")), expected, "{a}");
+            for b in &values {
+                let mut expected = attrs(format!("\x1b[{a};{b};0m"));
+                expected.pop();
+                assert_eq!(attrs(format!("\x1b[{a};{b}m")), expected, "{a};{b}");
+            }
         }
     }
 
