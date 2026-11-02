@@ -281,7 +281,9 @@ Same results as upstream, in less time:
 - `grid/row.rs`: `Row::reset` compares the template with the cell at `occ`
   (all cells from there on are alike) rather than the last cell, which on a
   long row is a cache miss of its own.
-- `term/mod.rs`: `input_ascii` checks and writes each cell in one pass;
+- `term/mod.rs`: `input_ascii` checks and writes each cell in one pass, and
+  `input_run` counts the bytes it took from what is left of the text and
+  puts the pen's extra on the cells it wrote after writing them;
   `char_width` is always inlined and also skips the table search for the
   emoticon (U+1F5FB–U+1F64F) and transport (U+1F680–U+1F6C5) emoji, which
   the table gives two cells; `scroll_up_relative` and
