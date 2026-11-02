@@ -1,0 +1,12 @@
+{
+  "name": "oxtty-engine-bench-node",
+  "private": true,
+  "type": "module",
+  "description": "oxtty wasm against libghostty-vt (ghostty-web) and xterm.js headless on the throughput.mjs corpus.",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@xterm/addon-unicode11": "0.10.0-beta.301",
+    "@xterm/headless": "6.1.0-beta.303",
+    "ghostty-web": "0.4.0"
+  }
+}
