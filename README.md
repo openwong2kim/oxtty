@@ -226,13 +226,15 @@ runs at 20–53 frames a second (95th percentile 85–141 ms).
 
 ### Against other engines
 
-oxtty is not one of the fastest parsers. As an engine, which is bytes in and
-a screen model out, it lands third to fifth of six on throughput. It is
-always ahead of WezTerm's engine and always behind its own upstream,
-Alacritty. Ghostty's libghostty-vt is fastest on three of the six outputs,
-by 1.8–2.9×. Where oxtty leads is memory. With 10,000 lines of scrollback it
-grew the least on three of the four outputs that keep history, by 3–9 MiB.
-Alacritty grew by 30 MiB on each output that filled 10,000 lines.
+This compares engines: bytes go in and a screen model comes out. Ghostty's
+libghostty-vt is the fastest parser here. It leads on three of the six
+outputs, 1.7–1.9× ahead of the next engine in its default setup. oxtty is
+second to it on log lines and the scrolling region. On short lines into
+scrollback, oxtty, Alacritty and Ghostty are level. On cursor jumps, oxtty is within 8% of the fastest engine. On truecolor
+and Hangul it is fourth of six. On memory, oxtty grew the least of any engine
+on all four outputs that keep history, by 1–7 MiB. Alacritty, which keeps
+history uncompressed, grew 30 MiB on each output that filled 10,000 lines. In
+Node, oxtty's wasm build is the fastest of the three engines on every output.
 
 **Native, MiB/s**, higher is better. Each engine gets the same corpus as the
 table above: 120×40, 10,000 lines of scrollback, 8 MiB per output fed in
@@ -242,12 +244,12 @@ every output.
 
 | Output | oxtty | oxtty, uncompressed | Alacritty | Ghostty | avt | vt100 | WezTerm |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Log lines, some colour | 91 | 81 | 101 | **289** | 92 | 39 | 49 |
-| Truecolor fg and bg in every cell | 183 | 198 | 318 | 205 | **351** | 337 | 159 |
-| Hangul, CJK and emoji | 87 | 123 | 150 | **269** | 119 | 101 | 52 |
-| Cursor jumps (TUI redraw) | 142 | 142 | 221 | 187 | 233 | **237** | 81 |
-| Scrolling region (DECSTBM) | 139 | 140 | 187 | **423** | 128 | 166 | 63 |
-| Short lines into scrollback | 80 | 74 | **117** | 104 | 41 | 33 | 35 |
+| Log lines, some colour | 235 | 306 | 178 | **433** | 121 | 56 | 56 |
+| Truecolor fg and bg in every cell | 281 | 308 | 325 | 233 | **375** | 355 | 174 |
+| Hangul, CJK and emoji | 131 | 224 | 167 | **319** | 133 | 114 | 56 |
+| Cursor jumps (TUI redraw) | 239 | 256 | 231 | 198 | 244 | **258** | 86 |
+| Scrolling region (DECSTBM) | 264 | 267 | 195 | **443** | 141 | 180 | 66 |
+| Short lines into scrollback | 171 | **308** | 172 | 169 | 63 | 39 | 43 |
 
 **Native, peak RSS growth in MiB**, lower is better. This is the memory one
 engine takes to swallow one output, in a fresh process. Cursor jumps and the
@@ -255,10 +257,10 @@ scrolling region keep no history and stay under 2.5 MiB for every engine.
 
 | Output | oxtty | oxtty, uncompressed | Alacritty | Ghostty | avt | vt100 | WezTerm |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Log lines (10,000 lines kept) | **3.3** | 30.4 | 30.1 | 10.6 | 55.0 | 94.0 | 8.2 |
-| Truecolor (1,989 lines kept) | **4.2** | 6.6 | 6.3 | 11.9 | 4.5 | 8.4 | 30.1 |
-| Hangul, CJK and emoji (10,000) | 9.0 | 30.3 | 30.2 | 10.7 | 48.0 | 75.6 | **8.2** |
-| Short lines (10,000) | **2.9** | 30.3 | 30.3 | 10.5 | 71.3 | 12.6 | 9.1 |
+| Log lines (10,000 lines kept) | **1.2** | 30.2 | 30.1 | 10.6 | 29.5 | 56.6 | 5.4 |
+| Truecolor (1,989 lines kept) | **3.9** | 6.4 | 6.3 | 11.9 | 4.5 | 8.3 | 29.7 |
+| Hangul, CJK and emoji (10,000) | **7.4** | 30.2 | 30.1 | 10.6 | 42.8 | 68.1 | 8.9 |
+| Short lines (10,000) | **1.7** | 30.2 | 30.1 | 10.5 | 49.2 | 12.9 | 6.3 |
 
 **In Node (WebAssembly)**, oxtty's wasm build runs against Ghostty's wasm
 build in [ghostty-web](https://github.com/coder/ghostty-web) 0.4.0 and
@@ -266,16 +268,16 @@ against xterm.js headless. The figures are MiB/s and peak RSS growth in MiB.
 
 | Output | oxtty wasm | MiB | ghostty-web | MiB | xterm.js | MiB |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Log lines, some colour | 61 | **18** | 67 | 39 | **78** | 47 |
-| Truecolor fg and bg in every cell | **141** | 20 | 18 | 43 | 121 | **19** |
-| Hangul, CJK and emoji | 64 | **14** | **89** | 24 | 86 | 40 |
-| Cursor jumps (TUI redraw) | **114** | 14 | 61 | 23 | 104 | **12** |
-| Scrolling region (DECSTBM) | **98** | **16** | 68 | 23 | 35 | 49 |
-| Short lines into scrollback | 50 | **13** | **59** | 24 | 47 | 60 |
+| Log lines, some colour | **149** | **16** | 74 | 40 | 92 | 46 |
+| Truecolor fg and bg in every cell | **211** | **18** | 20 | 41 | 134 | 19 |
+| Hangul, CJK and emoji | **101** | **12** | 91 | 23 | 94 | 37 |
+| Cursor jumps (TUI redraw) | **188** | 14 | 64 | 24 | 108 | **12** |
+| Scrolling region (DECSTBM) | **173** | **14** | 72 | 26 | 39 | 52 |
+| Short lines into scrollback | **109** | **12** | 72 | 24 | 57 | 59 |
 
 **Setup.** Apple M4 (4 performance and 6 efficiency cores, 16 GB), macOS 15.6,
-rustc 1.99.1. Every engine is built in release mode with LTO. Node is
-22.23.3. The engines and their licences:
+rustc 1.99.1, 2026-11-02. Every engine is built in release mode with LTO. Node
+is 22.23.3. The engines and their licences:
 
 - oxtty at this commit.
 - alacritty_terminal 0.26.0 (Apache-2.0).
@@ -326,13 +328,11 @@ leaves Ghostty out.
   and avt had 3–27 MiB of live heap. The bench's counting allocator records
   that figure too, in the JSON it writes.
 - In Node, part of every RSS figure is the runtime and the engine's own
-  floor. The cursor jumps row keeps no history and shows that floor: 12–23
+  floor. The cursor jumps row keeps no history and shows that floor: 12–24
   MiB.
-- Other jobs shared the machine (load average 8–9), so the engines took
-  turns. Most of the 5 runs stayed within ±10% of the median, and short
-  lines within ±25%. The JSON the bench writes has the minimum and maximum.
-  A second full native run agreed within 10%, except Ghostty on log lines
-  (234 MiB/s against 289).
+- Other jobs shared the machine (load average 5–8), so the engines took
+  turns within each run. A second full run of both benches agreed within 9%.
+  The JSON the bench writes has each figure's minimum and maximum.
 
 ## Quick start
 

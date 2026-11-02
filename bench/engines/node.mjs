@@ -106,7 +106,7 @@ const engines = {};
 for (const name of ENGINES) engines[name] = await engine(name);
 
 const results = [];
-for (const caseName of Object.keys(CASES)) {
+for (const caseName of CASES) {
   const { bytes, chunks } = load(dir, caseName);
   const mib = bytes.length / 1048576;
   const times = Object.fromEntries(ENGINES.map((n) => [n, []]));
