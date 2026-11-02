@@ -83,6 +83,18 @@ single crate.
   turned on by `oxtty::Engine`, answers DA1 with `CSI ? 1 ; 2 c` and DA2 with
   `CSI > 0 ; 276 ; 0 c` as xterm.js does, instead of `CSI ? 6 c` and
   Alacritty's version.
+- `term::Config::decrqss`, off (upstream) by default and turned on by
+  `oxtty::Engine`, answers DECRQSS (`DCS $ q Pt ST`) as xterm.js
+  `requestStatusString` does: `0m` for SGR, the scroll region for DECSTBM,
+  `Config::default_cursor_style` for DECSCUSR (xterm.js reports its
+  `cursorStyle`/`cursorBlink` options; `Term::set_default_cursor_style` sets
+  it), 0 for DECSCA, `61;1` for DECSCL, `DCS 0 $ r ST` for anything else.
+  vte has no DCS actions: the `Performer` collects an unhooked `DCS $ q`
+  payload and stops parsing after the byte that ends it, then the
+  `Processor` calls `Handler::request_status_string`, unless that byte was
+  a CAN or SUB, which abort it (xterm.js does not answer then either). A
+  hooked one is answered by `finish_hook`; a payload past the hook limit is
+  not answered.
 - Private mode 9 (X10 mouse reporting) sets `TermMode::MOUSE_X10`, which is
   part of `TermMode::MOUSE_MODE` so the mouse protocols stay exclusive, and
   DECRQM reports it.

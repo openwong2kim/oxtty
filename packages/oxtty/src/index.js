@@ -214,6 +214,7 @@ export class Terminal {
   #colors = null;
   #hooks = new Set();
   #windowsPty = null;
+  #cursorDefault = null;
   // Bytes of a write that stopped at a hook, fed by finishHook.
   #rest = null;
 
@@ -257,6 +258,7 @@ export class Terminal {
     if (this.#colors) this.setColors(this.#colors);
     this.#rest = null;
     if (this.#windowsPty) this.setWindowsPty(this.#windowsPty);
+    if (this.#cursorDefault) this.setCursorDefault(...this.#cursorDefault);
     for (const key of this.#hooks) {
       const [kind, id] = key.split(':');
       wasm.oxtty_set_hook(this.#h, HOOK_KINDS.indexOf(kind), Number(id), 1);
@@ -529,6 +531,12 @@ export class Terminal {
   setFocus(focused) {
     this.#focus = focused == null ? null : !!focused;
     wasm.oxtty_set_focus(this.#handle(), this.#focus === null ? -1 : this.#focus ? 1 : 0);
+  }
+
+  /** The host's cursor style (xterm.js `cursorStyle`, `cursorBlink`): `cursor()` reports it until the program sets one, and DECRQSS reports it. */
+  setCursorDefault(shape, blink) {
+    this.#cursorDefault = [shape, !!blink];
+    wasm.oxtty_set_cursor_default(this.#handle(), Math.max(0, CURSOR_SHAPES.indexOf(shape)), blink ? 1 : 0);
   }
 
   /** Viewport changes since the last call: move drawn rows up by `scroll`, then redraw `lines`. */

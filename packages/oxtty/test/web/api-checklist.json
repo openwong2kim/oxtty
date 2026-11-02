@@ -33,7 +33,7 @@
     },
     "options.cursorStyle": {
       "status": "supported",
-      "reason": "Renderer option, get/set at runtime: block, underline or bar (unless the program set one with DECSCUSR), drawn like @xterm/addon-webgl 6.0; cursorInactiveStyle while unfocused."
+      "reason": "Renderer option, get/set at runtime: block, underline or bar (unless the program set one with DECSCUSR), drawn like @xterm/addon-webgl 6.0; cursorInactiveStyle while unfocused. With cursorBlink it is what DECRQSS reports for DECSCUSR, as in xterm.js."
     },
     "options.fontSize": {
       "status": "supported",
@@ -215,7 +215,7 @@
     },
     "Terminal.parser.registerDcsHandler": {
       "status": "supported",
-      "reason": "As registerCsiHandler; the handler gets the whole payload when the sequence ends. The engine does not answer DECRQSS itself, so a handler falling through sends nothing (xterm.js replies).",
+      "reason": "As registerCsiHandler; the handler gets the whole payload when the sequence ends. A DECRQSS handler falling through gets the engine's answer, as in xterm.js (DECSCA reported as 0).",
       "exercisedBy": "registerDcsHandler\\("
     },
     "Terminal.registerLinkProvider": {

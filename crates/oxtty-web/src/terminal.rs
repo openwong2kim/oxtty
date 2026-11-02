@@ -217,6 +217,7 @@ impl Terminal {
         *slot.borrow_mut() = Rc::downgrade(&shared);
         shared.apply_clipboard();
         shared.apply_windows_pty();
+        shared.apply_cursor_default();
         crate::input::init(&shared);
         shared.apply_theme();
         shared.state.set(shared.read_state());
@@ -649,6 +650,9 @@ impl Shared {
         if key == "windowsPty" {
             self.apply_windows_pty();
         }
+        if key == "cursorStyle" || key == "cursorBlink" {
+            self.apply_cursor_default();
+        }
         // Hook: theme (engine colours, renderer), renderer options, input, mouse and accessibility options.
         crate::input::set_option(self, key);
         self.apply_renderer_option(key);
@@ -668,6 +672,16 @@ impl Shared {
             pty = JsValue::NULL;
         }
         let _ = core.view.engine().set_windows_pty(&pty);
+    }
+
+    /// The engine answers DECRQSS for DECSCUSR with these options, as xterm.js does.
+    fn apply_cursor_default(&self) {
+        let core = self.core.borrow();
+        let blink = get(&core.options, "cursorBlink").is_truthy();
+        let _ = core
+            .view
+            .engine()
+            .set_cursor_default(&get(&core.options, "cursorStyle"), blink);
     }
 
     fn apply_clipboard(&self) {

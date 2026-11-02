@@ -28,7 +28,7 @@ export interface Cursor {
   /** Set by the program with DECSCUSR (`CSI Ps SP q`). */
   shape: 'block' | 'underline' | 'bar';
   blink: boolean;
-  /** The program chose `shape` and `blink`; when false they are defaults (block, steady) and the host's own style applies. */
+  /** The program chose `shape` and `blink`; when false they are the host's (`setCursorDefault`, block and steady by default). */
   styled: boolean;
 }
 
@@ -173,6 +173,11 @@ export class Terminal {
    * on focus events (`CSI ? 1004 h`); `null`, the default, sends none. Kept across a crash.
    */
   setFocus(focused: boolean | null): void;
+  /**
+   * The host's cursor style (xterm.js `cursorStyle` and `cursorBlink`; block, steady by default): `cursor()` reports it
+   * until the program sets one, and DECRQSS (`DCS $ q SP q ST`) reports it, as xterm.js does. Kept across a crash.
+   */
+  setCursorDefault(shape: 'block' | 'underline' | 'bar', blink: boolean): void;
   takeDamage(): Damage;
   /** Bytes to write back to the PTY (status reports, …). */
   takeReplies(): Uint8Array;

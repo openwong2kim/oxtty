@@ -235,10 +235,19 @@ struct ProcessorState {
 
     /// A hook's default action is running, so hooks do not apply (oxtty).
     hook_default: bool,
+
+    /// The payload of an unhooked DECRQSS being collected: its first bytes and its length (oxtty).
+    request: Option<(Vec<u8>, usize)>,
+
+    /// A DECRQSS that just ended, answered once the parser stops after its last byte (oxtty).
+    requested: Option<Vec<u8>>,
 }
 
 /// Largest OSC or DCS payload handed to a hook, as xterm.js `PAYLOAD_LIMIT`. A longer one is not stopped at.
 const HOOK_PAYLOAD_LIMIT: usize = 10_000_000;
+
+/// [`hook_id`] of DECRQSS (`DCS $ q Pt ST`).
+const DECRQSS_HOOK: u32 = (b'$' as u32) << 8 | b'q' as u32;
 
 /// Kind of sequence parsing can stop at (see [`Processor::set_hook`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -310,6 +319,10 @@ impl Processor {
         while processed != bytes.len() && self.state.hook.is_none() {
             let mut performer = Performer::new(&mut self.state, handler);
             processed += self.parser.advance_until_terminated(&mut performer, &bytes[processed..]);
+            // oxtty: a DECRQSS stops parsing after its last byte, which may be a CAN or SUB that aborts it.
+            if let Some(request) = self.state.requested.take() {
+                handler.request_status_string(&request);
+            }
         }
         processed
     }
@@ -348,7 +361,8 @@ impl Processor {
                     let params: Vec<&[u8]> = params.iter().map(Vec::as_slice).collect();
                     super::Perform::osc_dispatch(&mut performer, &params, bell_terminated);
                 },
-                // vte has no DCS actions.
+                Hook::Dcs { id: DECRQSS_HOOK, data, .. } => performer.handler.request_status_string(&data),
+                // vte has no other DCS actions.
                 Hook::Dcs { .. } => (),
             }
             self.state.hook_default = false;
@@ -494,6 +508,9 @@ pub trait Handler {
 
     /// Linefeed.
     fn linefeed(&mut self) {}
+
+    /// oxtty: DECRQSS (`DCS $ q Pt ST`) asked for setting `request` (`Pt`).
+    fn request_status_string(&mut self, _request: &[u8]) {}
 
     /// oxtty: where xterm.js runs its Windows wrapping heuristic: after a C0 line feed (LF, VT, FF; not IND or
     /// NEL) and before `CSI H` (not `CSI f`).
@@ -1252,6 +1269,7 @@ where
                 Some(Hook::Dcs { .. }) => (),
                 hook => self.state.hook = hook,
             }
+            self.state.requested = None;
         }
         match byte {
             C0::HT => self.handler.put_tab(1),
@@ -1276,6 +1294,11 @@ where
             self.state.dcs = Some(Hook::Dcs { id, params: hook_params(params), data: Vec::new() });
             return;
         }
+        // oxtty: DECRQSS, answered when it ends.
+        if !ignore && id == DECRQSS_HOOK {
+            self.state.request = Some((Vec::new(), 0));
+            return;
+        }
         debug!(
             "[unhandled hook] params={:?}, ints: {:?}, ignore: {:?}, action: {:?}",
             params, intermediates, ignore, action
@@ -1291,6 +1314,14 @@ where
             }
             return;
         }
+        // oxtty: the valid requests are two bytes at most.
+        if let Some((data, len)) = &mut self.state.request {
+            if data.len() < 3 {
+                data.push(byte);
+            }
+            *len += 1;
+            return;
+        }
         debug!("[unhandled put] byte={:?}", byte);
     }
 
@@ -1299,7 +1330,15 @@ where
         match self.state.dcs.take() {
             Some(Hook::Dcs { data, .. }) if data.len() > HOOK_PAYLOAD_LIMIT => (),
             Some(hook) => self.stop_at(hook),
-            None => debug!("[unhandled unhook]"),
+            None => match self.state.request.take() {
+                // oxtty: like a hook, a payload past the limit is dropped.
+                Some((data, len)) if len <= HOOK_PAYLOAD_LIMIT => {
+                    self.state.requested = Some(data);
+                    self.terminated = true;
+                },
+                Some(_) => (),
+                None => debug!("[unhandled unhook]"),
+            },
         }
     }
 

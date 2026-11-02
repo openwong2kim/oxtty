@@ -392,8 +392,8 @@ Beyond the notes in the tables above:
   `undefined` there and `markers` is `[]`.
 - `term.parser`, the buffer objects and `term.markers` return new objects on
   every read.
-- The engine does not answer DECRQSS, so a DCS handler that falls through
-  sends nothing.
+- DECRQSS reports the protection attribute (DECSCA) as `0`: the engine has no
+  protected cells.
 - With `scrollbar.showScrollbar: false` there is no
   `.xterm-scrollable-element` wrapper.
 - Without an `ImageAddon` the engine always answers `CSI 18 t` (xterm.js only

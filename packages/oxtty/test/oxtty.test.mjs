@@ -305,7 +305,8 @@ test('parser hooks: writeUntilHook stops at a hooked sequence, finishHook decide
   assert.equal(t.resume(), true);
   assert.equal(t.pendingHook(), null);
   assert.equal(t.rowText(0), 'abcd');
-  assert.equal(t.takeReplies().length, 0);
+  // The DECRQSS default answered; the skipped DSR did not.
+  assert.equal(new TextDecoder().decode(t.takeReplies()), '\x1bP1$r0m\x1b\\');
   // `write` runs defaults itself; a hook dropped with setHook(…, false) no longer stops.
   t.write('\x1b[6n');
   assert.deepEqual(Array.from(t.takeReplies()), Array.from(new TextEncoder().encode('\x1b[1;5R')));

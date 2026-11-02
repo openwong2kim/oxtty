@@ -436,6 +436,11 @@ pub struct Config {
     /// The default `false` is the original Alacritty behavior (`CSI ? 6 c`, `CSI > 0 ; version ; 1 c`).
     pub xterm_device_attributes: bool,
 
+    /// oxtty: whether to answer DECRQSS (`DCS $ q Pt ST`) as xterm.js does: SGR as `0m`, DECSTBM, DECSCUSR as
+    /// [`Config::default_cursor_style`] (xterm.js reports its options, not what DECSCUSR set), DECSCA as 0, DECSCL as
+    /// `61;1`, anything else as invalid. The default `false` is the original Alacritty behavior (no answer).
+    pub decrqss: bool,
+
     /// oxtty: whether resizing reflows the primary screen. xterm.js turns reflow off for a Windows PTY older than
     /// conpty build 21376 (`windowsPty`). The default `true` is the original Alacritty behavior.
     pub reflow: bool,
@@ -470,6 +475,7 @@ impl Default for Config {
             sgr21_double_underline: false,
             xterm_mouse_modes: false,
             xterm_device_attributes: false,
+            decrqss: false,
             reflow: true,
             grow_from_history: true,
             windows_wrap_heuristic: false,
@@ -1225,6 +1231,12 @@ impl<T> Term<T> {
         self.inactive_grid.set_grow_blank(!grow_from_history);
     }
 
+    /// oxtty: sets [`Config::default_cursor_style`], the style while the program has not chosen one, without the
+    /// other effects of `set_options`.
+    pub fn set_default_cursor_style(&mut self, style: CursorStyle) {
+        self.config.default_cursor_style = style;
+    }
+
     /// oxtty: sets the focus reported when the program sets focus events (`None`: no report).
     pub fn set_focus_report(&mut self, focused: Option<bool>) {
         self.focus_report = focused;
@@ -1625,6 +1637,30 @@ impl<T: EventListener> Handler for Term<T> {
 
         self.grid.cursor.point.column = Column(column);
         self.grid.cursor.input_needs_wrap = false;
+    }
+
+    /// oxtty: DECRQSS as xterm.js `requestStatusString` answers it (see [`Config::decrqss`]).
+    fn request_status_string(&mut self, request: &[u8]) {
+        if !self.config.decrqss {
+            return;
+        }
+        let report = match request {
+            b"\"q" => String::from("1$r0\"q"),
+            b"\"p" => String::from("1$r61;1\"p"),
+            b"r" => format!("1$r{};{}r", self.scroll_region.start.0 + 1, self.scroll_region.end.0),
+            b"m" => String::from("1$r0m"),
+            b" q" => {
+                let style = self.config.default_cursor_style;
+                let shape = match style.shape {
+                    CursorShape::Underline => 4,
+                    CursorShape::Beam => 6,
+                    _ => 2,
+                };
+                format!("1$r{} q", shape - u8::from(style.blinking))
+            },
+            _ => String::from("0$r"),
+        };
+        self.event_proxy.send_event(Event::PtyWrite(format!("\x1bP{report}\x1b\\")));
     }
 
     #[inline]

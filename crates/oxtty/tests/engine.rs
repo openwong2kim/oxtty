@@ -283,6 +283,21 @@ fn resize_reflows_all_but_the_cursor_paragraph() {
 }
 
 #[test]
+fn decrqss_answers_as_xterm_js() {
+    let mut t = Engine::new(20, 6, 100);
+    t.feed(b"\x1b[2;5r\x1b[6 q\x1bP$qr\x1b\\\x1bP$q q\x1b\\\x1bP$qm\x1b\\\x1bP$q\"p\x1b\\\x1bP$qx\x1b\\");
+    // The cursor style is the host's, not what DECSCUSR set (xterm.js reports its options).
+    assert_eq!(
+        t.take_replies(),
+        b"\x1bP1$r2;5r\x1b\\\x1bP1$r2 q\x1b\\\x1bP1$r0m\x1b\\\x1bP1$r61;1\"p\x1b\\\x1bP0$r\x1b\\"
+    );
+    t.set_cursor_default(CursorShape::Bar, true);
+    // CAN aborts a request; ESC ends one.
+    t.feed(b"\x1bP$q q\x18\x1bP$q q\x1b[A");
+    assert_eq!(t.take_replies(), b"\x1bP1$r5 q\x1b\\");
+}
+
+#[test]
 fn device_attributes_match_xterm_js() {
     // The replies @xterm/headless gives, so programs that probe the terminal see what they saw on xterm.js.
     let mut t = term();

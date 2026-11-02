@@ -258,6 +258,18 @@ pub extern "C" fn oxtty_cursor(h: u32) -> u32 {
     })
 }
 
+/// The host's cursor style (shape 0 block, 1 underline, 2 bar; `blinking` 1), reported until the program sets one
+/// and by DECRQSS.
+#[no_mangle]
+pub extern "C" fn oxtty_set_cursor_default(h: u32, shape: u32, blinking: u32) {
+    let shape = match shape {
+        1 => CursorShape::Underline,
+        2 => CursorShape::Bar,
+        _ => CursorShape::Block,
+    };
+    with(h, (), |t| t.set_cursor_default(shape, blinking != 0));
+}
+
 /// Cursor shape (0 block, 1 underline, 2 bar), with bit 8 set when blinking and bit 9 when the program set the style.
 #[no_mangle]
 pub extern "C" fn oxtty_cursor_style(h: u32) -> u32 {

@@ -50,7 +50,7 @@ use crate::vt::term::{ClipboardType, Config, Osc52, Term, TermDamage, TermMode};
 use crate::vt::vte::ansi::Hook as VtHook;
 use crate::vt::vte::ansi::Rgb;
 use crate::vt::vte::ansi::{
-    Color, CursorShape as AlacCursorShape, Handler, NamedPrivateMode, Processor,
+    Color, CursorShape as AlacCursorShape, CursorStyle, Handler, NamedPrivateMode, Processor,
 };
 pub use crate::vt::vte::ansi::{HookKind, hook_id};
 
@@ -465,6 +465,8 @@ impl Engine {
             sgr21_double_underline: true,
             // Like xterm.js, device attributes report a VT100 with advanced video (DA1) and xterm 276 (DA2).
             xterm_device_attributes: true,
+            // Like xterm.js, DECRQSS is answered.
+            decrqss: true,
             // Like xterm.js, resetting any mouse tracking mode turns tracking off, and resetting an SGR encoding
             // returns to the default one.
             xterm_mouse_modes: true,
@@ -709,6 +711,19 @@ impl Engine {
     /// the reports for focus changes itself.
     pub fn set_focus(&mut self, focused: Option<bool>) {
         self.term.set_focus_report(focused);
+    }
+
+    /// The host's cursor style (xterm.js `cursorStyle` and `cursorBlink` options; block, not blinking by default):
+    /// what [`Engine::cursor`] reports until the program chooses one, and what DECRQSS reports for DECSCUSR, as
+    /// xterm.js does even after the program chose one.
+    pub fn set_cursor_default(&mut self, shape: CursorShape, blinking: bool) {
+        let shape = match shape {
+            CursorShape::Block => AlacCursorShape::Block,
+            CursorShape::Underline => AlacCursorShape::Underline,
+            CursorShape::Bar => AlacCursorShape::Beam,
+        };
+        self.term
+            .set_default_cursor_style(CursorStyle { shape, blinking });
     }
 
     /// Behaves as xterm.js 6.1 does with `windowsPty` set to `pty` (the default is none): with a backend or build,

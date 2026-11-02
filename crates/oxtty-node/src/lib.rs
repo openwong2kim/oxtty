@@ -304,6 +304,18 @@ impl Terminal {
         self.inner.set_focus(focused);
     }
 
+    /// The host's cursor style (`"block"`, `"underline"` or `"bar"`): `cursor()` reports it until the program sets
+    /// one, and DECRQSS reports it.
+    #[napi]
+    pub fn set_cursor_default(&mut self, shape: String, blink: bool) {
+        let shape = match shape.as_str() {
+            "underline" => oxtty::CursorShape::Underline,
+            "bar" => oxtty::CursorShape::Bar,
+            _ => oxtty::CursorShape::Block,
+        };
+        self.inner.set_cursor_default(shape, blink);
+    }
+
     #[napi]
     pub fn take_damage(&mut self) -> Damage {
         match self.inner.take_damage() {
