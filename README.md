@@ -158,8 +158,8 @@ does, 17 terminals take 5.1 MiB of engine memory instead of 41.1 MiB
 
 | Module | Bytes | gzip | Budget |
 | --- | ---: | ---: | --- |
-| Engine `oxtty.wasm` | 307,707 | 111,732 | 340 KiB |
-| Front end `xterm_web_bg.wasm` (`oxtty/xterm` only) | 734,291 | 277,775 | 800 KiB raw, 300 KiB gzip |
+| Engine `oxtty.wasm` | 325,972 | 117,985 | 340 KiB |
+| Front end `xterm_web_bg.wasm` (`oxtty/xterm` only) | 774,054 | 292,912 | 800 KiB raw, 300 KiB gzip |
 
 One instance of each serves every terminal on a page, so the code is paid
 once, not per pane. `scripts/build-web.sh` and `test/web/size.test.mjs` fail
@@ -176,27 +176,53 @@ scrollback, oxtty (wasm) against `@xterm/headless`.
 
 **Parser throughput** — MiB/s, higher is better. Node 22 on an Apple M4,
 120×40 with 10,000 lines of scrollback, 8 MiB of generated output per row fed
-in 64 KiB chunks, median of 5 runs. All three end on the same screen.
+in 64 KiB chunks, median of 5 runs (2026-11-02; a second run was within 7%).
+All three end on the same screen.
 `node --expose-gc packages/oxtty/bench/throughput.mjs` reproduces it after
 building the wasm and N-API modules.
 
 | Output | oxtty native | oxtty wasm | xterm.js headless |
 | --- | ---: | ---: | ---: |
-| Log lines, some colour | 116 | 72 | 98 |
-| Truecolor fg and bg in every cell | 252 | 142 | 143 |
-| Hangul, CJK and emoji | 102 | 73 | 100 |
-| Cursor jumps (TUI redraw) | 194 | 128 | 113 |
-| Scrolling region (DECSTBM) | 164 | 112 | 41 |
-| Short lines into scrollback | 103 | 59 | 60 |
+| Log lines, some colour | 233 | 153 | 97 |
+| Truecolor fg and bg in every cell | 276 | 213 | 138 |
+| Hangul, CJK and emoji | 134 | 105 | 97 |
+| Cursor jumps (TUI redraw) | 259 | 190 | 108 |
+| Scrolling region (DECSTBM) | 269 | 171 | 39 |
+| Short lines into scrollback | 170 | 110 | 58 |
 
 **Compressed history outside the engine** — with
 [`TermHistory`](#compressed-history-for-your-own-term), replaying an 8 MB
 output ring into 100,000 lines of scrollback peaked at 11 MiB, against 143 MiB
 for xterm.js headless (wmux daemon experiment, local).
 
-**The cost.** Compressing history makes wasm parsing slower than xterm.js on
-some output: 120 ms against 104 ms for log lines, 89 ms against 67 ms for
-Hangul lines.
+**The cost.** Each line that scrolls off is compressed on its way into
+history. With 10,000 lines of scrollback that takes 37% of the wasm time on log
+lines and 44% on Hangul lines (against a 16-line scrollback, which compresses
+nothing), which is why Hangul output is the closest race with xterm.js, whose
+lines are kept as they are: 105 against 97 MiB/s.
+
+**Many panes in a browser** — 20 panes of 120×40 on one page, all in view
+and all printing; system Chrome on the GPU, Apple M4, 2026-11-02, median of 3
+runs (within 7% of each other). Flat out, each pane gets its next 16 KiB as
+soon as a write callback reports one parsed, so the main thread never idles;
+the figure is the output parsed per second over all panes.
+`npm run bench:speed` in `packages/oxtty` reproduces it, with 17 panes too,
+write-to-frame latency, frame rate, long tasks and main-thread time.
+
+| Output, flat out (MiB/s) | oxtty/xterm | xterm.js + WebGL | ghostty-web 0.4.0 |
+| --- | ---: | ---: | ---: |
+| Log lines | 148 | 90 | 24 |
+| Truecolor in every cell | 77 | 62 | 7 |
+| Hangul, CJK and emoji | 103 | 93 | 26 |
+| Cursor jumps (TUI redraw) | 177 | 154 | 16 |
+| Scrolling region | 168 | 40 | 27 |
+
+At an agent's pace, 2 KiB per pane every 50 ms, oxtty/xterm and xterm.js both
+draw 60 frames a second with output on screen 13–15 ms after `write`
+(median; 95th percentile 21–25 ms), except with a different truecolor in every cell
+on 20 panes, where oxtty/xterm drops to 29–58 frames (95th percentile
+35–60 ms) against xterm.js's 59 (24 ms). ghostty-web, drawing on a 2D canvas,
+runs at 20–53 frames a second (95th percentile 85–141 ms).
 
 ### Against other engines
 

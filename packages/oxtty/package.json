@@ -34,7 +34,8 @@
     "build": "bash ../../scripts/build-wasm.sh && bash ../../scripts/build-web.sh",
     "test": "node --test test/*.test.mjs",
     "test:web": "node --test test/web/*.test.mjs",
-    "bench:memory": "node bench/memory/bench.mjs"
+    "bench:memory": "node bench/memory/bench.mjs",
+    "bench:speed": "node bench/speed/bench.mjs"
   },
   "keywords": [
     "terminal",
@@ -62,6 +63,7 @@
     "@xterm/addon-webgl": "0.20.0-beta.329",
     "@xterm/headless": "6.1.0-beta.303",
     "@xterm/xterm": "6.1.0-beta.336",
+    "ghostty-web": "0.4.0",
     "playwright-core": "1.55.1"
   }
 }

@@ -595,9 +595,11 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             return 1;
         }
 
-        match str::from_utf8(&bytes[..plain_chars]) {
-            Ok(parsed) => {
-                Self::ground_dispatch(performer, parsed);
+        // oxtty: `ground_dispatch` validates as it dispatches; the error is read only where the bytes are not
+        // valid UTF-8.
+        let valid_bytes = Self::ground_dispatch(performer, &bytes[..plain_chars]);
+        match str::from_utf8(&bytes[valid_bytes..plain_chars]) {
+            Ok(_) => {
                 let mut processed = plain_chars;
 
                 // If there's another character, it must be escape so process it directly.
@@ -611,11 +613,6 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             },
             // Handle invalid and partial utf8.
             Err(err) => {
-                // Dispatch all the valid bytes.
-                let valid_bytes = err.valid_up_to();
-                let parsed = unsafe { str::from_utf8_unchecked(&bytes[..valid_bytes]) };
-                Self::ground_dispatch(performer, parsed);
-
                 match err.error_len() {
                     Some(len) => {
                         // Execute C1 escapes or emit replacement character.
@@ -707,15 +704,72 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     }
 
     /// Handle ground dispatch of print/execute for all characters in a string.
+    ///
+    /// oxtty: dispatches the longest valid UTF-8 prefix of `bytes` and returns its length. The characters
+    /// between controls go to `print_str` together; C1 controls are U+0080..U+009F (0xC2 0x80..0x9F).
     #[inline]
-    fn ground_dispatch<P: Perform>(performer: &mut P, text: &str) {
-        for c in text.chars() {
-            match c {
-                '\x00'..='\x1f' | '\u{80}'..='\u{9f}' => performer.execute(c as u8),
-                _ => performer.print(c),
+    fn ground_dispatch<P: Perform>(performer: &mut P, bytes: &[u8]) -> usize {
+        let (mut start, mut i) = (0, 0);
+        let flush = |performer: &mut P, start: usize, end: usize| {
+            if start < end {
+                // SAFETY: `bytes[start..end]` was checked to be valid UTF-8 below.
+                performer.print_str(unsafe { str::from_utf8_unchecked(&bytes[start..end]) });
             }
+        };
+        while i < bytes.len() {
+            let byte = bytes[i];
+            if (0x20..0x80).contains(&byte) {
+                i += 1;
+                continue;
+            }
+            // Three bytes (most of CJK and Hangul) without the general checks.
+            if let (0xe1..=0xef, Some(&[b1, b2])) = (byte, bytes.get(i + 1..i + 3)) {
+                let last = if byte == 0xed { 0x9f } else { 0xbf };
+                if (0x80..=last).contains(&b1) && b2 & 0xc0 == 0x80 {
+                    i += 3;
+                    continue;
+                }
+            }
+            let Some(len) = utf8_len(&bytes[i..]) else { break };
+            let control = match byte {
+                0x00..=0x1f => Some(byte),
+                0xc2 => Some(bytes[i + 1]).filter(|b| *b <= 0x9f),
+                _ => None,
+            };
+            if let Some(control) = control {
+                flush(performer, start, i);
+                performer.execute(control);
+                start = i + len;
+            }
+            i += len;
         }
+        flush(performer, start, i);
+        i
     }
+}
+
+/// oxtty: the length of the UTF-8 character `bytes` starts with, or `None` where it is not valid or not complete
+/// (the rules of `str::from_utf8`).
+#[inline(always)]
+fn utf8_len(bytes: &[u8]) -> Option<usize> {
+    let cont = |i: usize| bytes.get(i).is_some_and(|b| (0x80..=0xbf).contains(b));
+    let second = |range: std::ops::RangeInclusive<u8>| bytes.get(1).is_some_and(|b| range.contains(b));
+    let len = match *bytes.first()? {
+        0x00..=0x7f => return Some(1),
+        0xc2..=0xdf => second(0x80..=0xbf),
+        0xe0 => second(0xa0..=0xbf) && cont(2),
+        0xe1..=0xec | 0xee..=0xef => second(0x80..=0xbf) && cont(2),
+        0xed => second(0x80..=0x9f) && cont(2),
+        0xf0 => second(0x90..=0xbf) && cont(2) && cont(3),
+        0xf1..=0xf3 => second(0x80..=0xbf) && cont(2) && cont(3),
+        0xf4 => second(0x80..=0x8f) && cont(2) && cont(3),
+        _ => false,
+    };
+    len.then(|| match bytes[0] {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        _ => 4,
+    })
 }
 
 #[derive(PartialEq, Eq, Debug, Default, Copy, Clone)]
@@ -750,6 +804,13 @@ enum State {
 pub trait Perform {
     /// Draw a character to the screen and update states.
     fn print(&mut self, _c: char) {}
+
+    /// oxtty: draws characters that hold no controls, as `print` would one by one.
+    fn print_str(&mut self, text: &str) {
+        for c in text.chars() {
+            self.print(c);
+        }
+    }
 
     /// Execute a C0 or C1 control function.
     fn execute(&mut self, _byte: u8) {}
@@ -826,6 +887,32 @@ mod tests {
         b'e', b's', b'k', b':', b' ', b'~', b'/', b'c', b'o', b'd', b'e', b'/', b'a', b'l', b'a',
         b'c', b'r', b'i', b't', b't', b'y', 0x07, // End OSC
     ];
+
+    #[test]
+    fn utf8_len_matches_from_utf8() {
+        // Every one- to four-byte sequence of the bytes that matter around the boundaries.
+        let pick = [0x00, 0x41, 0x7f, 0x80, 0x8f, 0x90, 0x9f, 0xa0, 0xbf, 0xc0, 0xc1, 0xc2, 0xdf, 0xe0, 0xe1,
+            0xec, 0xed, 0xee, 0xef, 0xf0, 0xf1, 0xf3, 0xf4, 0xf5, 0xff];
+        let mut seqs = vec![vec![]];
+        for _ in 0..4 {
+            seqs = seqs
+                .iter()
+                .flat_map(|s| pick.iter().map(move |&b| [s.as_slice(), &[b]].concat()))
+                .chain(seqs.clone())
+                .collect();
+        }
+        for bytes in seqs {
+            let expected = match str::from_utf8(&bytes) {
+                Ok(s) => s.chars().next().map(char::len_utf8),
+                Err(e) if e.valid_up_to() > 0 => str::from_utf8(&bytes[..e.valid_up_to()])
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                    .map(char::len_utf8),
+                Err(_) => None,
+            };
+            assert_eq!(utf8_len(&bytes), expected, "{bytes:02x?}");
+        }
+    }
 
     #[derive(Default)]
     struct Dispatcher {

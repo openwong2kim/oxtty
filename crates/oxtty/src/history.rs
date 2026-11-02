@@ -760,11 +760,51 @@ fn encode(row: &Row<Cell>, out: &mut Vec<u8>, extras: &mut Vec<(u16, Arc<CellExt
         // Write the header first and the characters right after it, then fill
         // in the unit count and BLANK.
         let head = put_head(out, &mut prev, key, pair);
-        let body = out.len();
-        // Gather units of the same kind and attributes. A run that is not wide
-        // splits its trailing spaces off into a run that writes no characters.
+        if !pair {
+            // A narrow run: one pass finds how far the attributes go and the last character that is not an erased
+            // blank (the blanks after it are read again by the next run, as one blank run), the next writes them.
+            let cells = &cells[start..used];
+            let erased = |c: &Cell| c.c == ' ' && !c.flags.contains(Flags::TYPED_SPACE);
+            let (mut len, mut text, mut ascii, mut extra) = (0, 0, true, false);
+            for (i, c) in cells.iter().enumerate() {
+                if c.fg != key.0 || c.bg != key.1 || c.flags - Flags::TYPED_SPACE != key.2 {
+                    break;
+                }
+                len = i + 1;
+                if !erased(c) {
+                    text = i + 1;
+                }
+                ascii &= c.c.is_ascii();
+                extra |= c.extra.is_some();
+            }
+            // A blank run keeps the extras of all its cells, a run with text those of its units.
+            let units = if text == 0 { len } else { text };
+            let run = &cells[..units];
+            if text == 0 {
+                out[head] |= BLANK;
+            } else if ascii {
+                out.extend(run.iter().map(|c| if erased(c) { 0 } else { c.c as u8 }));
+            } else {
+                for c in run {
+                    put_char(out, if erased(c) { '\0' } else { c.c });
+                }
+            }
+            if extra {
+                for (col, c) in run.iter().enumerate() {
+                    if let Some(extra) = &c.extra {
+                        extras.push(((start + col) as u16, extra.clone()));
+                    }
+                }
+            }
+            out[head + 1..head + 3].copy_from_slice(&(units as u16).to_le_bytes());
+            start += units;
+            continue;
+        }
+        // A wide run: wide characters, each with the blank right half that makes it a pair (`is_pair`, with
+        // the run's attributes), and the narrow spaces between them (so it does not break between words).
+        let (wide, right) = (key.2 | Flags::WIDE_CHAR, key.2 | Flags::WIDE_CHAR_SPACER);
         let (mut at, mut units) = (start, 0);
-        // Position and unit count after the last character (a unit that is not a space).
+        // Position and unit count after the last character (a unit that is not an erased blank).
         let (mut text_end, mut text_units) = (start, 0);
         while at < used {
             let cell = &cells[at];
@@ -772,27 +812,26 @@ fn encode(row: &Row<Cell>, out: &mut Vec<u8>, extras: &mut Vec<(u16, Arc<CellExt
                 break;
             }
             let typed = cell.flags.contains(Flags::TYPED_SPACE);
-            if cell.flags - Flags::TYPED_SPACE == key.2 {
-                // A narrow cell. A wide run only takes narrow spaces with the
-                // same attributes (so it does not break between words).
-                if pair && cell.c != ' ' {
-                    break;
-                }
-                let c = if cell.c == ' ' && !typed {
-                    '\0'
-                } else {
-                    cell.c
-                };
-                put_char(out, c);
+            if cell.flags - Flags::TYPED_SPACE == key.2 && cell.c == ' ' {
+                out.push(if typed { b' ' } else { 0 });
                 if let Some(extra) = &cell.extra {
                     extras.push((at as u16, extra.clone()));
                 }
                 at += 1;
                 units += 1;
-                if cell.c != ' ' || typed {
+                if typed {
                     (text_end, text_units) = (at, units);
                 }
-            } else if pair && cell.flags == key.2 | Flags::WIDE_CHAR && is_pair(cells, at) {
+            } else if cell.flags == wide
+                && cell.c != ' '
+                && cells.get(at + 1).is_some_and(|r| {
+                    r.c == ' '
+                        && r.extra.is_none()
+                        && r.fg == key.0
+                        && r.bg == key.1
+                        && r.flags == right
+                })
+            {
                 put_char(out, cell.c);
                 if let Some(extra) = &cell.extra {
                     extras.push((at as u16, extra.clone()));
@@ -804,22 +843,15 @@ fn encode(row: &Row<Cell>, out: &mut Vec<u8>, extras: &mut Vec<(u16, Arc<CellExt
                 break;
             }
         }
-        let (end, units) = if text_units == 0 {
-            out.truncate(body);
-            out[head] |= BLANK;
-            (at, units)
-        } else {
-            // The trailing spaces split off (one byte per cell) are read again
-            // by the next run.
-            out.truncate(out.len() - (units - text_units));
-            while extras
-                .last()
-                .is_some_and(|(col, _)| *col as usize >= text_end)
-            {
-                extras.pop();
-            }
-            (text_end, text_units)
-        };
+        // The trailing erased blanks (one byte each) are read again by the next run.
+        out.truncate(out.len() - (units - text_units));
+        while extras
+            .last()
+            .is_some_and(|(col, _)| *col as usize >= text_end)
+        {
+            extras.pop();
+        }
+        let (end, units) = (text_end, text_units);
         out[head + 1..head + 3].copy_from_slice(&(units as u16).to_le_bytes());
         start = end;
     }
@@ -871,24 +903,22 @@ fn put_head(
 
 #[inline(always)]
 fn put_char(out: &mut Vec<u8>, c: char) {
+    // One push per byte: faster than appending a slice or an array of them.
     let n = c as u32;
     if n < 0x80 {
         out.push(n as u8);
     } else if n < 0x800 {
-        out.extend_from_slice(&[0xc0 | (n >> 6) as u8, 0x80 | (n & 0x3f) as u8]);
+        out.push(0xc0 | (n >> 6) as u8);
+        out.push(0x80 | (n & 0x3f) as u8);
     } else if n < 0x1_0000 {
-        out.extend_from_slice(&[
-            0xe0 | (n >> 12) as u8,
-            0x80 | ((n >> 6) & 0x3f) as u8,
-            0x80 | (n & 0x3f) as u8,
-        ]);
+        out.push(0xe0 | (n >> 12) as u8);
+        out.push(0x80 | ((n >> 6) & 0x3f) as u8);
+        out.push(0x80 | (n & 0x3f) as u8);
     } else {
-        out.extend_from_slice(&[
-            0xf0 | (n >> 18) as u8,
-            0x80 | ((n >> 12) & 0x3f) as u8,
-            0x80 | ((n >> 6) & 0x3f) as u8,
-            0x80 | (n & 0x3f) as u8,
-        ]);
+        out.push(0xf0 | (n >> 18) as u8);
+        out.push(0x80 | ((n >> 12) & 0x3f) as u8);
+        out.push(0x80 | ((n >> 6) & 0x3f) as u8);
+        out.push(0x80 | (n & 0x3f) as u8);
     }
 }
 

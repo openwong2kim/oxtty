@@ -105,7 +105,7 @@ impl RawTail {
         // Where the plain text `bytes` ends with starts, if it ends with any: after the sequence that ends in it,
         // or all of it.
         let mut text = None;
-        let start = match bytes.iter().rposition(|&b| b == 0x1b) {
+        let start = match memchr::memrchr(0x1b, bytes) {
             Some(at) => {
                 self.state = Scan::Ground;
                 at
