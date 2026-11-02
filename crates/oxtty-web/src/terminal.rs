@@ -65,7 +65,7 @@ pub(crate) struct Core {
     pub renderer: Option<Box<dyn Renderer>>,
     /// While `options.screenReaderMode` is on.
     pub a11y: Option<crate::a11y::A11y>,
-    /// While `options.scrollbar.showScrollbar` is not false.
+    /// While open (hidden with `options.scrollbar.showScrollbar: false`).
     pub scrollbar: Option<crate::scrollbar::Scrollbar>,
     pub dirty: Dirty,
     queue: VecDeque<Chunk>,

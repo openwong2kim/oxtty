@@ -3,9 +3,9 @@
 //! last frame. Dragging the slider or pressing the track scrolls the view; like xterm.js the bar shows while the
 //! pointer is over the terminal or the view scrolls, and fades 500 ms later. The wheel is the mouse module's.
 //!
-//! Memory: built only while `options.scrollbar.showScrollbar` is not `false` (three elements and one closure per
-//! terminal); turning it off unwraps the screen and frees it all. Not built: the horizontal scrollbar, the arrows
-//! (`showArrows`) and the shadows, which xterm.js keeps hidden for a terminal.
+//! Memory: three elements and one closure per opened terminal. With `options.scrollbar.showScrollbar: false` they
+//! stay, as in xterm.js: the bar is 0 px wide and never shown (`ScrollbarVisibility.HIDDEN`). Not built: the
+//! horizontal scrollbar, the arrows (`showArrows`) and the shadows, which xterm.js keeps hidden for a terminal.
 //!
 //! Ported from xterm.js 6.1.0-beta.336 (commit 08829c7eb6279dda2a9e86df901353a1a89858ca, MIT; the scrollable
 //! files derive from VS Code, MIT):
@@ -168,6 +168,8 @@ struct Inner {
     scroll: Scroll,
     state: State,
     should_render: bool,
+    /// `showScrollbar: false` (`ScrollbarVisibility.HIDDEN`): the bar is never shown.
+    hidden: bool,
     should_be_visible: bool,
     is_needed: bool,
     is_visible: bool,
@@ -256,6 +258,7 @@ impl Scrollbar {
                     ..State::default()
                 },
                 should_render: true,
+                hidden: false,
                 should_be_visible: false,
                 is_needed: false,
                 is_visible: false,
@@ -309,6 +312,17 @@ impl Scrollbar {
         inner.state.scrollbar_size = js_round(width);
         inner.should_render = true;
         inner.render();
+    }
+
+    /// `ScrollbarVisibilityController.setVisibility` between `AUTO` and `HIDDEN`.
+    fn set_hidden(&self, hidden: bool) {
+        let Ok(mut inner) = self.inner.try_borrow_mut() else {
+            return;
+        };
+        if inner.hidden != hidden {
+            inner.hidden = hidden;
+            inner.ensure_visibility();
+        }
     }
 
     /// The slider colours of `ThemeService` (the foreground at 20, 40 and 50%, or the theme's own), in a style
@@ -628,11 +642,12 @@ impl Inner {
         }
     }
 
-    /// `ScrollbarVisibilityController.ensureVisibility`; the class changes a task later when revealed.
+    /// `ScrollbarVisibilityController.ensureVisibility`; the class changes a task later when revealed. Hidden, it
+    /// should never be visible (`_applyVisibilitySetting`).
     fn ensure_visibility(&mut self) {
         if !self.is_needed {
             self.hide_bar(false);
-        } else if !self.should_be_visible {
+        } else if !self.should_be_visible || self.hidden {
             self.hide_bar(true);
         } else if !self.is_visible {
             self.is_visible = true;
@@ -684,7 +699,8 @@ fn is_mac() -> bool {
 }
 
 impl Shared {
-    /// Builds, resizes or removes the scrollbar for `options.scrollbar` (`{ showScrollbar, width }`).
+    /// Builds or resizes the scrollbar for `options.scrollbar` (`{ showScrollbar, width }`); `showScrollbar: false`
+    /// hides it and makes it 0 px wide (`Viewport._getChangeOptions`).
     pub(crate) fn apply_scrollbar(self: &Rc<Self>) {
         let mut core = self.core.borrow_mut();
         let Some(screen) = core.screen.clone() else {
@@ -692,25 +708,26 @@ impl Shared {
         };
         let scrollbar = option(&core.options, "scrollbar");
         let show = get(&scrollbar, "showScrollbar").as_bool().unwrap_or(true);
-        let width = get(&scrollbar, "width").as_f64().unwrap_or(DEFAULT_WIDTH);
-        let created = match (&core.scrollbar, show) {
-            (None, true) => {
+        let width = if show {
+            get(&scrollbar, "width").as_f64().unwrap_or(DEFAULT_WIDTH)
+        } else {
+            0.0
+        };
+        let created = match &core.scrollbar {
+            None => {
                 let theme = get(&core.options, "theme");
                 if let Ok(bar) = Scrollbar::new(self, &screen, width) {
                     bar.set_theme(&theme);
+                    bar.set_hidden(!show);
                     core.scrollbar = Some(bar);
                 }
                 true
             }
-            (Some(bar), true) => {
+            Some(bar) => {
                 bar.set_width(width);
+                bar.set_hidden(!show);
                 false
             }
-            (Some(_), false) => {
-                core.scrollbar = None;
-                false
-            }
-            (None, false) => false,
         };
         drop(core);
         self.apply_background();

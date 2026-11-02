@@ -393,8 +393,6 @@ Beyond the notes in the tables above:
 - The buffer objects and `term.markers` return new objects on every read.
 - DECRQSS reports the protection attribute (DECSCA) as `0`: the engine has no
   protected cells.
-- With `scrollbar.showScrollbar: false` there is no
-  `.xterm-scrollable-element` wrapper.
 - Without an `ImageAddon` the engine always answers `CSI 18 t` (xterm.js only
   when `windowOptions` allows it).
 - `ImageAddon`: no kitty graphics, no QOI images, no

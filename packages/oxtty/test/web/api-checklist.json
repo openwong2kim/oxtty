@@ -53,7 +53,7 @@
     },
     "options.scrollbar": {
       "status": "supported",
-      "reason": "showScrollbar builds or removes the .xterm-scrollable-element bar at runtime, width sizes it (xterm.js 14px default); FitAddon keeps the same width free (none without scrollback). showArrows is not drawn."
+      "reason": "showScrollbar shows or hides the .xterm-scrollable-element bar at runtime (hidden, it is 0px wide in its wrapper, as in xterm.js), width sizes it (xterm.js 14px default); FitAddon keeps the same width free (none without scrollback). showArrows is not drawn."
     },
     "options.allowProposedApi": {
       "status": "supported",
@@ -109,7 +109,7 @@
     },
     "Terminal.open": {
       "status": "supported",
-      "reason": "Builds the xterm.js DOM (.terminal.xterm > .xterm-scrollable-element > .xterm-screen > .xterm-helpers, the wrapper while the scrollbar is shown); opening again moves the element."
+      "reason": "Builds the xterm.js DOM (.terminal.xterm > .xterm-scrollable-element > .xterm-screen > .xterm-helpers); opening again moves the element."
     },
     "Terminal.write": {
       "status": "supported",
