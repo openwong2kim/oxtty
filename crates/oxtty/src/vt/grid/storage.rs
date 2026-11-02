@@ -189,8 +189,8 @@ impl<T> Storage<T> {
 
     /// oxtty: moves the rows of screen lines `region` toward the top (`up`) or the bottom by `positions`, as
     /// swapping rows `positions` apart one pair at a time does for every row that stays in `region`. The rows
-    /// moved out fill the other end, in an order the callers (which reset them) do not rely on. Where
-    /// `region`'s rows lie in order in the buffer, they move in one go.
+    /// moved out fill the other end, in an order the callers (which reset them) do not rely on. The rows
+    /// move a slice at a time, not a swap at a time.
     pub fn rotate_region(&mut self, region: Range<Line>, positions: usize, up: bool) {
         debug_assert!(positions < (region.end - region.start).0 as usize);
 
@@ -200,6 +200,24 @@ impl<T> Storage<T> {
         if low <= high {
             let rows = &mut self.inner[low..=high];
             if up { rows.rotate_right(positions) } else { rows.rotate_left(positions) }
+            return;
+        }
+
+        // The region wraps around the end of the buffer: its rows are `tail` (from `low` to the end) and then
+        // `head` (from the start to `high`). The rows that cross between the two pieces are swapped over.
+        let (head, tail) = self.inner.split_at_mut(low);
+        let head = &mut head[..=high];
+        if positions <= head.len().min(tail.len()) {
+            let at = tail.len() - positions;
+            if up {
+                head.rotate_right(positions);
+                tail[at..].swap_with_slice(&mut head[..positions]);
+                tail.rotate_right(positions);
+            } else {
+                tail.rotate_left(positions);
+                tail[at..].swap_with_slice(&mut head[..positions]);
+                head.rotate_left(positions);
+            }
         } else if up {
             for i in (region.start.0..region.end.0 - positions as i32).map(Line::from) {
                 self.swap(i, i + positions);
