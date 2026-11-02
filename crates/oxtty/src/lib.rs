@@ -1237,27 +1237,63 @@ enum DecstrScan {
 
 impl DecstrScan {
     /// Where a DECSTR ends (just past its last byte), or `None` after advancing the state through `bytes`.
+    ///
+    /// Every DECSTR has a `!`, so from the ground state only the `!`s are looked at (a DECSTR is `ESC [`, then
+    /// digits and `;`, `!` and `p`, with nothing in between); without one, the state is that after the last ESC.
     fn find(&mut self, bytes: &[u8]) -> Option<usize> {
+        // A sequence carried in from the last call: step through it until it ends.
         let mut i = 0;
-        while i < bytes.len() {
-            if *self == DecstrScan::Ground {
-                i += bytes[i..].iter().position(|&b| b == 0x1b)?;
-            }
-            let b = bytes[i];
+        while *self != DecstrScan::Ground {
+            let b = *bytes.get(i)?;
             i += 1;
-            *self = match (*self, b) {
-                (_, 0x1b) => DecstrScan::Esc,
-                (DecstrScan::Esc, b'[') => DecstrScan::Params,
-                (DecstrScan::Params, b'0'..=b'9' | b';') => DecstrScan::Params,
-                (DecstrScan::Params, b'!') => DecstrScan::Bang,
-                (DecstrScan::Bang, b'p') => {
-                    *self = DecstrScan::Ground;
-                    return Some(i);
+            if self.step(b) {
+                return Some(i);
+            }
+        }
+        let mut from = i;
+        while let Some(at) = memchr::memchr(b'!', &bytes[from..]) {
+            let bang = from + at;
+            let params = bytes[i..bang]
+                .iter()
+                .rposition(|b| !matches!(b, b'0'..=b'9' | b';'))
+                .map_or(i, |k| i + k + 1);
+            if params >= i + 2 && bytes[params - 2..params] == [0x1b, b'['] {
+                match bytes.get(bang + 1) {
+                    Some(b'p') => return Some(bang + 2),
+                    Some(_) => {}
+                    None => {
+                        *self = DecstrScan::Bang;
+                        return None;
+                    }
                 }
-                _ => DecstrScan::Ground,
-            };
+            }
+            from = bang + 1;
+        }
+        // No DECSTR here: only the bytes from the last ESC on decide the state.
+        let esc = i + memchr::memrchr(0x1b, &bytes[i..])?;
+        for &b in &bytes[esc..] {
+            self.step(b);
+            if *self == DecstrScan::Ground {
+                break;
+            }
         }
         None
+    }
+
+    /// Advances the state by one byte; true where a DECSTR ends.
+    fn step(&mut self, b: u8) -> bool {
+        *self = match (*self, b) {
+            (_, 0x1b) => DecstrScan::Esc,
+            (DecstrScan::Esc, b'[') => DecstrScan::Params,
+            (DecstrScan::Params, b'0'..=b'9' | b';') => DecstrScan::Params,
+            (DecstrScan::Params, b'!') => DecstrScan::Bang,
+            (DecstrScan::Bang, b'p') => {
+                *self = DecstrScan::Ground;
+                return true;
+            }
+            _ => DecstrScan::Ground,
+        };
+        false
     }
 }
 
@@ -1311,5 +1347,64 @@ pub fn pack_color(c: Color) -> u32 {
         Color::Named(n) => color::NAMED | n as u32,
         Color::Indexed(i) => color::INDEXED | i as u32,
         Color::Spec(rgb) => color::RGB | (rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DecstrScan;
+
+    /// The byte-at-a-time scanner `DecstrScan::find` must agree with.
+    fn find_bytewise(state: &mut DecstrScan, bytes: &[u8]) -> Option<usize> {
+        for (i, &b) in bytes.iter().enumerate() {
+            if state.step(b) {
+                return Some(i + 1);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn decstr_scan_matches_bytewise_scan() {
+        let pieces: [&[u8]; 12] = [
+            b"\x1b",
+            b"[",
+            b"!",
+            b"p",
+            b"1",
+            b";",
+            b"x",
+            b"\x1b[",
+            b"!p",
+            b"\x1b[2!p",
+            b"ok ",
+            b"[!",
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..20_000 {
+            let mut bytes = Vec::new();
+            for _ in 0..next(12) {
+                bytes.extend_from_slice(pieces[next(pieces.len())]);
+            }
+            let start = [
+                DecstrScan::Ground,
+                DecstrScan::Esc,
+                DecstrScan::Params,
+                DecstrScan::Bang,
+            ][next(4)];
+            let (mut fast, mut slow) = (start, start);
+            assert_eq!(
+                fast.find(&bytes),
+                find_bytewise(&mut slow, &bytes),
+                "{start:?} {bytes:?}"
+            );
+            assert_eq!(fast, slow, "{start:?} {bytes:?}");
+        }
     }
 }

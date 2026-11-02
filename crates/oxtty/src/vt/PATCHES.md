@@ -235,6 +235,19 @@ single crate.
   and dropping the extra when its last field is cleared counts it.
   `Term::set_image_tile` (`term/mod.rs`) puts a tile on a screen cell and
   damages it. Writing or erasing a cell replaces its extra, so the tile goes.
+- Printing is batched for speed, with the same result as upstream's
+  character-at-a-time path. `vte/mod.rs`: `ground_dispatch` checks UTF-8 as
+  it dispatches (`utf8_len`, the rules of `str::from_utf8`; the error is read
+  only where the bytes are not valid) and hands the characters between
+  controls to the new `Perform::print_str`, which `vte/ansi.rs` passes to the
+  new `Handler::input_str` (both default to one call per character).
+  `term/mod.rs`: `Term::input_str` writes printable ASCII a row at a time
+  (`input_ascii`) and other characters one or two cells wide in one pass over
+  the row (`input_run`), with the damage, occupied count and cursor `input`
+  leaves; a pending wrap, insert mode, a charset that maps the character, a
+  wide character's cell to overwrite or a wide character that does not fit
+  go through `input`. `char_width` skips the Unicode 11 table search for
+  Latin text, CJK ideographs and Hangul syllables.
 
 These changes are compatibility policy, not upstream behaviour.
 
