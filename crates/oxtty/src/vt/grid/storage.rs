@@ -1,7 +1,7 @@
 use std::cmp::max;
 use std::mem;
 use std::mem::MaybeUninit;
-use std::ops::{Index, IndexMut};
+use std::ops::{Index, IndexMut, Range};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -183,6 +183,48 @@ impl<T> Storage<T> {
                 tmp = *a_ptr.offset(i);
                 *a_ptr.offset(i) = *b_ptr.offset(i);
                 *b_ptr.offset(i) = tmp;
+            }
+        }
+    }
+
+    /// oxtty: moves the rows of screen lines `region` toward the top (`up`) or the bottom by `positions`, as
+    /// swapping rows `positions` apart one pair at a time does for every row that stays in `region`. The rows
+    /// moved out fill the other end, in an order the callers (which reset them) do not rely on. The rows
+    /// move a slice at a time, not a swap at a time.
+    pub fn rotate_region(&mut self, region: Range<Line>, positions: usize, up: bool) {
+        debug_assert!(positions < (region.end - region.start).0 as usize);
+
+        // The buffer holds lines bottom first.
+        let low = self.compute_index(region.end - 1);
+        let high = self.compute_index(region.start);
+        if low <= high {
+            let rows = &mut self.inner[low..=high];
+            if up { rows.rotate_right(positions) } else { rows.rotate_left(positions) }
+            return;
+        }
+
+        // The region wraps around the end of the buffer: its rows are `tail` (from `low` to the end) and then
+        // `head` (from the start to `high`). The rows that cross between the two pieces are swapped over.
+        let (head, tail) = self.inner.split_at_mut(low);
+        let head = &mut head[..=high];
+        if positions <= head.len().min(tail.len()) {
+            let at = tail.len() - positions;
+            if up {
+                head.rotate_right(positions);
+                tail[at..].swap_with_slice(&mut head[..positions]);
+                tail.rotate_right(positions);
+            } else {
+                tail.rotate_left(positions);
+                tail[at..].swap_with_slice(&mut head[..positions]);
+                head.rotate_left(positions);
+            }
+        } else if up {
+            for i in (region.start.0..region.end.0 - positions as i32).map(Line::from) {
+                self.swap(i, i + positions);
+            }
+        } else {
+            for line in ((region.start + positions).0..region.end.0).rev().map(Line::from) {
+                self.swap(line, line - positions);
             }
         }
     }
@@ -771,6 +813,56 @@ mod tests {
         storage.rotate(2);
 
         assert!(storage.zero < storage.inner.len());
+    }
+
+    /// `rotate_region` leaves every row that stays in the region where swapping rows one pair at a time
+    /// does, whether or not the region wraps around the end of the buffer.
+    #[test]
+    fn rotate_region_matches_swaps() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for case in 0..2000 {
+            let visible = 2 + next(12);
+            let len = visible + next(6);
+            let inner = (0..len).map(|i| filled_row(char::from(b'A' + i as u8))).collect();
+            let mut fast = Storage { inner, zero: next(len), visible_lines: visible, len };
+            let mut swapped = fast.clone();
+            let start = next(visible - 1);
+            let end = start + 2 + next(visible - start - 1);
+            let positions = 1 + next(end - start - 1);
+            let up = next(2) == 0;
+            let region = Line(start as i32)..Line(end as i32);
+
+            fast.rotate_region(region.clone(), positions, up);
+            if up {
+                for i in (start..end - positions).map(|i| Line(i as i32)) {
+                    swapped.swap(i, i + positions);
+                }
+            } else {
+                for i in (start + positions..end).rev().map(|i| Line(i as i32)) {
+                    swapped.swap(i, i - positions);
+                }
+            }
+
+            let stays = if up { start..end - positions } else { start + positions..end };
+            let mut vacated = (Vec::new(), Vec::new());
+            for line in (0..visible).map(|i| Line(i as i32)) {
+                if region.contains(&line) && !stays.contains(&(line.0 as usize)) {
+                    vacated.0.push(fast[line][Column(0)]);
+                    vacated.1.push(swapped[line][Column(0)]);
+                } else {
+                    assert_eq!(fast[line], swapped[line], "case {case} line {line}");
+                }
+            }
+            vacated.0.sort();
+            vacated.1.sort();
+            assert_eq!(vacated.0, vacated.1, "case {case}");
+        }
     }
 
     fn filled_row(content: char) -> Row<char> {

@@ -119,8 +119,13 @@ impl<T: Default> Row<T> {
         debug_assert!(!self.inner.is_empty());
 
         // Mark all cells as dirty if template cell changed.
+        // oxtty: the cells from `occ` on are all alike, so the first of them stands for the last one; it sits
+        // next to the cells reset, where the last one of a long row is another cache miss.
         let len = self.inner.len();
-        if self.inner[len - 1].discriminant() != template.discriminant() {
+        debug_assert!(
+            self.occ >= len || self.inner[self.occ].discriminant() == self.inner[len - 1].discriminant()
+        );
+        if self.inner[self.occ.min(len - 1)].discriminant() != template.discriminant() {
             self.occ = len;
         }
 

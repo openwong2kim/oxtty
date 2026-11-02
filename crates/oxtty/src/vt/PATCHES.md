@@ -265,3 +265,60 @@ These changes are compatibility policy, not upstream behaviour.
    `crates/oxtty/Cargo.toml`, then run `cargo test -p oxtty` and the wmux checks
    (`scripts/rust-terminal-core-bench.mjs --verify-only`,
    `scripts/rust-snapshot-verify.mjs`).
+
+## Screen model speed
+
+Same results as upstream, in less time:
+
+- `grid/storage.rs`: `Storage::rotate_region` moves the rows of a scroll
+  region that does not start at the top (DECSTBM, IL, DL) in one
+  `slice::rotate` where they lie in order in the ring buffer, instead of one
+  swap per row (`Grid::scroll_up`, `Grid::scroll_down`); a region that wraps
+  around the buffer's end is rotated in its two pieces, which then swap the
+  rows that cross between them (row by row only when the move is longer than
+  a piece). The rows moved out are reset either way, so their order is not
+  kept.
+- `grid/row.rs`: `Row::reset` compares the template with the cell at `occ`
+  (all cells from there on are alike) rather than the last cell, which on a
+  long row is a cache miss of its own.
+- `term/mod.rs`: `input_ascii` checks and writes each cell in one pass, and
+  `input_run` counts the bytes it took from what is left of the text and
+  puts the pen's extra on the cells it wrote after writing them;
+  `char_width` is always inlined and also skips the table search for the
+  emoticon (U+1F5FB–U+1F64F) and transport (U+1F680–U+1F6C5) emoji, which
+  the table gives two cells; `scroll_up_relative` and
+  `scroll_down_relative` touch the selection only when there is one.
+
+## Parser fast paths
+
+The ground state and CSI parsing take shortcuts with the same actions as
+upstream's byte-at-a-time state machine (checked against it by feeding the
+same input one byte at a time, `vte/mod.rs` `chunked_input_matches_byte_by_byte`).
+
+- `vte/mod.rs`: `advance_ground` no longer searches for ESC first;
+  `ground_dispatch` stops at it, so the text is read once. Printable ASCII is
+  skipped eight bytes at a time (`printable_ascii`), other text goes to
+  `text_end`, which on aarch64 first checks 16 bytes at a time with NEON
+  (`vte/scan.rs`: UTF-8 by Keiser and Lemire's lookup algorithm, as simdjson
+  and simdutf do, plus C0 and C1 controls), and so on WebAssembly built with
+  SIMD128 (`scripts/build-wasm.sh` turns it on). Other targets use the
+  scalar path.
+- A whole CSI after ESC (private marker, parameters, intermediates, final byte,
+  all within the bytes given) is dispatched by `csi_fast` without leaving
+  ground. A CSI of one parameter of at most two digits, or none (`CSI m`,
+  `CSI 0 m`, `CSI 31 m`, `CSI 2 J`), is read from its next three bytes
+  (`Params::set_one`). Otherwise `Params::parse` (`vte/params.rs`) finds the separators of a list
+  longer than eight bytes a word at a time (`classify`), then reads each
+  parameter's digits from a word at once (`word_value`). Anything else — a
+  control or DEL inside, a cut-off sequence, a full parameter list, too many
+  intermediates — goes through the state machine from the ESC as before.
+- `advance_partial_utf8` took the bytes of every valid character after the
+  first one it completed but printed only the first, dropping the others (an
+  ASCII byte after a split `é` was lost when an incomplete character followed
+  within four bytes); it now takes only the first character's bytes.
+- `vte/ansi.rs`: `parse_sgr_color` is generic over its iterator instead of
+  `dyn`, and while no hook is set `csi_dispatch` neither builds the hook id
+  nor looks it up. CUP (`H`, `f`), DECSTBM (`r`) and SGR (`m`, without the
+  colors 38, 48 and 58) with at most two plain parameters are handled before
+  the general match, from `Params::two` instead of the parameter iterator;
+  `sgr_attr` maps a plain SGR parameter for both paths.

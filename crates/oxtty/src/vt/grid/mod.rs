@@ -421,10 +421,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             }
         } else {
             // Subregion rotation.
-            let range = (region.start + positions).0..region.end.0;
-            for line in range.rev().map(Line::from) {
-                self.raw.swap(line, line - positions);
-            }
+            self.raw.rotate_region(region.clone(), positions, false);
 
             let range = region.start.0..(region.start + positions).0;
             for line in range.rev().map(Line::from) {
@@ -497,9 +494,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             }
         } else {
             // Rotate lines without moving anything into history.
-            for i in (region.start.0..region.end.0 - positions as i32).map(Line::from) {
-                self.raw.swap(i, i + positions);
-            }
+            self.raw.rotate_region(region.clone(), positions, true);
         }
 
         // Ensure all new lines are fully cleared.
