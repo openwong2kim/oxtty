@@ -776,12 +776,13 @@ impl Shared {
                 .a11y
                 .as_ref()
                 .map_or(0, |a11y| i64::from(a11y.take_scroll()));
-            let e = core.view.engine();
+            // The view's numbers count the host's lines in viewport-only mode.
+            let view = &core.view;
             if let Some(row) = row {
                 delta += i64::from(row)
-                    - (i64::from(e.history_length()) - i64::from(e.display_offset()));
+                    - (i64::from(view.history_length()) - i64::from(view.display_offset()));
             }
-            delta != 0 && e.scroll_display(-(delta as i32)).is_ok()
+            delta != 0 && view.scroll_display(-(delta as i32)).is_ok()
         };
         if scrolled {
             self.after_change();

@@ -15,6 +15,12 @@
 //!
 //! The selected match is the terminal's selection (`select`), and the next search starts from the selection, whatever
 //! made it (`getSelectionPosition`), like the addon.
+//!
+//! Viewport-only mode ([`crate::remote`]): a search that must read host lines the terminal does not hold returns
+//! false, fetches them a page of [`PAGE`] lines at a time and starts over until it is done, then selects and scrolls to
+//! the match and fires `onDidChangeResults` (also without decorations). A page without any match of the term is
+//! remembered as empty; at most [`HELD_PAGES`] pages with matches are held, as text. Logical lines are cut at page
+//! boundaries and where the engine's own lines begin. With decorations, only held lines are highlighted.
 use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::{Rc, Weak};
 
@@ -23,8 +29,9 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::emitter::{Disposable, Emitter};
-use crate::engine::{get, Engine};
+use crate::engine::{attr, get, Engine, LocalEngineView};
 use crate::events;
+use crate::remote::{self, Row};
 use crate::render::Highlight;
 use crate::terminal::{Shared, Terminal};
 use crate::timer;
@@ -36,6 +43,10 @@ const DEFAULT_HIGHLIGHT_LIMIT: u32 = 1000;
 const UPDATE_DELAY_MS: i32 = 200;
 /// Bit 31 of a `searchLine` cell: the unit is a wide character.
 const CELL_WIDE: u32 = 1 << 31;
+/// Host lines fetched at a time by a search in viewport-only mode.
+const PAGE: u64 = 256;
+/// Pages with matches a search keeps (pages without any are kept as one flag each).
+const HELD_PAGES: usize = 4;
 
 #[wasm_bindgen(typescript_custom_section)]
 const TYPES: &str = r#"
@@ -126,7 +137,7 @@ impl SearchOptions {
 
 /// A match as the search engine finds it: buffer row, column and length in cells (running on into later rows).
 #[derive(Clone, Copy, PartialEq)]
-struct Found {
+struct FoundMatch {
     row: i32,
     col: u32,
     size: u32,
@@ -142,7 +153,7 @@ struct Hit {
 }
 
 impl Hit {
-    fn new(found: Found, trimmed: f64) -> Self {
+    fn new(found: FoundMatch, trimmed: f64) -> Self {
         Self {
             row: f64::from(found.row) + trimmed,
             col: found.col,
@@ -186,11 +197,59 @@ struct Pos {
     col: u32,
 }
 
+/// A host history page a search fetched: no match of the term at all, or its logical lines.
+enum Page {
+    Empty,
+    Lines(Vec<Rc<Line>>),
+}
+
+/// Host history pages of one term and options, by absolute page (`(dropped + row) / PAGE`).
+#[derive(Default)]
+struct HistoryPages {
+    /// Term, regex, case sensitivity, remote generation and dropped host lines the pages were read for.
+    key: Option<(String, bool, bool, u32, u64)>,
+    pages: std::collections::HashMap<u64, Page>,
+    /// Pages with lines, least recently fetched first.
+    held: Vec<u64>,
+    /// Bumped by every search; a history search that sees another value stops.
+    token: u32,
+}
+
+impl HistoryPages {
+    /// Forgets the pages unless they were read for this term, options and history.
+    fn keep_for(&mut self, key: (String, bool, bool, u32, u64)) {
+        if self.key.as_ref() != Some(&key) {
+            self.key = Some(key);
+            self.pages.clear();
+            self.held.clear();
+        }
+    }
+
+    fn insert(&mut self, page: u64, content: Page) {
+        if matches!(content, Page::Lines(_)) {
+            self.held.retain(|&p| p != page);
+            self.held.push(page);
+            if self.held.len() > HELD_PAGES {
+                let old = self.held.remove(0);
+                self.pages.remove(&old);
+            }
+        }
+        self.pages.insert(page, content);
+    }
+}
+
 /// One search over the engine (SearchEngine.ts), reading each line once.
 struct Search<'a> {
     engine: &'a Engine,
     cols: u32,
+    /// Buffer rows above the engine's first line: its line `l` is row `history + l`.
     history: i32,
+    /// Host lines above the engine's own (viewport-only mode), read from `pages`.
+    remote: i32,
+    dropped: u64,
+    pages: Option<&'a HistoryPages>,
+    /// The first host row the search needed and did not have: its result does not count.
+    missing: Option<i32>,
     /// One past the last buffer row (`baseY + rows`).
     end: i32,
     term: &'a JsString,
@@ -204,10 +263,12 @@ struct Search<'a> {
 
 impl<'a> Search<'a> {
     fn new(
-        engine: &'a Engine,
+        view: &'a LocalEngineView,
+        pages: Option<&'a HistoryPages>,
         term: &'a JsString,
         options: &SearchOptions,
     ) -> Result<Self, JsValue> {
+        let engine = view.engine();
         let flags = if options.case_sensitive { "g" } else { "gi" };
         let regex = if options.regex {
             Some(pattern(term, flags)?)
@@ -215,11 +276,16 @@ impl<'a> Search<'a> {
             None
         };
         let fold_case = !options.regex && !options.case_sensitive;
-        let history = engine.history_length() as i32;
+        let history = view.history_length() as i32;
+        let remote = view.remote_lines() as i32;
         Ok(Self {
             engine,
             cols: engine.cols().max(1),
             history,
+            remote,
+            dropped: view.remote().map_or(0, |r| r.dropped()),
+            pages: pages.filter(|_| remote > 0),
+            missing: None,
             end: history + engine.rows() as i32,
             term,
             needle: if fold_case {
@@ -244,6 +310,9 @@ impl<'a> Search<'a> {
         if row < 0 || row >= self.end {
             return None;
         }
+        if row < self.remote {
+            return self.host_line(row);
+        }
         let value = self.engine.search_line(row - self.history).ok()?;
         if !value.is_object() {
             return None;
@@ -262,8 +331,58 @@ impl<'a> Search<'a> {
         Some(line)
     }
 
+    /// Host row `row`'s logical line from the fetched pages; notes it as missing when its page is not held.
+    fn host_line(&mut self, row: i32) -> Option<Rc<Line>> {
+        let abs = self.dropped + row as u64;
+        let page = match self.pages.and_then(|pages| pages.pages.get(&(abs / PAGE))) {
+            Some(page) => page,
+            None => {
+                self.missing.get_or_insert(row);
+                return None;
+            }
+        };
+        let line = match page {
+            Page::Lines(lines) => lines
+                .iter()
+                .find(|l| row >= l.first && row < l.first + l.rows)?
+                .clone(),
+            // One line of nothing over the page's rows.
+            Page::Empty => {
+                let first = ((abs / PAGE * PAGE).saturating_sub(self.dropped)) as i32;
+                let end = (((abs / PAGE + 1) * PAGE - self.dropped) as i32).min(self.remote);
+                Rc::new(Line {
+                    first,
+                    rows: (end - first).max(1),
+                    text: JsString::from(""),
+                    lower: OnceCell::new(),
+                    cells: Vec::new(),
+                })
+            }
+        };
+        self.line = Some(line.clone());
+        Some(line)
+    }
+
+    /// Whether the term occurs anywhere in `text` (whole words or not): pages without it need not be kept.
+    fn occurs_in(&self, text: &JsString) -> Result<bool, JsValue> {
+        Ok(match &self.regex {
+            Some(regex) => {
+                regex.set_last_index(0);
+                !regex.exec(text)?.is_null()
+            }
+            None => {
+                let text = if self.fold_case {
+                    text.to_lower_case()
+                } else {
+                    text.clone()
+                };
+                text.unchecked_ref::<Text>().index_of(&self.needle, 0) >= 0
+            }
+        })
+    }
+
     /// `SearchEngine.find`: the first match at or after (`row`, `col`), down to the bottom of the screen.
-    fn find(&mut self, row: i32, col: u32) -> Result<Option<Found>, JsValue> {
+    fn find(&mut self, row: i32, col: u32) -> Result<Option<FoundMatch>, JsValue> {
         if col >= self.cols {
             // The addon throws; its callers never get here.
             return Ok(None);
@@ -280,7 +399,7 @@ impl<'a> Search<'a> {
     }
 
     /// Every match from the top, as `_highlightAllMatches` collects them.
-    fn find_all(&mut self, limit: u32) -> Result<Vec<Found>, JsValue> {
+    fn find_all(&mut self, limit: u32) -> Result<Vec<FoundMatch>, JsValue> {
         let mut results = Vec::new();
         let mut previous: Option<(i32, u32)> = None;
         let mut result = self.find(0, 0)?;
@@ -306,7 +425,7 @@ impl<'a> Search<'a> {
         &mut self,
         selection: Option<SelectionPosition>,
         same_term: bool,
-    ) -> Result<Option<Found>, JsValue> {
+    ) -> Result<Option<FoundMatch>, JsValue> {
         let (start_col, start_row) = match selection {
             Some(s) if same_term => s.end,
             Some(s) => s.start,
@@ -349,7 +468,7 @@ impl<'a> Search<'a> {
         &mut self,
         selection: Option<SelectionPosition>,
         same_term: bool,
-    ) -> Result<Option<Found>, JsValue> {
+    ) -> Result<Option<FoundMatch>, JsValue> {
         let bottom = self.end - 1;
         let mut start_row = bottom;
         let mut pos = Pos {
@@ -407,7 +526,11 @@ impl<'a> Search<'a> {
     /// A row that continues a wrapped line is searched from its line's first row going forwards, and skipped
     /// (widening `pos.col` to cover it) going backwards.
     #[inline(never)]
-    fn find_in_line(&mut self, pos: &mut Pos, reverse: bool) -> Result<Option<Found>, JsValue> {
+    fn find_in_line(
+        &mut self,
+        pos: &mut Pos,
+        reverse: bool,
+    ) -> Result<Option<FoundMatch>, JsValue> {
         let Some(line) = self.line(pos.row) else {
             return Ok(None);
         };
@@ -495,12 +618,146 @@ impl<'a> Search<'a> {
             }
             _ => start,
         };
-        Ok(Some(Found {
+        Ok(Some(FoundMatch {
             row: line.first + (start / self.cols) as i32,
             col: start % self.cols,
             size: end.saturating_sub(start),
         }))
     }
+}
+
+/// What one search pass gave.
+enum Found {
+    Hit(FoundMatch),
+    None,
+    /// The first host row it needed and the terminal does not hold.
+    Missing(i32),
+}
+
+/// A `findNext`/`findPrevious` call, kept while a history search goes on.
+struct Find {
+    term: JsString,
+    options: SearchOptions,
+    forward: bool,
+    no_scroll: bool,
+    selection: Option<SelectionPosition>,
+    same_term: bool,
+}
+
+/// The fetch of the history page holding a host row.
+struct PageFetch {
+    provider: Object,
+    page: u64,
+    start: u32,
+    count: u32,
+    cols: u32,
+    generation: u32,
+}
+
+/// Pages are read for one term, options and host history.
+fn page_key(
+    view: &LocalEngineView,
+    term: &JsString,
+    options: &SearchOptions,
+) -> (String, bool, bool, u32, u64) {
+    let remote = view.remote();
+    (
+        String::from(term),
+        options.regex,
+        options.case_sensitive,
+        remote.map_or(0, |r| r.generation()),
+        remote.map_or(0, |r| r.dropped()),
+    )
+}
+
+/// The page of host row `row`, clipped to the host lines; `None` when the mode is off.
+fn page_request(shared: &Rc<Shared>, row: i32) -> Option<PageFetch> {
+    let core = shared.core.try_borrow().ok()?;
+    if core.disposed {
+        return None;
+    }
+    let remote = core.view.remote()?;
+    let lines = u64::from(core.view.remote_lines());
+    let abs = remote.dropped() + u64::try_from(row).ok()?;
+    let page = abs / PAGE;
+    let start = (page * PAGE).saturating_sub(remote.dropped());
+    let end = ((page + 1) * PAGE - remote.dropped()).min(lines);
+    (start < end).then(|| PageFetch {
+        provider: remote.provider().clone(),
+        page,
+        start: start as u32,
+        count: (end - start) as u32,
+        cols: core.view.engine().cols(),
+        generation: remote.generation(),
+    })
+}
+
+/// The logical lines of fetched host rows starting at buffer row `first`, as the engine's `searchLine` reads its
+/// own (crates/oxtty/src/search.rs `read_line`): cut where the page ends.
+fn page_lines(rows: &[Option<Row>], first: i32, cols: u32) -> Vec<Rc<Line>> {
+    let mut lines = Vec::new();
+    let mut i = 0;
+    let mut row_cells = vec![0u32; cols as usize * 4];
+    while i < rows.len() {
+        let start = i;
+        let (mut units, mut cells) = (Vec::<u16>::new(), Vec::new());
+        let mut keep = 0;
+        loop {
+            let row = rows[i].as_ref();
+            match row {
+                Some(row) => row.copy_cells(&mut row_cells),
+                None => crate::engine::blank_row(&mut row_cells),
+            }
+            let base = (i - start) as u32 * cols;
+            for (col, cell) in row_cells.chunks_exact(4).enumerate() {
+                let attrs = cell[3];
+                if attrs & (attr::WIDE_SPACER | attr::LEADING_WIDE_SPACER) != 0 {
+                    continue;
+                }
+                let at = (base + col as u32)
+                    | if attrs & attr::WIDE != 0 {
+                        CELL_WIDE
+                    } else {
+                        0
+                    };
+                let marks = row.and_then(|r| {
+                    r.extras
+                        .iter()
+                        .find(|e| e.col == col as u32)
+                        .and_then(|e| e.text.as_deref())
+                });
+                let text = match marks {
+                    Some(text) => text.to_string(),
+                    None => char::from_u32(cell[0])
+                        .filter(|&c| c != '\0')
+                        .unwrap_or(' ')
+                        .to_string(),
+                };
+                for unit in text.encode_utf16() {
+                    units.push(unit);
+                    cells.push(at);
+                }
+                let empty = marks.is_none() && text == " " && attrs & attr::TYPED_SPACE == 0;
+                if !empty {
+                    keep = units.len();
+                }
+            }
+            i += 1;
+            if !row.is_some_and(|r| r.wrapped) || i >= rows.len() {
+                break;
+            }
+        }
+        units.truncate(keep);
+        cells.truncate(keep);
+        lines.push(Rc::new(Line {
+            first: first + start as i32,
+            rows: (i - start) as i32,
+            text: JsString::from_char_code(&units),
+            lower: OnceCell::new(),
+            cells,
+        }));
+    }
+    lines
 }
 
 /// Length of `exec`'s whole match, 0 for no match.
@@ -557,6 +814,8 @@ struct SearchState {
     id: u32,
     highlight_limit: u32,
     inner: RefCell<Inner>,
+    /// Host history pages read for the current term (viewport-only mode).
+    history: RefCell<HistoryPages>,
     before_search: Rc<Emitter>,
     after_search: Rc<Emitter>,
     did_change_results: Rc<Emitter>,
@@ -678,6 +937,10 @@ impl SearchState {
             return Err(js_sys::Error::new("Cannot use addon until it has been loaded").into());
         };
         self.before_search.fire(&[]);
+        {
+            let mut history = self.history.borrow_mut();
+            history.token = history.token.wrapping_add(1);
+        }
         let term: JsString = term.dyn_into().unwrap_or_else(|_| JsString::from(""));
         let decorations = options.as_ref().and_then(|o| o.decorations.clone());
         let highlight = {
@@ -697,18 +960,7 @@ impl SearchState {
             .scroll_lines(amount);
         }
         if decorations.is_some() {
-            let (index, count) = {
-                let inner = self.inner.borrow();
-                let index = inner
-                    .active
-                    .and_then(|a| inner.results.iter().position(|&r| r == a))
-                    .map_or(-1, |i| i as i32);
-                (index, inner.results.len() as u32)
-            };
-            let event = Object::new();
-            let _ = Reflect::set(&event, &"resultIndex".into(), &index.into());
-            let _ = Reflect::set(&event, &"resultCount".into(), &count.into());
-            self.did_change_results.fire(&[&event.into()]);
+            self.fire_results();
         }
         self.inner.borrow_mut().cached_term = Some(term);
         self.after_search.fire(&[]);
@@ -733,9 +985,11 @@ impl SearchState {
             if core.disposed {
                 return Ok(());
             }
-            let engine = core.view.engine();
-            let results = Search::new(engine, term, options)?.find_all(self.highlight_limit)?;
-            (results, engine.trimmed_lines())
+            let mut history = self.history.borrow_mut();
+            history.keep_for(page_key(&core.view, term, options));
+            let results = Search::new(&core.view, Some(&history), term, options)?
+                .find_all(self.highlight_limit)?;
+            (results, core.view.trimmed_lines())
         };
         let mut inner = self.inner.borrow_mut();
         inner.results = results.into_iter().map(|f| Hit::new(f, trimmed)).collect();
@@ -748,7 +1002,7 @@ impl SearchState {
     /// `_findNextAndSelect`/`_findPreviousAndSelect` and `_selectResult`: whether a match was selected, and the
     /// lines to scroll to bring it into view.
     fn find_and_select(
-        &self,
+        self: &Rc<Self>,
         shared: &Rc<Shared>,
         term: &JsString,
         options: &SearchOptions,
@@ -766,32 +1020,78 @@ impl SearchState {
         // `findNextWithSelection`/`findPreviousWithSelection` read the selection, then clear it.
         let selection = SelectionPosition::of(shared);
         terminal.clear_selection();
-        let (found, trimmed, rows, viewport_y) = {
+        let same_term = self.inner.borrow().cached_term.as_ref() == Some(term);
+        let request = Find {
+            term: term.clone(),
+            options: options.clone(),
+            forward,
+            no_scroll,
+            selection,
+            same_term,
+        };
+        match self.find(shared, &request)? {
+            Some(Found::Missing(row)) => {
+                // Host lines are needed: go on without blocking, and leave nothing selected until then.
+                self.inner.borrow_mut().active = None;
+                self.search_history(shared, request, row);
+                Ok((false, None))
+            }
+            Some(found) => Ok(self.select(shared, &request, found)),
+            None => Ok((false, None)),
+        }
+    }
+
+    /// One pass of `findNextWithSelection`/`findPreviousWithSelection` over what the terminal holds: the match,
+    /// none, or the first host row it needed and does not have; `None` after dispose.
+    fn find(&self, shared: &Rc<Shared>, request: &Find) -> Result<Option<Found>, JsValue> {
+        let core = shared.core.borrow();
+        if core.disposed {
+            return Ok(None);
+        }
+        let mut history = self.history.borrow_mut();
+        history.keep_for(page_key(&core.view, &request.term, &request.options));
+        let mut search = Search::new(&core.view, Some(&history), &request.term, &request.options)?;
+        let found = if request.forward {
+            search.find_next(request.selection, request.same_term)?
+        } else {
+            search.find_previous(request.selection, request.same_term)?
+        };
+        Ok(Some(match (search.missing, found) {
+            (Some(row), _) => Found::Missing(row),
+            (None, Some(hit)) => Found::Hit(hit),
+            (None, None) => Found::None,
+        }))
+    }
+
+    /// `_selectResult`: selects the match (or clears the selection); whether there was one and the lines to scroll
+    /// to bring it into view.
+    fn select(&self, shared: &Rc<Shared>, request: &Find, found: Found) -> (bool, Option<i32>) {
+        let terminal = Terminal {
+            shared: shared.clone(),
+        };
+        let options = &request.options;
+        let (trimmed, rows, viewport_y) = {
             let core = shared.core.borrow();
             if core.disposed {
-                return Ok((false, None));
+                return (false, None);
             }
-            let engine = core.view.engine();
-            let same_term = self.inner.borrow().cached_term.as_ref() == Some(term);
-            let mut search = Search::new(engine, term, options)?;
-            let found = if forward {
-                search.find_next(selection, same_term)?
-            } else {
-                search.find_previous(selection, same_term)?
-            };
-            let viewport_y = engine.history_length() as i32 - engine.display_offset() as i32;
+            let view = &core.view;
             (
-                found,
-                engine.trimmed_lines(),
-                engine.rows() as i32,
-                viewport_y,
+                view.trimmed_lines(),
+                view.engine().rows() as i32,
+                view.history_length() as i32 - view.display_offset() as i32,
             )
+        };
+        let no_scroll = request.no_scroll;
+        let found = match found {
+            Found::Hit(found) => Some(found),
+            _ => None,
         };
         // `_selectResult`
         self.inner.borrow_mut().active = None;
         let Some(found) = found else {
             terminal.clear_selection();
-            return Ok((false, None));
+            return (false, None);
         };
         terminal.select(found.col.into(), found.row.into(), found.size.into());
         if options.decorations.is_some() {
@@ -801,7 +1101,139 @@ impl SearchState {
         }
         let scroll = (!no_scroll && (found.row >= viewport_y + rows || found.row < viewport_y))
             .then(|| found.row - viewport_y - rows / 2);
-        Ok((true, scroll))
+        (true, scroll)
+    }
+
+    /// Goes on with a search that needs host lines: fetches the page of `row`, searches again, until it is done or
+    /// another search starts. Then selects and scrolls like `findNext` and fires `onDidChangeResults`.
+    fn search_history(self: &Rc<Self>, shared: &Rc<Shared>, request: Find, row: i32) {
+        let token = self.history.borrow().token;
+        let state = Rc::downgrade(self);
+        let terminal = Rc::downgrade(shared);
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut row = row;
+            let mut tried = Vec::new();
+            loop {
+                let (Some(state), Some(shared)) = (state.upgrade(), terminal.upgrade()) else {
+                    return;
+                };
+                let Some(fetch) = page_request(&shared, row) else {
+                    return;
+                };
+                // A page asked for twice did not help: the host does not have it.
+                let found = if !tried.contains(&fetch.page) {
+                    tried.push(fetch.page);
+                    let rows =
+                        remote::fetch_rows(&fetch.provider, fetch.start, fetch.count, fetch.cols)
+                            .await;
+                    if state.history.borrow().token != token {
+                        return;
+                    }
+                    match rows {
+                        Ok(rows) => {
+                            state.store_page(&shared, &request, &fetch, &rows);
+                            match state.find(&shared, &request) {
+                                Ok(found) => found,
+                                Err(error) => {
+                                    web_sys::console::error_1(&error);
+                                    return;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            web_sys::console::warn_1(&error);
+                            Some(Found::None)
+                        }
+                    }
+                } else {
+                    Some(Found::None)
+                };
+                match found {
+                    None => return,
+                    Some(Found::Missing(next)) => row = next,
+                    Some(found) => {
+                        state.finish_history(&shared, &request, found);
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Keeps a fetched page: its logical lines when the term occurs in it, else a note that it does not.
+    fn store_page(
+        &self,
+        shared: &Rc<Shared>,
+        request: &Find,
+        fetch: &PageFetch,
+        rows: &[Option<Row>],
+    ) {
+        let Ok(core) = shared.core.try_borrow() else {
+            return;
+        };
+        if core.disposed {
+            return;
+        }
+        let mut history = self.history.borrow_mut();
+        let key = page_key(&core.view, &request.term, &request.options);
+        if history.key.as_ref() != Some(&key) || key.3 != fetch.generation {
+            return;
+        }
+        let Ok(search) = Search::new(&core.view, None, &request.term, &request.options) else {
+            return;
+        };
+        let lines = page_lines(rows, fetch.start as i32, search.cols);
+        let mut occurs = false;
+        for line in &lines {
+            match search.occurs_in(&line.text) {
+                Ok(true) => {
+                    occurs = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(_) => return,
+            }
+        }
+        history.insert(
+            fetch.page,
+            if occurs {
+                Page::Lines(lines)
+            } else {
+                Page::Empty
+            },
+        );
+    }
+
+    /// Ends a history search like `search` ends a synchronous one.
+    fn finish_history(self: &Rc<Self>, shared: &Rc<Shared>, request: &Find, found: Found) {
+        if shared.core.borrow().disposed {
+            return;
+        }
+        let (_, scroll) = self.select(shared, request, found);
+        if let Some(amount) = scroll {
+            let _ = Terminal {
+                shared: shared.clone(),
+            }
+            .scroll_lines(amount);
+        }
+        self.fire_results();
+        self.paint();
+    }
+
+    /// `onDidChangeResults` with the active match's index and the match count.
+    fn fire_results(&self) {
+        let (index, count) = {
+            let inner = self.inner.borrow();
+            let index = inner
+                .active
+                .and_then(|a| inner.results.iter().position(|&r| r == a))
+                .map_or(-1, |i| i as i32);
+            (index, inner.results.len() as u32)
+        };
+        let event = Object::new();
+        let _ = Reflect::set(&event, &"resultIndex".into(), &index.into());
+        let _ = Reflect::set(&event, &"resultCount".into(), &count.into());
+        self.did_change_results.fire(&[&event.into()]);
     }
 
     /// Hands the decorations in view to the renderer.
@@ -818,9 +1250,13 @@ impl SearchState {
         if core.disposed || core.renderer.is_none() {
             return;
         }
-        let engine = core.view.engine();
-        let (cols, rows, trimmed) = (engine.cols(), engine.rows(), engine.trimmed_lines());
-        let viewport_y = f64::from(engine.history_length()) - f64::from(engine.display_offset());
+        let view = &core.view;
+        let (cols, rows, trimmed) = (
+            view.engine().cols(),
+            view.engine().rows(),
+            view.trimmed_lines(),
+        );
+        let viewport_y = f64::from(view.history_length()) - f64::from(view.display_offset());
         let mut highlights = Vec::new();
         if let Some(colors) = &inner.colors {
             let mut add = |hit: Hit, background: &Option<String>, border: &Option<String>| {
@@ -900,6 +1336,7 @@ impl SearchAddon {
             id: NEXT_ID.with(|n| n.replace(n.get().wrapping_add(1))),
             highlight_limit,
             inner: RefCell::default(),
+            history: RefCell::default(),
             before_search: Rc::default(),
             after_search: Rc::default(),
             did_change_results: Rc::default(),

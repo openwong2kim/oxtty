@@ -11,6 +11,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..', '..');
 const TYPES = { '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm', '.css': 'text/css' };
 const IMPORTS = {
+  oxtty: '/dist/index.js',
   'oxtty/xterm': '/dist/xterm.js',
   '@xterm/xterm': '/node_modules/@xterm/xterm/lib/xterm.mjs',
   '@xterm/addon-webgl': '/node_modules/@xterm/addon-webgl/lib/addon-webgl.mjs',

@@ -38,6 +38,7 @@ pub mod links;
 pub mod markers;
 pub mod options;
 pub mod parser;
+pub mod remote;
 pub mod render;
 pub mod scrollbar;
 pub mod search;

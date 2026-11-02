@@ -5,6 +5,9 @@
 //! when read (so `buffer.active !== buffer.normal`, unlike xterm.js); `getLine` copies one row, a code point and
 //! the attributes per cell, never the buffer. The engine keeps only the active screen readable: the other buffer
 //! reads as empty (xterm.js keeps the normal buffer readable under the alternate one).
+//!
+//! In viewport-only mode ([`crate::remote`]) lines `0..H` are the host's: `getLine` returns the fetched row, or a
+//! blank line of `cols` cells while it is not fetched (and asks for it), never `undefined` inside the buffer.
 use std::rc::Rc;
 
 use js_sys::{Array, Object};
@@ -118,34 +121,31 @@ impl BufferView {
     /// Line shown at the top of the viewport.
     #[wasm_bindgen(getter = viewportY)]
     pub fn viewport_y(&self) -> u32 {
-        self.read(|view| {
-            let e = view.engine();
-            e.history_length().saturating_sub(e.display_offset())
-        })
-        .unwrap_or(0)
+        self.read(|view| view.history_length().saturating_sub(view.display_offset()))
+            .unwrap_or(0)
     }
 
-    /// Line at the top of the screen: the scrollback length.
+    /// Line at the top of the screen: the scrollback length (the host's lines included in viewport-only mode).
     #[wasm_bindgen(getter = baseY)]
     pub fn base_y(&self) -> u32 {
-        self.read(|view| view.engine().history_length())
-            .unwrap_or(0)
+        self.read(|view| view.history_length()).unwrap_or(0)
     }
 
     /// Scrollback plus screen lines.
     #[wasm_bindgen(getter)]
     pub fn length(&self) -> u32 {
-        self.read(|view| {
-            let e = view.engine();
-            e.history_length().saturating_add(e.rows())
-        })
-        .unwrap_or(0)
+        self.read(|view| view.history_length().saturating_add(view.engine().rows()))
+            .unwrap_or(0)
     }
 
     /// A copy of line `y` taken now (xterm.js hands out a live view), or `undefined` outside `0..length`.
     #[wasm_bindgen(js_name = getLine)]
     pub fn get_line(&self, y: f64) -> Option<BufferLine> {
-        self.read(|view| read_line(view, y)).flatten()
+        let line = self.read(|view| read_line(view, y)).flatten();
+        // A host line not fetched yet was asked for: the fetch calls the host, so it waits for the next task (the
+        // caller may hold borrows of its own).
+        crate::remote::fetch_soon(&self.shared);
+        line
     }
 
     /// OSC 8 hyperlinks of line `y` as `(column, id, uri)`; empty outside the buffer. For links that reach past the
@@ -153,9 +153,20 @@ impl BufferView {
     pub(crate) fn hyperlinks(&self, y: f64) -> Vec<(u32, String, String)> {
         self.read(|view| {
             let e = view.engine();
-            let history = f64::from(e.history_length());
+            let history = f64::from(view.history_length());
             if !(y >= 0.0 && y.fract() == 0.0 && y < history + f64::from(e.rows())) {
                 return Vec::new();
+            }
+            if let Some(remote) = view.remote().filter(|_| y < f64::from(view.remote_lines())) {
+                return remote.row(y as u32).map_or_else(Vec::new, |row| {
+                    row.extras
+                        .iter()
+                        .filter_map(|extra| {
+                            let link = extra.hyperlink.as_ref()?;
+                            Some((extra.col, link.id.clone(), link.uri.clone()))
+                        })
+                        .collect()
+                });
             }
             let extras = e.row_extras((y - history) as i32).unwrap_or(JsValue::NULL);
             if !Array::is_array(&extras) {
@@ -191,9 +202,13 @@ impl BufferView {
 
 fn read_line(view: &LocalEngineView, y: f64) -> Option<BufferLine> {
     let e = view.engine();
-    let history = e.history_length();
+    let history = view.history_length();
     if !(y >= 0.0 && y.fract() == 0.0 && y < f64::from(history) + f64::from(e.rows())) {
         return None;
+    }
+    let remote_lines = view.remote_lines();
+    if let Some(remote) = view.remote().filter(|_| y < f64::from(remote_lines)) {
+        return Some(remote_line(remote, y as u32, e.cols()));
     }
     let line = (y - f64::from(history)) as i32;
     // A view into engine memory: copy it before the next engine call.
@@ -224,12 +239,53 @@ fn read_line(view: &LocalEngineView, y: f64) -> Option<BufferLine> {
         }
     }
     // Engine rows carry "wraps into the next row"; xterm.js lines carry "continues the previous one".
-    let wrapped = line > -(history as i32) && e.row_wrapped(line - 1).unwrap_or(false);
+    let local = history - remote_lines;
+    let wrapped = if line > -(local as i32) {
+        e.row_wrapped(line - 1).unwrap_or(false)
+    } else {
+        // The engine's oldest line continues the host's newest one, if that is fetched.
+        remote_lines > 0
+            && view
+                .remote()
+                .and_then(|r| r.row(remote_lines - 1))
+                .is_some_and(|row| row.wrapped)
+    };
     Some(BufferLine {
         cells,
         texts,
         wrapped,
     })
+}
+
+/// Host line `y` in viewport-only mode: the fetched row, or a blank line of `cols` cells (asked for) until then.
+fn remote_line(remote: &crate::remote::Remote, y: u32, cols: u32) -> BufferLine {
+    let wrapped = y > 0 && remote.row(y - 1).is_some_and(|row| row.wrapped);
+    let Some(row) = remote.row(y) else {
+        remote.want(y, y + 1);
+        return BufferLine {
+            cells: vec![0; 2 * cols as usize],
+            texts: Vec::new(),
+            wrapped,
+        };
+    };
+    let mut cells = vec![0; cols as usize * 4];
+    row.copy_cells(&mut cells);
+    let count = cells.len() / 4;
+    for x in 0..count {
+        cells[2 * x] = cells[4 * x];
+        cells[2 * x + 1] = cells[4 * x + 3];
+    }
+    cells.truncate(2 * count);
+    let texts = row
+        .extras
+        .iter()
+        .filter_map(|extra| Some((extra.col, extra.text.clone()?)))
+        .collect();
+    BufferLine {
+        cells,
+        texts,
+        wrapped,
+    }
 }
 
 /// xterm.js `IBufferLine`: a copy of one row.

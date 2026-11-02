@@ -559,7 +559,7 @@ pub(crate) fn send_data(shared: &Rc<Shared>, data: &JsValue, user_input: bool) {
         }
         user_input
             && option(&core.options, "scrollOnUserInput").is_truthy()
-            && core.view.engine().display_offset() != 0
+            && core.view.display_offset() != 0
     };
     if scroll {
         let _ = terminal(shared).scroll_to_bottom();

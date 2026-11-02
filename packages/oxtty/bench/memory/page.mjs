@@ -1,12 +1,19 @@
-// The page bench.mjs opens: `setup(kind, n, cols, rows, lines, blink)` builds `n` terminals of one kind ('oxtty' or
-// 'xterm' with @xterm/addon-webgl), all in view, feeds each the same log output and waits a few frames. `idle()`
-// focuses the first terminal; `counts()` reports the WebGL draw calls and canvas `drawImage` calls since its last call.
-// `breakdown()` reports the WebAssembly memories and canvas backing stores (for breakdown.mjs); `hide(hidden)` and
-// `dispose()` take the terminals out of view and dispose of them; `startBusy(interval)` and `stopBusy()` keep every
+// The page bench.mjs opens: `setup(kind, n, cols, rows, lines, blink)` builds `n` terminals of one kind ('oxtty',
+// 'viewport' or 'xterm' with @xterm/addon-webgl), all in view, feeds each the same log output and waits a few frames.
+// 'viewport' is oxtty in viewport-only mode: a scrollback of VIEWPORT_MARGIN lines and a history provider standing for
+// wmux's daemon, which keeps the history in another process (here it makes rows up on demand and holds nothing).
+// `idle()` focuses the first terminal; `counts()` reports the WebGL draw calls and canvas `drawImage` calls since its
+// last call. `breakdown()` reports the WebAssembly memories and canvas backing stores (for breakdown.mjs); `hide(hidden)`
+// and `dispose()` take the terminals out of view and dispose of them; `startBusy(interval)` and `stopBusy()` keep every
 // terminal printing (busy.mjs).
 import { Terminal as XtermTerminal } from '@xterm/xterm';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { init, Terminal } from 'oxtty/xterm';
+import initFrontEnd from '/dist/xterm_web.js';
+import { Terminal as Engine } from 'oxtty';
+
+/** Local scrollback of a viewport-only terminal: the margin wmux would use. */
+const VIEWPORT_MARGIN = 200;
 
 /** 1000 lines of coloured words (Hangul, box drawing, paths), deterministic for a seed. */
 function chunk(cols, seed0) {
@@ -108,10 +115,14 @@ window.setup = async (kind, n, cols, rows, lines, blink) => {
     document.body.appendChild(host);
     // `mixed`: sizes differ from pane to pane, as in a split layout
     const size = window.mixed ? { cols: cols - (i % 5) * 7, rows: rows - (i % 3) * 5 } : { cols, rows };
-    const options = { ...size, scrollback: 10000, fontFamily: 'Menlo, monospace', fontSize: 12, cursorBlink: blink };
+    const scrollback = kind === 'viewport' ? VIEWPORT_MARGIN : 10000;
+    const options = { ...size, scrollback, fontFamily: 'Menlo, monospace', fontSize: 12, cursorBlink: blink };
     const term = kind === 'xterm' ? new XtermTerminal(options) : new Terminal(options);
     term.open(host);
     if (kind === 'xterm') term.loadAddon(new WebglAddon());
+    if (kind === 'viewport') {
+      term.setHistoryProvider({ length: 0, limit: 10000, fetch: async (start, count) => new Array(count).fill(`line ${start}`) });
+    }
     for (let k = 0; k < lines / 1000; k++) await new Promise((resolve) => term.write(chunk(size.cols, 7 + k), resolve));
     terms.push(term);
   }
@@ -119,7 +130,14 @@ window.setup = async (kind, n, cols, rows, lines, blink) => {
   window.terms = terms;
   const gl = document.createElement('canvas').getContext('webgl2');
   const info = gl?.getExtension('WEBGL_debug_renderer_info');
-  return { gpuName: info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : '?', canvases: document.querySelectorAll('canvas').length };
+  // WebAssembly memory: the engine instance all terminals share (read through a probe's row view) and the front end.
+  let wasm = null;
+  if (kind !== 'xterm') {
+    const probe = new Engine({ cols: 2, rows: 1, scrollback: 0 });
+    wasm = { engine: probe.rowCellsView(0).buffer.byteLength, frontEnd: (await initFrontEnd()).memory.buffer.byteLength };
+    probe.dispose();
+  }
+  return { gpuName: info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : '?', canvases: document.querySelectorAll('canvas').length, wasm };
 };
 
 window.idle = () => {

@@ -10,6 +10,7 @@ bash scripts/build-wasm.sh && bash scripts/build-web.sh   # repository root
 cd packages/oxtty && npm ci
 npm run bench:memory                # 17 panes, 10,000 lines each
 npm run bench:memory -- 8 2000      # [panes] [lines]
+npm run bench:memory -- 17 10000 oxtty,viewport   # [kinds]: oxtty, viewport, xterm
 ```
 
 - It runs **system Chrome** through Playwright (`channel: 'chrome'`), headless

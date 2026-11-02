@@ -159,8 +159,11 @@ impl Terminal {
         if core.disposed {
             return None;
         }
-        let e = core.view.engine();
-        Some(e.history_length().saturating_sub(e.display_offset()))
+        Some(
+            core.view
+                .history_length()
+                .saturating_sub(core.view.display_offset()),
+        )
     }
 
     /// `scrollLines(amount)` unless the amount is 0 or the terminal is disposed (xterm.js does nothing then).
