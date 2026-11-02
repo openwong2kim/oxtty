@@ -198,6 +198,116 @@ for xterm.js headless (wmux daemon experiment, local).
 some output: 120 ms against 104 ms for log lines, 89 ms against 67 ms for
 Hangul lines.
 
+### Against other engines
+
+oxtty is not one of the fastest parsers. As an engine, which is bytes in and
+a screen model out, it lands third to fifth of six on throughput. It is
+always ahead of WezTerm's engine and always behind its own upstream,
+Alacritty. Ghostty's libghostty-vt is fastest on three of the six outputs,
+by 1.8–2.9×. Where oxtty leads is memory. With 10,000 lines of scrollback it
+grew the least on three of the four outputs that keep history, by 3–9 MiB.
+Alacritty grew by 30 MiB on each output that filled 10,000 lines.
+
+**Native, MiB/s**, higher is better. Each engine gets the same corpus as the
+table above: 120×40, 10,000 lines of scrollback, 8 MiB per output fed in
+64 KiB chunks. The figure is the median of 5 runs, and the engines take turns
+within each run. Every engine ends on the same 40 rows of visible text in
+every output.
+
+| Output | oxtty | oxtty, uncompressed | Alacritty | Ghostty | avt | vt100 | WezTerm |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Log lines, some colour | 91 | 81 | 101 | **289** | 92 | 39 | 49 |
+| Truecolor fg and bg in every cell | 183 | 198 | 318 | 205 | **351** | 337 | 159 |
+| Hangul, CJK and emoji | 87 | 123 | 150 | **269** | 119 | 101 | 52 |
+| Cursor jumps (TUI redraw) | 142 | 142 | 221 | 187 | 233 | **237** | 81 |
+| Scrolling region (DECSTBM) | 139 | 140 | 187 | **423** | 128 | 166 | 63 |
+| Short lines into scrollback | 80 | 74 | **117** | 104 | 41 | 33 | 35 |
+
+**Native, peak RSS growth in MiB**, lower is better. This is the memory one
+engine takes to swallow one output, in a fresh process. Cursor jumps and the
+scrolling region keep no history and stay under 2.5 MiB for every engine.
+
+| Output | oxtty | oxtty, uncompressed | Alacritty | Ghostty | avt | vt100 | WezTerm |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Log lines (10,000 lines kept) | **3.3** | 30.4 | 30.1 | 10.6 | 55.0 | 94.0 | 8.2 |
+| Truecolor (1,989 lines kept) | **4.2** | 6.6 | 6.3 | 11.9 | 4.5 | 8.4 | 30.1 |
+| Hangul, CJK and emoji (10,000) | 9.0 | 30.3 | 30.2 | 10.7 | 48.0 | 75.6 | **8.2** |
+| Short lines (10,000) | **2.9** | 30.3 | 30.3 | 10.5 | 71.3 | 12.6 | 9.1 |
+
+**In Node (WebAssembly)**, oxtty's wasm build runs against Ghostty's wasm
+build in [ghostty-web](https://github.com/coder/ghostty-web) 0.4.0 and
+against xterm.js headless. The figures are MiB/s and peak RSS growth in MiB.
+
+| Output | oxtty wasm | MiB | ghostty-web | MiB | xterm.js | MiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Log lines, some colour | 61 | **18** | 67 | 39 | **78** | 47 |
+| Truecolor fg and bg in every cell | **141** | 20 | 18 | 43 | 121 | **19** |
+| Hangul, CJK and emoji | 64 | **14** | **89** | 24 | 86 | 40 |
+| Cursor jumps (TUI redraw) | **114** | 14 | 61 | 23 | 104 | **12** |
+| Scrolling region (DECSTBM) | **98** | **16** | 68 | 23 | 35 | 49 |
+| Short lines into scrollback | 50 | **13** | **59** | 24 | 47 | 60 |
+
+**Setup.** Apple M4 (4 performance and 6 efficiency cores, 16 GB), macOS 15.6,
+rustc 1.99.1. Every engine is built in release mode with LTO. Node is
+22.23.3. The engines and their licences:
+
+- oxtty at this commit.
+- alacritty_terminal 0.26.0 (Apache-2.0).
+- Ghostty's libghostty-vt at commit 4a4fc017. It comes as a prebuilt static
+  library, built in Zig's fast mode, through ghostty-vt-rs-sys 0.2.0 (MIT).
+- avt 0.19.0 (Apache-2.0).
+- vt100 0.18.1 (MIT).
+- WezTerm's wezterm-term at commit 2658f629. It is not on crates.io, so the
+  bench uses the unmodified copy published as zeughaus-wezterm-term 0.1.0
+  (MIT).
+- ghostty-web 0.4.0 (MIT) and @xterm/headless 6.1.0-beta.303 (MIT).
+
+`bench/engines/` holds the bench. It is not part of the workspace or the
+gate. To reproduce:
+
+```sh
+node bench/engines/corpus.mjs /tmp/vt-corpus
+cargo run --release --manifest-path bench/engines/Cargo.toml --features ghostty -- /tmp/vt-corpus
+bash scripts/build-wasm.sh && (cd bench/engines && npm ci)
+node --expose-gc bench/engines/node.mjs /tmp/vt-corpus
+```
+
+Without `--features ghostty`, the bench downloads no prebuilt library and
+leaves Ghostty out.
+
+**Caveats.**
+
+- This compares engines only. It does not cover a PTY, rendering, fonts or
+  frame pacing. vtebench and other figures for the Alacritty, Ghostty, kitty
+  or WezTerm apps measure the whole app and cannot be compared with these.
+- The screen check compares visible text, not colours. ghostty-web's render
+  state API reads one row differently from the others after the truecolor
+  output. Native libghostty-vt matches on that output.
+- Ghostty trims scrollback a page at a time. It kept 9,606–9,969 lines where
+  the others kept 10,000. ghostty-web takes its scrollback limit in bytes:
+  its xterm.js-style `scrollback: 10000` keeps one page, a few hundred lines.
+  The bench gives it 16 MiB, which keeps 10,000 lines or more.
+- Ghostty can compress its scrollback when the host asks, for example while
+  idle. The table does not do that. After a full pass, Ghostty's own count
+  of page memory falls to 0.7–2.1 MiB on log lines, Hangul and short lines,
+  and to 8.1 MiB on truecolor. On the first three, that is about what
+  oxtty's live heap holds for the same outputs (0.7–2.4 MiB).
+- ghostty-web 0.4.0 (December 2025) builds an older Ghostty than the native
+  library does.
+- avt takes text rather than bytes, so its time includes the UTF-8 check of
+  each chunk.
+- RSS includes memory that malloc keeps after it is freed. At their peak, vt100
+  and avt had 3–27 MiB of live heap. The bench's counting allocator records
+  that figure too, in the JSON it writes.
+- In Node, part of every RSS figure is the runtime and the engine's own
+  floor. The cursor jumps row keeps no history and shows that floor: 12–23
+  MiB.
+- Other jobs shared the machine (load average 8–9), so the engines took
+  turns. Most of the 5 runs stayed within ±10% of the median, and short
+  lines within ±25%. The JSON the bench writes has the minimum and maximum.
+  A second full native run agreed within 10%, except Ghostty on log lines
+  (234 MiB/s against 289).
+
 ## Quick start
 
 ### Browser terminal with the xterm.js API

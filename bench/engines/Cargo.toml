@@ -1,0 +1,34 @@
+[package]
+name = "oxtty-engine-bench"
+description = "Parser throughput and memory of oxtty against other Rust terminal engines on the throughput.mjs corpus."
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+# Standalone: not a member of the root workspace, not built by the gate.
+[workspace]
+
+[features]
+# Ghostty's libghostty-vt through ghostty-vt-rs-sys, which downloads a prebuilt static library (SHA-256 pinned).
+ghostty = ["dep:ghostty-vt-rs-sys"]
+
+[dependencies]
+oxtty = { path = "../../crates/oxtty" }
+# oxtty's upstream, unpatched (Apache-2.0).
+alacritty_terminal = "=0.26.0"
+# MIT.
+vt100 = "=0.18.1"
+# asciinema's virtual terminal (Apache-2.0).
+avt = "=0.19.0"
+# WezTerm's terminal model, unmodified from wezterm commit 2658f629 (MIT); wezterm-term itself is not on crates.io.
+wezterm-term = { package = "zeughaus-wezterm-term", version = "=0.1.0" }
+# libghostty-vt bindings with prebuilt static libraries (MIT; Ghostty is MIT).
+ghostty-vt-rs-sys = { version = "=0.2.0", optional = true }
+libc = "0.2"
+
+# Same as the root workspace's release profile, for every engine.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
