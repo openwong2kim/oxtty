@@ -190,7 +190,7 @@ single crate.
   `env!("CARGO_PKG_VERSION")` pinned to `"0.26.0"` so the secondary device
   attributes reply keeps reporting Alacritty's version instead of oxtty's.
 - The module is `#[rustfmt::skip]` so it stays byte-close to upstream.
-- `vte/` is the published `vte` 0.15.0 crate (Apache-2.0 OR MIT), built in:
+- `vte/` is the published `vte` 0.15.0 crate (crates.io, git 3b3da71c34cc1256c7e20981cf03f8eb95e08ffc; Apache-2.0 OR MIT), built in:
   `vte/mod.rs` is its `lib.rs`, next to its `params.rs` and `ansi.rs`, so
   parsing can stop at a sequence the host hooked and an empty sub-parameter
   can be told from 0. Mechanical changes: the no-std code (the fixed-size

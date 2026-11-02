@@ -30,7 +30,7 @@ The full list is in `crates/oxtty/src/vt/PATCHES.md` in the repository.
 
 ## vte 0.15.0
 
-Copyright the Alacritty contributors. Source: https://github.com/alacritty/vte
+Copyright the Alacritty contributors. Source: https://github.com/alacritty/vte (0.15.0 from crates.io, git 3b3da71c34cc1256c7e20981cf03f8eb95e08ffc)
 Licensed under Apache-2.0 OR MIT; used here under the Apache License 2.0
 (`LICENSE-APACHE`).
 

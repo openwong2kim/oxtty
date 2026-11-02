@@ -1,4 +1,4 @@
-//! `vte` 0.15.0 (Apache-2.0 OR MIT), built in: this file is the crate's `lib.rs`, with its `params` and `ansi`
+//! `vte` 0.15.0 (crates.io, git 3b3da71c34cc1256c7e20981cf03f8eb95e08ffc; Apache-2.0 OR MIT), built in: this file is the crate's `lib.rs`, with its `params` and `ansi`
 //! modules next to it, so the parser can stop at a sequence the host hooked before its default action and can tell
 //! an empty sub-parameter from 0. Changes are listed in `../PATCHES.md`.
 //!
