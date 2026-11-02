@@ -284,7 +284,13 @@ fn digits_value(bytes: &[u8], at: usize, len: usize) -> u16 {
 #[inline(always)]
 fn word_value(word: u64, len: usize) -> u16 {
     // The digits as values, the first one the most significant, moved up so the bytes after them drop out and
-    // zeros lead (borrows only reach the bytes after them); then pairs, quads and all eight are joined.
+    // zeros lead (borrows only reach the bytes after them); then pairs, quads and all eight are joined. Up to
+    // four digits (most parameters) need only the low half.
+    if len <= 4 {
+        let digits = (word as u32).wrapping_sub(ZEROS as u32) << (8 * (4 - len));
+        let pairs = (digits * 10 + (digits >> 8)) & 0x00FF_00FF;
+        return ((pairs * 100 + (pairs >> 16)) & 0xFFFF) as u16;
+    }
     let digits = word.wrapping_sub(ZEROS) << (8 * (8 - len));
     let pairs = (digits * 10 + (digits >> 8)) & 0x00FF_00FF_00FF_00FF;
     let quads = (pairs * 100 + (pairs >> 16)) & 0x0000_FFFF_0000_FFFF;

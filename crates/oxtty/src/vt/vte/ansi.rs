@@ -1590,10 +1590,12 @@ where
         }
 
         // oxtty: a hooked CSI stops parsing before its default action.
-        let id = hook_id(intermediates, action as u8);
-        if self.hooked(HookKind::Csi, id) {
-            self.stop_at(Hook::Csi { id, params: hook_params(params) });
-            return;
+        if !self.state.hooks.is_empty() {
+            let id = hook_id(intermediates, action as u8);
+            if self.hooked(HookKind::Csi, id) {
+                self.stop_at(Hook::Csi { id, params: hook_params(params) });
+                return;
+            }
         }
 
         let mut params_iter = params.iter();
