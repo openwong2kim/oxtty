@@ -751,6 +751,7 @@ impl Engine {
         let old_cols = self.term.columns();
         let reflow = size(cols, rows).cols != old_cols;
         let anchors = self.anchor_markers(reflow);
+        let alt_anchors = self.anchor_alt_markers();
         match &self.history {
             Some(history) => {
                 self.offset = history.reflow(&mut self.term, size(cols, rows), self.offset);
@@ -762,6 +763,7 @@ impl Engine {
         self.entered_seen = self.primary().history_entered();
         self.history_seen = self.primary_history_len();
         self.place_markers(anchors, reflow);
+        self.place_alt_markers(alt_anchors);
         self.extend_images(old_cols);
     }
 

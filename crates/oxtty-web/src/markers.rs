@@ -1,7 +1,8 @@
 //! xterm.js markers (`registerMarker`, `markers`, `IMarker`) on the engine's markers, which the buffer API may call
 //! (PRD D7). The engine moves a marker with its line as output scrolls it into the history and as scroll regions,
 //! inserted and deleted lines move it, and drops it when its line leaves the scrollback or is cleared (ED, RIS);
-//! `onDispose` fires once the write that dropped it is parsed, before the write callback.
+//! `onDispose` fires once the write that dropped it is parsed, before the write callback. Each screen has its own
+//! markers, as each xterm.js buffer does; the alternate screen's are dropped when it is left.
 //!
 //! Memory: the terminal keeps the id of each live marker (4 bytes) and an emitter only for the markers whose
 //! `onDispose` was read. An `IMarker` is a small object made when read that asks the engine for its line, so
@@ -24,8 +25,10 @@ export type IMarker = Marker;
 /// The live markers of one terminal.
 #[derive(Default)]
 pub(crate) struct Markers {
-    /// Oldest first.
+    /// The primary screen's, oldest first.
     ids: Vec<u32>,
+    /// The alternate screen's, oldest first.
+    alt_ids: Vec<u32>,
     /// Bumped when the engine starts over (a crash): its ids begin again, and older `IMarker`s must not see them.
     generation: u32,
     /// `onDispose` of the markers whose event was read.
@@ -33,6 +36,15 @@ pub(crate) struct Markers {
 }
 
 impl Markers {
+    fn contains(&self, id: u32) -> bool {
+        self.ids.contains(&id) || self.alt_ids.contains(&id)
+    }
+
+    fn remove(&mut self, gone: &[u32]) {
+        self.ids.retain(|id| !gone.contains(id));
+        self.alt_ids.retain(|id| !gone.contains(id));
+    }
+
     fn take_emitter(&mut self, id: u32) -> Option<Rc<Emitter>> {
         let at = self.emitters.iter().position(|(i, _)| *i == id)?;
         Some(self.emitters.swap_remove(at).1)
@@ -48,7 +60,11 @@ fn fire(emitters: Vec<Rc<Emitter>>) {
 
 /// Fires `onDispose` of the markers the engine dropped since the last call. Runs after every parsed write.
 pub(crate) fn sync(shared: &Rc<Shared>) {
-    if shared.markers.borrow().ids.is_empty() && !crate::image::has_markers(shared) {
+    let none = {
+        let markers = shared.markers.borrow();
+        markers.ids.is_empty() && markers.alt_ids.is_empty()
+    };
+    if none && !crate::image::has_markers(shared) {
         return;
     }
     let gone: Vec<u32> = {
@@ -74,7 +90,7 @@ pub(crate) fn sync(shared: &Rc<Shared>) {
     crate::image::markers_gone(shared, &gone);
     let emitters = {
         let mut markers = shared.markers.borrow_mut();
-        markers.ids.retain(|id| !gone.contains(id));
+        markers.remove(&gone);
         gone.iter()
             .filter_map(|&id| markers.take_emitter(id))
             .collect()
@@ -88,6 +104,7 @@ pub(crate) fn drop_all(shared: &Rc<Shared>) {
         let mut markers = shared.markers.borrow_mut();
         markers.generation = markers.generation.wrapping_add(1);
         markers.ids.clear();
+        markers.alt_ids.clear();
         std::mem::take(&mut markers.emitters)
     };
     fire(emitters.into_iter().map(|(_, emitter)| emitter).collect());
@@ -108,7 +125,7 @@ impl Marker {
         let live = shared
             .markers
             .try_borrow()
-            .is_ok_and(|m| m.generation == self.generation && m.ids.contains(&self.id));
+            .is_ok_and(|m| m.generation == self.generation && m.contains(self.id));
         live.then_some(shared)
     }
 }
@@ -153,7 +170,7 @@ impl Marker {
         }
         let emitter = {
             let mut markers = shared.markers.borrow_mut();
-            markers.ids.retain(|&id| id != self.id);
+            markers.remove(&[self.id]);
             markers.take_emitter(self.id)
         };
         fire(emitter.into_iter().collect());
@@ -183,8 +200,8 @@ impl Marker {
 
 #[wasm_bindgen]
 impl Terminal {
-    /// A marker on the cursor line plus `cursorYOffset` of the normal buffer. `undefined` while the alternate
-    /// screen is up and for a line outside the buffer (xterm.js marks those too); non-integers throw like xterm.js.
+    /// A marker on the cursor line plus `cursorYOffset` of the active buffer. `undefined` for a line outside the
+    /// buffer (xterm.js marks those too); non-integers throw like xterm.js.
     #[wasm_bindgen(js_name = registerMarker, unchecked_return_type = "IMarker")]
     pub fn register_marker(
         &self,
@@ -194,26 +211,31 @@ impl Terminal {
         if !offset.is_finite() || offset.fract() != 0.0 {
             return Err(js_sys::Error::new("This API only accepts integers").into());
         }
-        let id = {
+        let (id, alternate) = {
             let Ok(core) = self.shared.core.try_borrow() else {
                 return Ok(None);
             };
             if core.disposed {
                 return Ok(None);
             }
-            let line = f64::from(core.view.engine().history_length())
-                + f64::from(core.view.cursor().line)
-                + offset;
+            let engine = core.view.engine();
+            let line =
+                f64::from(engine.history_length()) + f64::from(core.view.cursor().line) + offset;
             if !(0.0..=f64::from(i32::MAX)).contains(&line) {
                 return Ok(None);
             }
-            core.view.engine().add_marker(line as i32).unwrap_or(0)
+            let alternate = engine.modes().unwrap_or(0) & mode::ALT_SCREEN != 0;
+            (engine.add_marker(line as i32).unwrap_or(0), alternate)
         };
         if id == 0 {
             return Ok(None);
         }
         let mut markers = self.shared.markers.borrow_mut();
-        markers.ids.push(id);
+        if alternate {
+            markers.alt_ids.push(id);
+        } else {
+            markers.ids.push(id);
+        }
         Ok(Some(Marker {
             shared: Rc::downgrade(&self.shared),
             id,
@@ -221,18 +243,24 @@ impl Terminal {
         }))
     }
 
-    /// The live markers, oldest first; `[]` while the alternate screen is up, like xterm.js.
+    /// The live markers of the active buffer, oldest first, like xterm.js.
     #[wasm_bindgen(getter, unchecked_return_type = "ReadonlyArray<IMarker>")]
     pub fn markers(&self) -> Array {
-        let alternate = self.shared.core.try_borrow().map_or(true, |core| {
-            core.disposed || core.view.engine().modes().unwrap_or(0) & mode::ALT_SCREEN != 0
+        let alternate = self.shared.core.try_borrow().ok().and_then(|core| {
+            (!core.disposed)
+                .then(|| core.view.engine().modes().unwrap_or(0) & mode::ALT_SCREEN != 0)
         });
         let list = Array::new();
-        if alternate {
+        let Some(alternate) = alternate else {
             return list;
-        }
+        };
         let markers = self.shared.markers.borrow();
-        for &id in &markers.ids {
+        let ids = if alternate {
+            &markers.alt_ids
+        } else {
+            &markers.ids
+        };
+        for &id in ids {
             list.push(
                 &Marker {
                     shared: Rc::downgrade(&self.shared),

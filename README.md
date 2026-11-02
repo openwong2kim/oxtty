@@ -388,8 +388,9 @@ Beyond the notes in the tables above:
 
 - A selection follows lines trimmed off the scrollback and screen switches at
   the next animation frame, not during the write (PRD D7).
-- Markers do not exist on the alternate screen: `registerMarker` returns
-  `undefined` there and `markers` is `[]`.
+- A marker in a scroll region below the top row follows its line when a line
+  feed at the region's bottom or a reverse index at its top scrolls it;
+  xterm.js leaves markers on their rows then.
 - The buffer objects and `term.markers` return new objects on every read.
 - DECRQSS reports the protection attribute (DECSCA) as `0`: the engine has no
   protected cells.

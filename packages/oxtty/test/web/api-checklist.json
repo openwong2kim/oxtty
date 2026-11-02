@@ -224,11 +224,11 @@
     },
     "Terminal.registerMarker": {
       "status": "supported",
-      "reason": "crates/oxtty-web/src/markers.rs on the engine's markers (addMarker/markerLine/takeDisposedMarkers). Unlike xterm.js it returns undefined on the alternate screen and for a line outside the buffer, and ids count per terminal."
+      "reason": "crates/oxtty-web/src/markers.rs on the engine's markers (addMarker/markerLine/takeDisposedMarkers). The alternate screen has its own, disposed when it is left, as in xterm.js. Unlike xterm.js it returns undefined for a line outside the buffer, ids count per terminal, and a marker follows its line when a line feed or reverse index scrolls a region below the top row."
     },
     "Terminal.markers": {
       "status": "supported",
-      "reason": "The live markers, oldest first, [] on the alternate screen; new IMarker objects per read (xterm.js hands out the same ones)."
+      "reason": "The live markers of the active buffer, oldest first; new IMarker objects per read (xterm.js hands out the same ones)."
     },
     "IMarker.id/line/dispose/onDispose": {
       "status": "supported",

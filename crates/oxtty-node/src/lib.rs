@@ -545,14 +545,14 @@ impl Terminal {
         })
     }
 
-    /// Puts a marker on buffer line `line` of the primary screen (0 is the oldest history line); null outside the buffer
-    /// or on the alternate screen.
+    /// Puts a marker on buffer line `line` of the screen that is up (0 is the oldest history line, or the alternate
+    /// screen's top row); null outside the buffer. The alternate screen's markers go when it is left.
     #[napi]
     pub fn add_marker(&mut self, line: i32) -> Option<u32> {
         self.inner.add_marker(line as i64)
     }
 
-    /// The marker's buffer line on the primary screen; null once it is gone.
+    /// The marker's buffer line on its screen; null once it is gone.
     #[napi]
     pub fn marker_line(&self, id: u32) -> Option<i32> {
         self.inner.marker_line(id).map(|line| line as i32)

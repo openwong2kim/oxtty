@@ -5,9 +5,9 @@
 //! line (the rows soft wraps join), on the same row within that line; a row that wider columns merged into the rows
 //! above it takes its markers along.
 //!
-//! Markers are on the primary screen (xterm.js drops the alternate screen's when the primary one comes back, and
-//! hosts mark scrollback). Marker lines are buffer lines as xterm.js counts them: 0 is the oldest history line and
-//! the top screen row is at the history length.
+//! Each screen has its own markers, as each xterm.js buffer does: the alternate screen's are dropped when the
+//! primary one comes back. Marker lines are buffer lines as xterm.js counts them: 0 is the oldest history line and
+//! the top screen row is at the history length (on the alternate screen, which has no history, the screen row).
 
 use crate::Engine;
 use crate::vt::grid::{Dimensions, Grid, Row, RowMove};
@@ -25,10 +25,14 @@ struct Marker {
 #[derive(Default)]
 pub(crate) struct Markers {
     next_id: u32,
+    /// The primary screen's.
     live: Vec<Marker>,
+    /// The alternate screen's.
+    alt: Vec<Marker>,
     /// Dropped by the engine and not taken yet ([`Engine::take_disposed_markers`]).
     disposed: Vec<u32>,
     entered: u64,
+    alt_entered: u64,
     resets: u64,
 }
 
@@ -77,11 +81,25 @@ fn sort(items: &mut [(i64, usize)]) {
 
 impl Engine {
     fn primary_mut(&mut self) -> &mut Grid<Cell> {
-        if self.alt_screen() {
-            self.term.inactive_grid_mut()
-        } else {
+        self.grid_of_mut(false)
+    }
+
+    /// The alternate screen's grid (`alt`) or the primary one's, whichever is up.
+    fn grid_of_mut(&mut self, alt: bool) -> &mut Grid<Cell> {
+        if alt == self.alt_screen() {
             self.term.grid_mut()
+        } else {
+            self.term.inactive_grid_mut()
         }
+    }
+
+    fn alt_entered(&self) -> i64 {
+        let grid = if self.alt_screen() {
+            self.term.grid()
+        } else {
+            self.term.inactive_grid()
+        };
+        grid.history_entered() as i64
     }
 
     fn primary_entered(&self) -> i64 {
@@ -127,34 +145,59 @@ impl Engine {
         line
     }
 
-    /// Puts a marker on buffer line `line` of the primary screen (0 the oldest history line); returns its id, never
-    /// 0, or `None` when the line is outside the buffer or the alternate screen is up.
+    /// Puts a marker on buffer line `line` of the screen that is up (0 the oldest history line, or the top row of
+    /// the alternate screen); returns its id, never 0, or `None` when the line is outside the buffer.
     pub fn add_marker(&mut self, line: i64) -> Option<u32> {
+        let alt = self.alt_screen();
         let history = self.history_len() as i64;
-        if self.alt_screen() || line < 0 || line >= history + self.rows() as i64 {
+        if line < 0 || line >= history + self.rows() as i64 {
             return None;
         }
-        if self.markers.live.is_empty() {
-            self.markers.entered = self.primary().history_entered();
+        if self.markers.live.is_empty() && self.markers.alt.is_empty() {
             self.markers.resets = self.term.resets();
-            self.primary_mut().track_row_moves(true);
+        }
+        let entered = if alt {
+            self.alt_entered()
+        } else {
+            self.primary_entered()
+        };
+        let markers = &mut self.markers;
+        let (list, list_entered) = if alt {
+            (&mut markers.alt, &mut markers.alt_entered)
+        } else {
+            (&mut markers.live, &mut markers.entered)
+        };
+        if list.is_empty() {
+            *list_entered = entered as u64;
+            self.grid_of_mut(alt).track_row_moves(true);
         }
         self.markers.next_id += 1;
         let id = self.markers.next_id;
-        let line = line - history + self.primary_entered();
-        self.markers.live.push(Marker { id, line });
+        let marker = Marker {
+            id,
+            line: line - history + entered,
+        };
+        if alt {
+            self.markers.alt.push(marker);
+        } else {
+            self.markers.live.push(marker);
+        }
         Some(id)
     }
 
     /// The buffer line of marker `id`, `None` once it was dropped or removed.
     pub fn marker_line(&self, id: u32) -> Option<i64> {
-        let marker = self.markers.live.iter().find(|m| m.id == id)?;
-        Some(marker.line - self.primary_entered() + self.primary_history_len() as i64)
+        if let Some(marker) = self.markers.live.iter().find(|m| m.id == id) {
+            return Some(marker.line - self.primary_entered() + self.primary_history_len() as i64);
+        }
+        let marker = self.markers.alt.iter().find(|m| m.id == id)?;
+        Some(marker.line - self.alt_entered())
     }
 
     /// Drops marker `id` for the host (it is not reported by [`Engine::take_disposed_markers`]).
     pub fn remove_marker(&mut self, id: u32) {
         self.markers.live.retain(|m| m.id != id);
+        self.markers.alt.retain(|m| m.id != id);
         self.untrack_if_empty();
     }
 
@@ -167,14 +210,28 @@ impl Engine {
         if self.markers.live.is_empty() {
             self.primary_mut().track_row_moves(false);
         }
+        if self.markers.alt.is_empty() {
+            self.grid_of_mut(true).track_row_moves(false);
+        }
     }
 
-    /// Keeps the markers whose new line `line_of` gives (counted on screen), reporting the others as dropped.
-    fn relocate(&mut self, mut line_of: impl FnMut(usize, &Marker) -> Option<i64>) {
-        let entered = self.primary_entered();
-        let disposed = &mut self.markers.disposed;
+    /// Keeps the markers of the alternate screen (`alt`) or the primary one whose new line `line_of` gives
+    /// (counted on screen), reporting the others as dropped.
+    fn relocate(&mut self, alt: bool, mut line_of: impl FnMut(usize, &Marker) -> Option<i64>) {
+        let entered = if alt {
+            self.alt_entered()
+        } else {
+            self.primary_entered()
+        };
+        let markers = &mut self.markers;
+        let (list, list_entered) = if alt {
+            (&mut markers.alt, &mut markers.alt_entered)
+        } else {
+            (&mut markers.live, &mut markers.entered)
+        };
+        let disposed = &mut markers.disposed;
         let mut i = 0;
-        self.markers.live.retain_mut(|m| {
+        list.retain_mut(|m| {
             let line = line_of(i, m);
             i += 1;
             match line {
@@ -183,25 +240,38 @@ impl Engine {
             }
             line.is_some()
         });
-        self.markers.entered = entered as u64;
+        *list_entered = entered as u64;
         self.untrack_if_empty();
     }
 
     /// Brings the markers up to date with what the last input did to the rows.
     pub(crate) fn follow_markers(&mut self) {
-        if self.markers.live.is_empty() {
+        if self.markers.live.is_empty() && self.markers.alt.is_empty() {
             return;
         }
-        let moves = self.primary_mut().take_row_moves();
         let resets = self.term.resets();
         let reset = resets != self.markers.resets;
         self.markers.resets = resets;
-        let (before, top) = (self.markers.entered as i64, self.primary_top() as i64);
-        self.relocate(|_, m| {
-            let line = moves.iter().try_fold(m.line - before, moved)?;
-            // Past the top of the scrollback
-            (!reset && line >= top).then_some(line)
-        });
+        if !self.markers.live.is_empty() {
+            let moves = self.primary_mut().take_row_moves();
+            let (before, top) = (self.markers.entered as i64, self.primary_top() as i64);
+            self.relocate(false, |_, m| {
+                let line = moves.iter().try_fold(m.line - before, moved)?;
+                // Past the top of the scrollback
+                (!reset && line >= top).then_some(line)
+            });
+        }
+        if !self.markers.alt.is_empty() {
+            // Leaving the alternate screen drops its markers, as xterm.js clears that buffer; entering it again
+            // cleared its rows.
+            let up = self.alt_screen();
+            let moves = self.grid_of_mut(true).take_row_moves();
+            let before = self.markers.alt_entered as i64;
+            self.relocate(true, |_, m| {
+                let line = moves.iter().try_fold(m.line - before, moved)?;
+                (up && !reset && line >= 0).then_some(line)
+            });
+        }
     }
 
     /// Where each marker is before a resize: logical lines from the cursor's logical line (negative below it) and
@@ -309,7 +379,34 @@ impl Engine {
                 });
             }
         }
-        self.relocate(|i, _| lines[i].map(i64::from));
+        self.relocate(false, |i, _| lines[i].map(i64::from));
+    }
+
+    /// Where each marker of the alternate screen is before a resize: rows from the cursor's row, as that screen
+    /// does not reflow.
+    pub(crate) fn anchor_alt_markers(&mut self) -> Vec<i64> {
+        self.follow_markers();
+        let entered = self.alt_entered();
+        let cursor = i64::from(self.term.grid().cursor.point.line.0);
+        self.markers
+            .alt
+            .iter()
+            .map(|m| cursor - (m.line - entered))
+            .collect()
+    }
+
+    /// Puts the alternate screen's markers back after a resize from what [`Engine::anchor_alt_markers`] took.
+    pub(crate) fn place_alt_markers(&mut self, anchors: Vec<i64>) {
+        if self.markers.alt.is_empty() {
+            return;
+        }
+        self.grid_of_mut(true).take_row_moves();
+        let cursor = i64::from(self.term.grid().cursor.point.line.0);
+        let rows = self.rows() as i64;
+        self.relocate(true, |i, _| {
+            let line = cursor - anchors[i];
+            (0..rows).contains(&line).then_some(line)
+        });
     }
 }
 
@@ -361,21 +458,42 @@ mod tests {
     }
 
     #[test]
-    fn ris_drops_markers_and_the_alternate_screen_takes_none() {
+    fn ris_drops_markers_and_the_alternate_screen_has_its_own() {
         let mut t = Engine::new(10, 3, 20);
         let primary = t.add_marker(0).unwrap();
         t.feed(b"\x1b[?1049h");
-        assert_eq!(t.add_marker(1), None);
-        t.feed(b"x\r\ny\r\nz\r\n\x1b[?1049l");
+        assert_eq!(t.add_marker(3), None);
+        let alt: Vec<u32> = (1..3).map(|y| t.add_marker(y).unwrap()).collect();
+        // Scrolling the alternate screen moves its markers up and drops the one past the top
+        t.feed(b"x\r\ny\r\nz\r\n\n");
+        assert_eq!(lines(&t, &alt), [None, Some(0)]);
+        assert_eq!(t.take_disposed_markers(), [alt[0]]);
+        // A resize keeps them on their rows; the cursor's row stays at the bottom
+        t.resize(12, 2);
+        assert_eq!(lines(&t, &alt), [None, None]);
+        t.resize(12, 4);
+        let kept = t.add_marker(1).unwrap();
+        t.resize(10, 4);
+        assert_eq!(t.marker_line(kept), Some(1));
+        // Leaving the alternate screen drops its markers
+        t.feed(b"\x1b[?1049l");
+        assert_eq!(t.marker_line(kept), None);
+        assert_eq!(t.take_disposed_markers(), [alt[1], kept]);
         assert_eq!(
             t.marker_line(primary),
             Some(0),
             "untouched by the alternate screen"
         );
-        t.feed(b"\x1bc");
+        // Also when it comes back within the same write
+        t.feed(b"\x1b[?1049h");
+        let again = t.add_marker(0).unwrap();
+        t.feed(b"\x1b[?1049l\x1b[?1049h");
+        assert_eq!(t.marker_line(again), None);
+        assert_eq!(t.take_disposed_markers(), [again]);
+        t.feed(b"\x1b[?1049l\x1bc");
         assert_eq!(t.marker_line(primary), None);
         assert_eq!(t.take_disposed_markers(), [primary]);
-        assert_eq!(t.add_marker(3), None);
+        assert_eq!(t.add_marker(4), None);
     }
 
     #[test]
