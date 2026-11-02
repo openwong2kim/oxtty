@@ -251,6 +251,85 @@ M2 runs on key input code borrowed from xterm.js. M3 moves encoding to Rust.
 | Web Worker parsing option | Measure the reduction in main thread usage with 20 panes outputting concurrently |
 | Skip drawing inactive panes | Hidden panes receive output but do not draw |
 
+#### Viewport-only mode: design (2026-11-02)
+
+In wmux the daemon keeps every pane's whole history, so the renderer's copy is duplicate memory (D6). In
+viewport-only mode the terminal keeps only its own short scrollback (the margin) and reads older lines from the host
+when the view scrolls to them.
+
+**Host API.** The host makes the terminal with the margin as its `scrollback` (xterm.js meaning unchanged: the
+lines this terminal keeps) and registers a provider:
+
+```ts
+term.setHistoryProvider(provider: IHistoryProvider | null): void;
+interface IHistoryProvider {
+  /** History lines the host holds now, this terminal's own included (the host engine's `historyLength`). */
+  readonly length: number;
+  /** Most history lines the host keeps; past it, its oldest lines drop off. Default: no limit. */
+  readonly limit?: number;
+  /** Host lines fetched for the view kept in this terminal (default 256). */
+  readonly cacheLines?: number;
+  /** Host history lines `start .. start + count` (0 its oldest line). */
+  fetch(start: number, count: number): Promise<ReadonlyArray<IHistoryRow | Uint32Array | string | null>>;
+}
+interface IHistoryRow {
+  /** Packed cells as the engine's `rowCells` gives them (4 words per cell). */
+  cells?: Uint32Array;
+  /** Or the row as ANSI text, parsed at the terminal's width. */
+  ansi?: string;
+  /** The row wraps into the next one (the engine's `rowWrapped`). */
+  wrapped?: boolean;
+  /** The engine's `rowExtras` for the row: combining marks, underline colours, OSC 8 links (with `cells`). */
+  extras?: unknown[];
+}
+```
+
+- Line numbering is xterm.js's over the whole history: buffer line `y < H` is host line `y`, where
+  `H = length - (this terminal's history)` is fixed when the provider is set; later lines are the terminal's own.
+  Both sides parse the same output, so the terminal keeps `H` itself: lines that leave its full scrollback go to
+  `H`; with a `limit`, `H` stops at `limit - own history` and its oldest lines drop off (they count as trimmed for
+  selection and search decorations, like xterm.js `onTrim`); ED3 and RIS empty `H`. A resize reflows both sides
+  differently, so the host calls `setHistoryProvider` again afterwards (until then the old `H` stands and fetched
+  rows are dropped). `null` turns the mode off.
+- Fetched rows are kept by their absolute line number (`H` lines dropped so far plus `y`), so trimming does not
+  move them. A host ahead of the terminal (output in flight) while at its `limit` answers rows off by the lines in
+  flight; wmux keeps no limit on the history it serves.
+
+**Scrolling.** `scrollLines`, `scrollToTop`, `scrollToLine`, `scrollPages`, the wheel, the keyboard, the scrollbar
+and the accessibility tree scroll over `H` plus the terminal's own history, exactly as xterm.js does over its
+buffer; scrolled-back views stay on their text as output arrives. Rows not held yet are drawn as blank placeholder
+rows; the terminal fetches them (the visible rows plus one screen each way, in one request), and the frame after the
+answer redraws them. Frames scrolled into host lines are full redraws.
+
+**Buffer API.** `length`, `baseY` and `viewportY` count `H` (`baseY = H + own history`). `getLine(y)` for a host
+line returns the fetched row, or, until it is fetched, a blank line of `cols` cells and asks for it (it never
+returns `undefined` inside `0..length`). `isWrapped` comes from the row above when it is held.
+
+**Search.** `findNext`/`findPrevious` search the terminal's own lines synchronously as before. A search that must
+read host lines returns `false`, fetches them in pages of 256 lines (a page without a match is remembered as empty,
+at most four pages with matches are held), and then selects and scrolls to the match and fires
+`onDidChangeResults` (also without decorations). Logical lines are cut at page boundaries and at the boundary to the
+terminal's own lines, so a match across a cut is not found. With decorations, only held lines are highlighted and
+counted.
+
+**Selection.** Selection reads `getLine`, so it covers fetched rows; copying a selection over rows not fetched gives
+blank lines for them. Drag-scrolling fetches rows like any scroll.
+
+**Unchanged, terminal-local.** `ansiSnapshot` serializes the terminal's own lines only (the host has the full
+history). Markers stay on the terminal's own lines (their `line` counts `H` like every buffer line) and are disposed when
+their line leaves its scrollback, as with any `scrollback`. The alternate screen has no history, so `H` is hidden while it is up.
+
+**Memory.** The engine holds `rows + scrollback` lines; fetched rows are JavaScript `Uint32Array`s (garbage
+collected, not wasm memory, which never shrinks), at most `cacheLines` (the rows farthest from the view go first);
+a search holds at most four pages of logical-line text.
+
+**wmux wiring (not done here).** The renderer builds each pane's terminal with `scrollback` 200 and, after
+attaching, calls `setHistoryProvider({ length, fetch })` with `length` from the daemon. The daemon answers `fetch`
+from a per-pane native oxtty engine (`oxtty-node`: `rowCells`, `rowWrapped`, `rowExtras` for lines
+`start - historyLength ..`) or, without one, by replaying the pane's ring through the existing snapshot path
+(`generateRustSnapshot`) and slicing the rows it needs. The renderer calls `setHistoryProvider` again after every
+resize with the daemon's new `historyLength`.
+
 ### M5 · 1.0 public release
 
 - Default engine for wmux on all platforms
