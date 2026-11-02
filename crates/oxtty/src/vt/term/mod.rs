@@ -1022,8 +1022,10 @@ impl<T> Term<T> {
         let region = origin..self.scroll_region.end;
 
         // Scroll selection.
-        self.selection =
-            self.selection.take().and_then(|s| s.rotate(self, &region, -(lines as i32)));
+        // oxtty: only when there is one, as the selection is written back otherwise too.
+        if let Some(selection) = self.selection.take() {
+            self.selection = selection.rotate(self, &region, -(lines as i32));
+        }
 
         // Scroll vi mode cursor.
         let line = &mut self.vi_mode_cursor.point.line;
@@ -1049,7 +1051,10 @@ impl<T> Term<T> {
         let region = origin..self.scroll_region.end;
 
         // Scroll selection.
-        self.selection = self.selection.take().and_then(|s| s.rotate(self, &region, lines as i32));
+        // oxtty: only when there is one, as the selection is written back otherwise too.
+        if let Some(selection) = self.selection.take() {
+            self.selection = selection.rotate(self, &region, lines as i32);
+        }
 
         self.grid.scroll_up(&region, lines);
 
@@ -1383,34 +1388,32 @@ impl<T> Term<T> {
         {
             return 0;
         }
-        let row = &self.grid[point.line][point.column..];
-        let n = row
-            .iter()
-            .zip(bytes)
-            .take_while(|(cell, b)| {
-                (0x20..0x7f).contains(*b) && !cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER)
-            })
-            .count();
-        if n == 0 {
-            return 0;
-        }
-        self.damage.damage_line(
-            point.line.0 as usize,
-            point.column.0.saturating_sub(1),
-            point.column.0 + n - 1,
-        );
         let template = &self.grid.cursor.template;
         let (fg, bg, flags, extra) = (template.fg, template.bg, template.flags, template.extra.clone());
         let spacer = flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
         let space_flags = if spacer { flags } else { flags | Flags::TYPED_SPACE };
-        for (cell, &b) in self.grid[point.line][point.column..point.column + n].iter_mut().zip(bytes) {
+        // Checked and written in one pass. Writing through the whole row marks all of it occupied; only the cells
+        // written are.
+        let row = &mut self.grid[point.line];
+        let occ = row.occ;
+        let mut n = 0;
+        for (cell, &b) in row[point.column..].iter_mut().zip(bytes) {
+            if !(0x20..0x7f).contains(&b) || cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER) {
+                break;
+            }
             cell.c = b as char;
             cell.fg = fg;
             cell.bg = bg;
             cell.flags = if b == b' ' { space_flags } else { flags };
             cell.extra = extra.clone();
+            n += 1;
         }
         let end = point.column.0 + n;
+        row.occ = if n == 0 { occ } else { occ.max(end) };
+        if n == 0 {
+            return 0;
+        }
+        self.damage.damage_line(point.line.0 as usize, point.column.0.saturating_sub(1), end - 1);
         if end < columns {
             self.grid.cursor.point.column = Column(end);
         } else {
@@ -1500,13 +1503,13 @@ impl<T> Term<T> {
 }
 
 /// oxtty: the cells `c` takes (`wmux_unicode11::width`), without the table search for Latin text, CJK
-/// ideographs and Hangul syllables.
-#[inline]
+/// ideographs, Hangul syllables and the emoticon and transport emoji.
+#[inline(always)]
 fn char_width(c: char) -> Option<usize> {
     match c as u32 {
         0x00..=0x1f | 0x7f..=0x9f => Some(0),
         0x20..=0x2ff => Some(1),
-        0x4e00..=0xa48c | 0xac00..=0xd7a3 => Some(2),
+        0x4e00..=0xa48c | 0xac00..=0xd7a3 | 0x1f5fb..=0x1f64f | 0x1f680..=0x1f6c5 => Some(2),
         _ => crate::vt::wmux_unicode11::width(c),
     }
 }
