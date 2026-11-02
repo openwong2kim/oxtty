@@ -9,6 +9,7 @@ mod atlas;
 mod blink;
 mod cell;
 pub mod color;
+mod cursor_layer;
 mod custom_glyphs;
 mod gl;
 mod glyphs;

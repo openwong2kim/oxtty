@@ -24,6 +24,7 @@ use web_sys::{
 };
 
 use super::atlas::{self, TextureAtlas};
+use super::cursor_layer::Region;
 use super::glyphs::{GlyphProgram, GlyphVertices};
 use super::images::{self, ImageLayer, ImageProgram};
 use super::model::RenderModel;
@@ -290,6 +291,8 @@ pub struct Frame<'a> {
     pub cursor: bool,
     pub images: &'a ImageLayer,
     pub present: &'a Present,
+    /// Draws only this part of the frame and copies it to `present`'s origin (the cursor layer); `None` is all of it.
+    pub region: Option<Region>,
 }
 
 /// Draws `frame` and hands it to the pane's canvas; false if the context cannot draw now.
@@ -440,6 +443,12 @@ impl Gpu {
         let Some(programs) = self.programs.take() else {
             return false;
         };
+        if let Some([x, y, w, h]) = frame.region {
+            // GL's origin is the bottom left
+            self.gl.enable(Gl::SCISSOR_TEST);
+            self.gl
+                .scissor(x as i32, (frame.height - y - h) as i32, w as i32, h as i32);
+        }
         programs.rect.draw_backgrounds(&self.gl, frame.rects);
         if let Some(atlas) = frame.glyphs.atlas().cloned() {
             if let Ok(atlas) = atlas.try_borrow() {
@@ -458,12 +467,27 @@ impl Gpu {
             self.draw_images(program, frame.pane, frame.images);
         }
         self.programs = Some(programs);
+        if frame.region.is_some() {
+            self.gl.disable(Gl::SCISSOR_TEST);
+        }
         let ctx = &frame.present.0;
         // The frame replaces the canvas's last one
         let _ = ctx.set_global_composite_operation("copy");
-        let _ = match &self.surface {
-            Surface::Offscreen(canvas) => ctx.draw_image_with_offscreen_canvas(canvas, 0.0, 0.0),
-            Surface::Element(canvas) => ctx.draw_image_with_html_canvas_element(canvas, 0.0, 0.0),
+        let _ = match (&self.surface, frame.region) {
+            (Surface::Offscreen(canvas), None) => {
+                ctx.draw_image_with_offscreen_canvas(canvas, 0.0, 0.0)
+            }
+            (Surface::Element(canvas), None) => {
+                ctx.draw_image_with_html_canvas_element(canvas, 0.0, 0.0)
+            }
+            (Surface::Offscreen(canvas), Some([x, y, w, h])) => ctx
+                .draw_image_with_offscreen_canvas_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                    canvas, x, y, w, h, 0.0, 0.0, w, h,
+                ),
+            (Surface::Element(canvas), Some([x, y, w, h])) => ctx
+                .draw_image_with_html_canvas_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                    canvas, x, y, w, h, 0.0, 0.0, w, h,
+                ),
         };
         self.draws = self.draws.wrapping_add(1);
         true

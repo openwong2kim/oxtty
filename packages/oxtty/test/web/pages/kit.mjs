@@ -62,6 +62,29 @@ export class Pane {
     return new Promise((resolve) => requestAnimationFrame(() => resolve(read(canvas))));
   }
 
+  /**
+   * Draws a frame and reads, in that frame, the canvas alone (`canvas`) and with the cursor layer drawn over it
+   * (`shown`, what the page shows in the blink's shown phase; the canvas alone without a layer), and whether the
+   * layer is shown now.
+   */
+  layered() {
+    this.term.refresh(0, -1);
+    return new Promise((resolve) =>
+      requestAnimationFrame(() => {
+        const { canvas, cursorLayer: layer, cursorLayerRegion: region } = this.debug;
+        const copy = document.createElement('canvas');
+        copy.width = canvas.width;
+        copy.height = canvas.height;
+        const ctx = copy.getContext('2d');
+        ctx.drawImage(canvas, 0, 0);
+        const alone = ctx.getImageData(0, 0, copy.width, copy.height).data;
+        if (layer) ctx.drawImage(layer, region[0], region[1]);
+        const shown = ctx.getImageData(0, 0, copy.width, copy.height).data;
+        resolve({ canvas: alone, shown, layer: layer ? layer.style.opacity === '1' : null, region });
+      }),
+    );
+  }
+
   /** `[r, g, b]` at the device pixel at (`dx`, `dy`) of cell (col, row). */
   async cellColor(col, row, dx = 0.5, dy = 0.5) {
     const d = this.term.dimensions.device;

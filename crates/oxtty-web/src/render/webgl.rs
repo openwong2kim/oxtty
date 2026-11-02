@@ -11,7 +11,8 @@
 //! A pane owns its canvas (holding the last frame), its render model and glyph vertices; the context, programs,
 //! atlas textures, glyph measurement, the visibility observer and the font and window listeners are shared by
 //! every pane on the page. A pane draws only when something changed, and not at all while it is out of view
-//! (`display: none`, zero size, scrolled away): it redraws everything when it comes back.
+//! (`display: none`, zero size, scrolled away): it redraws everything when it comes back. A blinking cursor
+//! draws nothing either: it is a small layer over the canvas whose opacity the blink flips ([`CursorLayer`]).
 //!
 //! # Re-entrancy
 //!
@@ -33,7 +34,8 @@ use web_sys::{
 use super::atlas::{self, AtlasConfig, TextureAtlas};
 use super::blink::Blink;
 use super::cell::{CellData, CM_RGB, RGB_MASK};
-use super::color::{css_to_color, ColorSet};
+use super::color::{css_to_color, is_opaque, ColorSet};
+use super::cursor_layer::{CursorLayer, Region};
 use super::glyphs::GlyphVertices;
 use super::gpu::{self, Listener, Present};
 use super::images::ImageLayer;
@@ -215,6 +217,8 @@ struct Inner {
     highlights_stale: bool,
     focused: bool,
     blink: Option<Blink>,
+    /// The cursor drawn shown, over the canvas drawn with it hidden, while it blinks.
+    cursor_layer: Option<CursorLayer>,
     cursor: crate::engine::Cursor,
     cursor_row: i64,
     /// Resolved background of the last cell drawn (glyphs are clipped where it changes).
@@ -224,6 +228,7 @@ struct Inner {
     visible: bool,
     disposed: bool,
     draws: u32,
+    layer_draws: u32,
     listeners: Vec<Listener>,
     requests: Vec<RendererRequest>,
     log: Vec<RendererRequest>,
@@ -289,6 +294,7 @@ impl WebglRenderer {
             highlights_stale: false,
             focused,
             blink: None,
+            cursor_layer: None,
             cursor: crate::engine::Cursor::default(),
             cursor_row: -1,
             last_bg: 0,
@@ -297,6 +303,7 @@ impl WebglRenderer {
             visible: true,
             disposed: false,
             draws: 0,
+            layer_draws: 0,
             listeners: Vec::new(),
             requests: Vec::new(),
             log: Vec::new(),
@@ -392,6 +399,8 @@ impl Inner {
         self.visible = visible;
         if visible {
             self.request_redraw_all();
+        } else {
+            self.cursor_layer = None;
         }
     }
 
@@ -418,6 +427,7 @@ impl Inner {
         }
         self.disposed = true;
         self.blink = None;
+        self.cursor_layer = None;
         self.listeners.clear();
         VISIBILITY.with(|v| {
             if let Some(v) = v {
@@ -581,18 +591,37 @@ impl Inner {
         }
         self.blink = blink.then(|| {
             let weak = self.me.clone();
-            Blink::new(
-                move || {
-                    with_inner(&weak, |i| {
-                        let row = i.cursor_row;
-                        i.request_redraw_rows([row]);
-                    })
-                },
-                self.focused,
-            )
+            Blink::new(move || with_inner(&weak, Inner::handle_blink), self.focused)
         });
         let row = self.cursor_row;
         self.request_redraw_rows([row]);
+    }
+    /// A blink tick: the cursor layer shows or hides, or without one the cursor row redraws.
+    fn handle_blink(&mut self) {
+        let shown = self.blink.as_ref().is_none_or(Blink::is_cursor_visible);
+        match &mut self.cursor_layer {
+            Some(layer) => layer.show(shown),
+            None => {
+                let row = self.cursor_row;
+                self.request_redraw_rows([row]);
+            }
+        }
+    }
+    /// Makes or drops the cursor layer for a cursor in viewport row `row`; true when it is new.
+    fn update_cursor_layer(&mut self, row: Option<u32>) -> bool {
+        let wanted = row.is_some()
+            && self.focused
+            && self.blink.is_some()
+            && is_opaque(&self.colors.background);
+        if !wanted {
+            self.cursor_layer = None;
+            return false;
+        }
+        if self.cursor_layer.is_some() {
+            return false;
+        }
+        self.cursor_layer = CursorLayer::new(&self.document, &self.canvas);
+        self.cursor_layer.is_some()
     }
     fn set_focused(&mut self, focused: bool) {
         if self.focused == focused {
@@ -677,7 +706,8 @@ impl Inner {
             return;
         }
         let cursor = viewport.cursor;
-        if cursor.line != self.cursor.line || cursor.col != self.cursor.col {
+        let moved = cursor.line != self.cursor.line || cursor.col != self.cursor.col;
+        if moved {
             if let Some(blink) = &self.blink {
                 blink.restart_blink_animation();
             }
@@ -685,6 +715,8 @@ impl Inner {
         let blink_changed = cursor.shape != self.cursor.shape
             || cursor.blink != self.cursor.blink
             || cursor.styled != self.cursor.styled;
+        // What the cursor layer shows changed
+        let mut layer_stale = moved || blink_changed || cursor.visible != self.cursor.visible;
         self.cursor = cursor;
         if blink_changed {
             self.update_cursor_blink();
@@ -705,6 +737,10 @@ impl Inner {
             if let Dirty::Rows(r) = host_dirty {
                 set.extend(r);
             }
+            if cursor.line >= 0 {
+                let around = CursorLayer::rows_around(cursor.line as u32);
+                layer_stale |= set.range(around).next().is_some();
+            }
             // The rows the cursor left and entered (the engine does not report cursor moves as damage)
             if self.cursor_row >= 0 {
                 set.insert(self.cursor_row as u32);
@@ -723,28 +759,73 @@ impl Inner {
         if self.highlights_stale {
             self.resolve_highlights();
         }
-        self.update_model(viewport, &lines);
         self.images.update(viewport, &self.dims, self.dpr);
+        let in_view = cursor.visible && cursor.line >= 0 && (cursor.line as u32) < rows;
+        let cursor_row = in_view.then_some(cursor.line as u32);
+        layer_stale |= all | self.update_cursor_layer(cursor_row);
+        let blink_shown = self.blink.as_ref().is_none_or(Blink::is_cursor_visible);
+        let (d, bar) = (self.dims, self.dpr * self.options.cursor_width);
+        let layer = self
+            .cursor_layer
+            .as_mut()
+            .zip(cursor_row)
+            .map(|(layer, row)| {
+                let col = cursor.col.min(cols.saturating_sub(1));
+                let cell = (d.device_cell.width, d.device_cell.height);
+                let region = CursorLayer::region_for(col, row, (cols, rows), cell, bar);
+                let scale = (
+                    d.css_canvas.width / d.device_canvas.width,
+                    d.css_canvas.height / d.device_canvas.height,
+                );
+                layer.place(region, scale);
+                (region, row)
+            });
 
-        let drawn = gpu::draw(gpu::Frame {
+        match layer {
+            Some((region, row)) if layer_stale => {
+                // The layer gets the frame with the cursor shown, the canvas the cursor row again without it
+                self.update_model(viewport, &lines, true);
+                if self.draw(true, Some(region)) {
+                    self.layer_draws = self.layer_draws.wrapping_add(1);
+                } else {
+                    self.full_redraw = true;
+                }
+                self.update_model(viewport, &[row], false);
+            }
+            _ => self.update_model(viewport, &lines, layer.is_none() && blink_shown),
+        }
+        if self.draw(layer.is_none() && blink_shown, None) {
+            self.draws = self.draws.wrapping_add(1);
+        } else {
+            self.full_redraw = true;
+        }
+        if let Some(layer) = &mut self.cursor_layer {
+            layer.show(blink_shown);
+        }
+    }
+    /// Draws the model into the pane's canvas, or `region` of it into the cursor layer.
+    fn draw(&self, cursor: bool, region: Option<Region>) -> bool {
+        let present = match (region, &self.cursor_layer) {
+            (None, _) => &self.present,
+            (Some(_), Some(layer)) => &layer.present,
+            (Some(_), None) => return false,
+        };
+        gpu::draw(gpu::Frame {
             pane: self.id,
             width: self.dims.device_canvas.width,
             height: self.dims.device_canvas.height,
             rects: &self.rects,
             glyphs: &self.glyphs,
             model: &self.model,
-            cursor: self.blink.as_ref().is_none_or(Blink::is_cursor_visible),
+            cursor,
             images: &self.images,
-            present: &self.present,
-        });
-        if drawn {
-            self.draws = self.draws.wrapping_add(1);
-        } else {
-            self.full_redraw = true;
-        }
+            present,
+            region,
+        })
     }
-    /// `WebglRenderer._updateModel` minus character joiners, reading cells from the viewport.
-    fn update_model(&mut self, viewport: &Viewport, lines: &[u32]) {
+    /// `WebglRenderer._updateModel` minus character joiners, reading cells from the viewport; `cursor_shown` is
+    /// the blink phase.
+    fn update_model(&mut self, viewport: &Viewport, lines: &[u32], cursor_shown: bool) {
         let cols = self.cols as usize;
         let cursor = viewport.cursor;
         let cursor_x = cursor.col.min(self.cols.saturating_sub(1));
@@ -753,8 +834,7 @@ impl Inner {
         } else {
             self.options.cursor_inactive_style
         };
-        let cursor_visible =
-            cursor.visible && self.blink.as_ref().is_none_or(Blink::is_cursor_visible);
+        let cursor_visible = cursor.visible && cursor_shown;
         let mut last_cursor_x: i64 = -1;
         let mut model_updated = false;
         self.model.cursor = None;
@@ -954,6 +1034,22 @@ impl Inner {
         set("focused", self.focused.into());
         set("visible", self.visible.into());
         set("draws", self.draws.into());
+        set("layerDraws", self.layer_draws.into());
+        let layer = self.cursor_layer.as_ref();
+        set(
+            "cursorLayer",
+            layer.map_or(JsValue::NULL, |l| l.canvas().clone().into()),
+        );
+        set(
+            "cursorLayerRegion",
+            layer.map_or(JsValue::NULL, |l| {
+                l.region()
+                    .iter()
+                    .map(|&v| JsValue::from(v))
+                    .collect::<Array>()
+                    .into()
+            }),
+        );
         set("gpuDraws", gpu_draws.into());
         set("gl", gl);
         let requests: Array = std::mem::take(&mut self.log)

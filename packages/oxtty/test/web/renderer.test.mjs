@@ -148,33 +148,37 @@ test('cursor: DECSCUSR shape over the cursorStyle default, cursorInactiveStyle w
   assert.deepEqual(r, { block: '1111', bar: '0100', underline: '0010', steadyBlock: '1111', optionBar: '0100', outline: '0111', none: '0000', hidden: '0000' });
 });
 
-test('cursor blink is timed by the renderer and asks for the cursor row', async () => {
+test('cursor blink is timed by the renderer and flips the cursor layer', async () => {
   const r = await inPage(async (theme) => {
     const p = new T.Pane(10, 3, { ...theme, cursorBlink: true });
     await p.write('\r\nab');
     // Blinks at 600 ms intervals from the focus: watch for hidden then shown again, with room for a loaded machine
     p.focus(true);
+    await p.layered();
     const t0 = performance.now();
-    const shown = async () => (await p.cellColor(2, 1))[0] === 0xff;
+    const shown = () => p.debug.cursorLayer?.style.opacity === '1';
     p.takeRequests();
-    const seen = [await shown()];
+    const seen = [shown()];
     while (seen.length < 3 && performance.now() - t0 < 5000) {
       await T.sleep(50);
-      const s = await shown();
+      const s = shown();
       if (s !== seen[seen.length - 1]) seen.push(s);
     }
     const requests = p.takeRequests().filter((x) => x !== 'all');
-    // Unfocused, the cursor stops blinking and stays shown
+    // Unfocused, the cursor stops blinking and stays shown in the canvas
     p.focus(false);
+    await p.layered();
     p.takeRequests();
     await T.sleep(700);
     const unfocused = p.takeRequests().filter((x) => x !== 'all').length;
+    const layer = p.debug.cursorLayer;
     p.dispose();
-    return { seen, requests, unfocused };
+    return { seen, requests, unfocused, layer };
   }, CURSOR_THEME);
   assert.deepEqual(r.seen, [true, false, true]);
-  assert.ok(r.requests.length >= 2 && r.requests.every((rows) => rows.length === 1 && rows[0] === 1), JSON.stringify(r.requests));
+  assert.deepEqual(r.requests, []);
   assert.equal(r.unfocused, 0);
+  assert.equal(r.layer, null);
 });
 
 test('selection colours the selected cells and redraws only the affected rows', async () => {
