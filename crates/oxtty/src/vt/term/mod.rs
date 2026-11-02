@@ -1371,6 +1371,112 @@ impl<T> Term<T> {
         cursor_cell.extra = extra;
     }
 
+    /// oxtty: `input` for each of the printable ASCII bytes `bytes` starts with that land on the cursor row, while
+    /// none needs the general path: a pending wrap, insert mode, a charset that maps ASCII, or a wide character's
+    /// cell to overwrite. Returns how many it wrote, none where the first needs the general path.
+    fn input_ascii(&mut self, bytes: &[u8]) -> usize {
+        let point = self.grid.cursor.point;
+        let columns = self.columns();
+        if self.grid.cursor.input_needs_wrap
+            || self.mode.contains(TermMode::INSERT)
+            || self.grid.cursor.charsets[self.active_charset] != StandardCharset::Ascii
+        {
+            return 0;
+        }
+        let row = &self.grid[point.line][point.column..];
+        let n = row
+            .iter()
+            .zip(bytes)
+            .take_while(|(cell, b)| {
+                (0x20..0x7f).contains(*b) && !cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER)
+            })
+            .count();
+        if n == 0 {
+            return 0;
+        }
+        self.damage.damage_line(
+            point.line.0 as usize,
+            point.column.0.saturating_sub(1),
+            point.column.0 + n - 1,
+        );
+        let template = &self.grid.cursor.template;
+        let (fg, bg, flags, extra) = (template.fg, template.bg, template.flags, template.extra.clone());
+        let spacer = flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+        let space_flags = if spacer { flags } else { flags | Flags::TYPED_SPACE };
+        for (cell, &b) in self.grid[point.line][point.column..point.column + n].iter_mut().zip(bytes) {
+            cell.c = b as char;
+            cell.fg = fg;
+            cell.bg = bg;
+            cell.flags = if b == b' ' { space_flags } else { flags };
+            cell.extra = extra.clone();
+        }
+        let end = point.column.0 + n;
+        if end < columns {
+            self.grid.cursor.point.column = Column(end);
+        } else {
+            self.grid.cursor.point.column = Column(columns - 1);
+            self.grid.cursor.input_needs_wrap = true;
+        }
+        n
+    }
+
+    /// oxtty: `input` for each of `text`'s characters one or two cells wide that fit on the cursor row, while
+    /// none needs the general path (as `input_ascii`, or a character the charset maps). Returns how many bytes
+    /// of `text` it wrote.
+    fn input_run(&mut self, text: &str) -> usize {
+        let point = self.grid.cursor.point;
+        let columns = self.columns();
+        if self.grid.cursor.input_needs_wrap || self.mode.contains(TermMode::INSERT) {
+            return 0;
+        }
+        let mapped = self.grid.cursor.charsets[self.active_charset] != StandardCharset::Ascii;
+        let template = &self.grid.cursor.template;
+        let (fg, bg, flags, extra) = (template.fg, template.bg, template.flags, template.extra.clone());
+        let spacer = flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+        let row = &mut self.grid[point.line];
+        // The cells are written through the whole row, which marks all of it occupied; only the cells written
+        // are, as when written one by one.
+        let occ = row.occ;
+        let cells = &mut row[..];
+        let wide_cell = |cell: &Cell| cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER);
+        let (mut col, mut used) = (point.column.0, 0);
+        for c in text.chars() {
+            let width = match char_width(c) {
+                Some(width @ 1..=2) => width,
+                _ => break,
+            };
+            if col + width > columns || (mapped && c.is_ascii()) {
+                break;
+            }
+            if width == 1 {
+                let Some(cell) = cells.get_mut(col).filter(|cell| !wide_cell(cell)) else { break };
+                let flags = if c == ' ' && !spacer { flags | Flags::TYPED_SPACE } else { flags };
+                *cell = Cell { c, fg, bg, flags, extra: extra.clone() };
+            } else {
+                let Some([wide, right]) = cells.get_mut(col..col + 2) else { break };
+                if wide_cell(wide) || wide_cell(right) {
+                    break;
+                }
+                *wide = Cell { c, fg, bg, flags: flags | Flags::WIDE_CHAR, extra: extra.clone() };
+                *right = Cell { c: ' ', fg, bg, flags: flags | Flags::WIDE_CHAR_SPACER, extra: extra.clone() };
+            }
+            col += width;
+            used += c.len_utf8();
+        }
+        row.occ = if used == 0 { occ } else { occ.max(col) };
+        if used == 0 {
+            return 0;
+        }
+        self.damage.damage_line(point.line.0 as usize, point.column.0.saturating_sub(1), col - 1);
+        if col < columns {
+            self.grid.cursor.point.column = Column(col);
+        } else {
+            self.grid.cursor.point.column = Column(columns - 1);
+            self.grid.cursor.input_needs_wrap = true;
+        }
+        used
+    }
+
     #[inline]
     fn damage_cursor(&mut self) {
         // The normal cursor coordinates are always in viewport.
@@ -1393,6 +1499,18 @@ impl<T> Term<T> {
     }
 }
 
+/// oxtty: the cells `c` takes (`wmux_unicode11::width`), without the table search for Latin text, CJK
+/// ideographs and Hangul syllables.
+#[inline]
+fn char_width(c: char) -> Option<usize> {
+    match c as u32 {
+        0x00..=0x1f | 0x7f..=0x9f => Some(0),
+        0x20..=0x2ff => Some(1),
+        0x4e00..=0xa48c | 0xac00..=0xd7a3 => Some(2),
+        _ => crate::vt::wmux_unicode11::width(c),
+    }
+}
+
 impl<T> Dimensions for Term<T> {
     #[inline]
     fn columns(&self) -> usize {
@@ -1411,11 +1529,37 @@ impl<T> Dimensions for Term<T> {
 }
 
 impl<T: EventListener> Handler for Term<T> {
+    /// oxtty: printable ASCII is written a row at a time (`input_ascii`), other characters too
+    /// (`input_run`), and what those leave to the general path by `input`.
+    fn input_str(&mut self, text: &str) {
+        #[cfg(test)]
+        if tests::GENERAL_INPUT.get() {
+            text.chars().for_each(|c| self.input(c));
+            return;
+        }
+        let mut i = 0;
+        while let Some(&first) = text.as_bytes().get(i) {
+            let mut n = match first {
+                0x20..=0x7e => self.input_ascii(&text.as_bytes()[i..]),
+                _ => 0,
+            };
+            if n == 0 {
+                n = self.input_run(&text[i..]);
+            }
+            if n == 0 {
+                let Some(c) = text[i..].chars().next() else { break };
+                self.input(c);
+                n = c.len_utf8();
+            }
+            i += n;
+        }
+    }
+
     /// A character to be displayed.
     #[inline(never)]
     fn input(&mut self, c: char) {
         // Number of cells the char will occupy.
-        let width = match crate::vt::wmux_unicode11::width(c) {
+        let width = match char_width(c) {
             Some(width) => width,
             None => return,
         };
@@ -3107,6 +3251,70 @@ mod tests {
     use crate::vt::term::cell::{Cell, Flags};
     use crate::vt::term::test::TermSize;
     use crate::vt::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+
+    thread_local! {
+        /// Makes `input_str` write every character through `input`.
+        pub(super) static GENERAL_INPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The fast paths of `input_str` leave the grid, its occupied counts, the cursor and the damage as `input`
+    /// one character at a time.
+    #[test]
+    fn input_str_matches_input() {
+        let pieces: [&str; 32] = [
+            "abc", "hello world ", " ", "가", "漢字", "😀", "é", "e\u{301}", "\u{200b}", "\x7f", "\t", "\r", "\n", "\x08",
+            "\x1b(0", "\x1b(B", "\x0e", "\x0f", "\x1b[4h", "\x1b[4l", "\x1b[?7l", "\x1b[?7h", "\x1b[31m", "\x1b[0m",
+            "\x1b[H", "\x1b[2;9H", "\x1b[K", "\x1b[3@", "\x1b[2P", "\x1b]8;id=a;x\x1b\\", "xxxxxxxxxxxxx", "가나다라마",
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for case in 0..400 {
+            let config = Config { xterm_wide_leader: case % 2 == 0, scrolling_history: 20, ..Config::default() };
+            let size = TermSize::new(9 + case % 5, 4);
+            let mut terms = [
+                Term::new(config.clone(), &size, VoidListener),
+                Term::new(config, &size, VoidListener),
+            ];
+            let mut parsers = [ansi::Processor::new(), ansi::Processor::new()];
+            for _ in 0..60 {
+                let piece = pieces[next(pieces.len())].as_bytes();
+                for (k, (term, parser)) in terms.iter_mut().zip(&mut parsers).enumerate() {
+                    GENERAL_INPUT.set(k == 1);
+                    parser.advance(term, piece);
+                }
+                GENERAL_INPUT.set(false);
+                let [fast, general] = &mut terms;
+                assert_eq!(fast.grid.cursor.point, general.grid.cursor.point, "case {case}");
+                assert_eq!(fast.grid.cursor.input_needs_wrap, general.grid.cursor.input_needs_wrap, "case {case}");
+                let history = fast.grid.history_size() as i32;
+                assert_eq!(history, general.grid.history_size() as i32, "case {case}");
+                for line in -history..fast.screen_lines() as i32 {
+                    let (a, b) = (&fast.grid[Line(line)], &general.grid[Line(line)]);
+                    assert_eq!(a, b, "case {case} line {line}");
+                    assert_eq!(a.occ, b.occ, "case {case} line {line}");
+                }
+                let damage = |term: &mut Term<VoidListener>| match term.damage() {
+                    TermDamage::Full => None,
+                    TermDamage::Partial(lines) => Some(lines.collect::<Vec<_>>()),
+                };
+                assert_eq!(damage(fast), damage(general), "case {case}");
+                fast.reset_damage();
+                general.reset_damage();
+            }
+        }
+    }
+
+    #[test]
+    fn char_width_matches_the_table() {
+        for c in (0..=0x10ffff).filter_map(char::from_u32) {
+            assert_eq!(char_width(c), crate::vt::wmux_unicode11::width(c), "{:#x}", c as u32);
+        }
+    }
 
     #[test]
     fn scroll_display_page_up() {

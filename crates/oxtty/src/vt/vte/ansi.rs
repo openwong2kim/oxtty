@@ -461,6 +461,13 @@ pub trait Handler {
     /// A character to be displayed.
     fn input(&mut self, _c: char) {}
 
+    /// oxtty: characters to be displayed, none of them a control, as `input` one by one.
+    fn input_str(&mut self, text: &str) {
+        for c in text.chars() {
+            self.input(c);
+        }
+    }
+
     /// Set cursor to position.
     fn goto(&mut self, _line: i32, _col: usize) {}
 
@@ -1252,6 +1259,12 @@ where
     fn print(&mut self, c: char) {
         self.handler.input(c);
         self.state.preceding_char = Some(c);
+    }
+
+    #[inline]
+    fn print_str(&mut self, text: &str) {
+        self.handler.input_str(text);
+        self.state.preceding_char = text.chars().next_back().or(self.state.preceding_char);
     }
 
     #[inline]
