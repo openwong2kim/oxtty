@@ -150,7 +150,13 @@ impl Marker {
         if core.disposed {
             return -1;
         }
-        core.view.engine().marker_line(self.id).unwrap_or(-1)
+        let line = core.view.engine().marker_line(self.id).unwrap_or(-1);
+        // In viewport-only mode the primary screen's lines start after the host's.
+        let primary = shared.markers.borrow().ids.contains(&self.id);
+        match core.view.remote() {
+            Some(remote) if line >= 0 && primary => line.saturating_add(remote.lines as i32),
+            _ => line,
+        }
     }
 
     #[wasm_bindgen(getter = isDisposed)]

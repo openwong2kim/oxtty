@@ -170,7 +170,7 @@ fn scroll_on_user_input(shared: &Rc<Shared>) {
     let scrolled = shared.core.try_borrow().is_ok_and(|core| {
         !core.disposed
             && crate::options::option(&core.options, "scrollOnUserInput").is_truthy()
-            && core.view.engine().display_offset() != 0
+            && core.view.display_offset() != 0
     });
     if scrolled {
         let _ = terminal(shared).scroll_to_bottom();

@@ -328,10 +328,6 @@ a search holds at most four pages of logical-line text.
 engine wasm memory 69 → 9 MB; 20 panes, +100 → +29 MB (RSS +130 → +61 MB), 81 → 13 MB. Front-end wasm memory (8–9
 MB) and the JS heap (3 MB) do not change. Tests: `packages/oxtty/test/web/viewport.test.mjs`.
 
-**Follow-ups outside this change.** The scrollbar's drag (`scrollbar.rs`, `apply_scroll_requests`) and
-`IMarker.line` (`markers.rs`) still read the engine's own numbers, so a drag cannot reach host lines and a marker's
-line leaves out `H`; both move to `LocalEngineView::{history_length, display_offset, scroll_display, remote_lines}`.
-
 **wmux wiring (not done here).** The renderer builds each pane's terminal with `scrollback` 200 and, after
 attaching, calls `setHistoryProvider({ length, fetch })` with `length` from the daemon. The daemon answers `fetch`
 from a per-pane native oxtty engine (`oxtty-node`: `rowCells`, `rowWrapped`, `rowExtras` for lines

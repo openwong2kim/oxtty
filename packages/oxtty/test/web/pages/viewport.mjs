@@ -122,6 +122,49 @@ window.select = async (column, row, length) => {
   return [full.term.getSelection(), view.term.getSelection()];
 };
 
+/** The view's slider, its centre and the top of its track. */
+function slider(p) {
+  const r = p.term.element.querySelector('.xterm-vertical > .xterm-slider').getBoundingClientRect();
+  const bar = p.term.element.querySelector('.xterm-scrollbar.xterm-vertical').getBoundingClientRect();
+  return { x: r.x + r.width / 2, y: r.y + r.height / 2, top: bar.y };
+}
+window.slider = (which) => slider(which === 'full' ? full : view);
+window.viewportY = async () => {
+  await frames(2);
+  return [full.term.buffer.active.viewportY, view.term.buffer.active.viewportY];
+};
+
+/**
+ * A viewport-only terminal keeping no scrollback of its own (so its engine never scrolls), scrolled to the top of
+ * the host's lines; `how` is 'key' (a keydown), 'composition' (a keydown the IME takes) or 'input' (`input()`).
+ * Returns viewportY after and baseY.
+ */
+window.userInput = async (how) => {
+  const p = new Pane(COLS, ROWS, { scrollback: 0 });
+  const host = new Engine({ cols: COLS, rows: ROWS, scrollback: 100000 });
+  const data = corpus(100);
+  host.write(data);
+  p.term.setHistoryProvider({ get length() { return host.historyLength; }, fetch: async () => [] });
+  await p.write(data);
+  p.term.scrollToTop();
+  const top = p.term.buffer.active.viewportY;
+  const textarea = p.term.textarea;
+  const init = { bubbles: true, cancelable: true, composed: true };
+  if (how === 'key') {
+    textarea.dispatchEvent(new KeyboardEvent('keydown', { ...init, key: 'a', code: 'KeyA', keyCode: 65, which: 65 }));
+    textarea.dispatchEvent(new KeyboardEvent('keypress', { ...init, key: 'a', code: 'KeyA', keyCode: 97, charCode: 97, which: 97 }));
+  } else if (how === 'composition') {
+    textarea.dispatchEvent(new KeyboardEvent('keydown', { ...init, key: 'Process', code: 'KeyA', keyCode: 229, which: 229, isComposing: true }));
+  } else {
+    p.term.input('a');
+  }
+  await frames(2);
+  const out = { top, viewportY: p.term.buffer.active.viewportY, baseY: p.term.buffer.active.baseY };
+  p.dispose();
+  host.dispose();
+  return out;
+};
+
 window.fetches = () => fetches;
 window.cacheSize = () => view.term._historyCacheSize();
 

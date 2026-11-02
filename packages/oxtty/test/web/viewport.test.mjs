@@ -237,6 +237,23 @@ test('a resize drops fetched rows until the host sets the provider again', async
   dispose();
 });
 
+test('markers count the host\'s lines, on the normal screen and while the alternate one is up', async () => {
+  const { full, view, step, dispose } = await setup(corpus(300));
+  const marks = [full, view].map((t) => [0, -3].map((offset) => t.registerMarker(offset)));
+  const lines = () => marks.map((list) => list.map((marker) => marker.line));
+  assert.ok(lines()[0][0] > 300);
+  assert.deepEqual(lines()[1], lines()[0]);
+  await step(corpus(10, 2));
+  assert.deepEqual(lines()[1], lines()[0]);
+  await step('\x1b[?1049h');
+  const alt = [full, view].map((t) => t.registerMarker(0));
+  assert.deepEqual(lines()[1], lines()[0]);
+  assert.equal(alt[1].line, alt[0].line);
+  await step('\x1b[?1049l');
+  assert.deepEqual(lines()[1], lines()[0]);
+  dispose();
+});
+
 // One page for drawing, search and selection: a browser per test would load the machine the parallel tests share.
 test('in a page: host rows are drawn once they arrive, search and selection read them like a full terminal', async () => {
   const r = await withPage('viewport.mjs', async (page) => {
@@ -258,8 +275,24 @@ test('in a page: host rows are drawn once they arrive, search and selection read
       }
     }
     const selection = await page.evaluate((top) => window.select(3, top, 40 * 100), baseY - 30 - 60);
-    return { render, search, selection };
+    // Dragging each slider to the top of its track: the viewport-only one goes into the host's lines too.
+    const drag = [];
+    for (const which of ['full', 'view']) {
+      const s = await page.evaluate((w) => window.slider(w), which);
+      await page.mouse.move(s.x, s.y);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await page.mouse.down();
+      await page.mouse.move(s.x, s.y - 40);
+      drag.push(await page.evaluate(() => window.viewportY()));
+      await page.mouse.move(s.x, s.top - 50);
+      drag.push(await page.evaluate(() => window.viewportY()));
+      await page.mouse.up();
+    }
+    const input = [];
+    for (const how of ['key', 'composition', 'input']) input.push(await page.evaluate((h) => window.userInput(h), how));
+    return { render, search, selection, drag, input, baseY };
   });
+  const { baseY } = r;
   // Drawing: blank placeholder rows until the answer, then the same pixels as the full terminal.
   for (const [k, s] of r.render.entries()) {
     assert.equal(s.viewportY[0], s.viewportY[1], `case ${k}`);
@@ -287,4 +320,15 @@ test('in a page: host rows are drawn once they arrive, search and selection read
   const [full, view] = r.selection;
   assert.ok(full.length > 1000, `${full.length} characters`);
   assert.equal(view, full);
+  // The scrollbar: a drag of the full terminal's slider, then the same drag of the viewport-only one.
+  const [[fullDragged], [fullTop], [, viewDragged], [, viewTop]] = r.drag;
+  assert.ok(fullDragged < baseY && fullTop === 0, `full terminal dragged to ${fullDragged}, then ${fullTop}`);
+  assert.equal(viewTop, 0, 'the viewport-only slider reaches the oldest host line');
+  assert.ok(viewDragged < baseY - 30 - 8, `a short drag reaches host lines (${viewDragged})`);
+  // User input from host lines scrolls to the bottom (scrollOnUserInput), even with no scrollback of its own.
+  for (const [k, i] of r.input.entries()) {
+    assert.equal(i.top, 0, `case ${k}`);
+    assert.ok(i.baseY > 90, `case ${k}`);
+    assert.equal(i.viewportY, i.baseY, ['key', 'composition', 'input'][k]);
+  }
 });
