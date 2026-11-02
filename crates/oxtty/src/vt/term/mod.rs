@@ -1443,7 +1443,8 @@ impl<T> Term<T> {
         let cells = &mut row[..];
         let wide_cell = |cell: &Cell| cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER);
         let (mut col, mut used) = (point.column.0, 0);
-        for c in text.chars() {
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
             let width = match char_width(c) {
                 Some(width @ 1..=2) => width,
                 _ => break,
@@ -1454,17 +1455,21 @@ impl<T> Term<T> {
             if width == 1 {
                 let Some(cell) = cells.get_mut(col).filter(|cell| !wide_cell(cell)) else { break };
                 let flags = if c == ' ' && !spacer { flags | Flags::TYPED_SPACE } else { flags };
-                *cell = Cell { c, fg, bg, flags, extra: extra.clone() };
+                *cell = Cell { c, fg, bg, flags, extra: None };
             } else {
                 let Some([wide, right]) = cells.get_mut(col..col + 2) else { break };
                 if wide_cell(wide) || wide_cell(right) {
                     break;
                 }
-                *wide = Cell { c, fg, bg, flags: flags | Flags::WIDE_CHAR, extra: extra.clone() };
-                *right = Cell { c: ' ', fg, bg, flags: flags | Flags::WIDE_CHAR_SPACER, extra: extra.clone() };
+                *wide = Cell { c, fg, bg, flags: flags | Flags::WIDE_CHAR, extra: None };
+                *right = Cell { c: ' ', fg, bg, flags: flags | Flags::WIDE_CHAR_SPACER, extra: None };
             }
             col += width;
-            used += c.len_utf8();
+            used = text.len() - chars.as_str().len();
+        }
+        // The pen's extra goes on afterwards, so the loop has no reference count to keep.
+        if let Some(extra) = extra {
+            cells[point.column.0..col].iter_mut().for_each(|cell| cell.extra = Some(extra.clone()));
         }
         row.occ = if used == 0 { occ } else { occ.max(col) };
         if used == 0 {
