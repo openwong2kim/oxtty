@@ -1,5 +1,5 @@
 target/
 node_modules/
-packages/oxtty/dist/
+packages/wongtty/dist/
 *.node
 examples/*/package-lock.json

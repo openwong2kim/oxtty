@@ -1,11 +1,11 @@
-// The corpus of packages/oxtty/bench/throughput.mjs (its corpus.mjs: the same six scenarios, the same seed, 8 MiB
+// The corpus of packages/wongtty/bench/throughput.mjs (its corpus.mjs: the same six scenarios, the same seed, 8 MiB
 // each), written to one file per scenario so the Rust bench and node.mjs read the same bytes.
 //
 //   node bench/engines/corpus.mjs <dir>
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
-import { cases, generate } from '../../packages/oxtty/bench/corpus.mjs';
+import { cases, generate } from '../../packages/wongtty/bench/corpus.mjs';
 
 export const COLS = 120;
 export const ROWS = 40;

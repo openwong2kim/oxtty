@@ -1,0 +1,22 @@
+[package]
+name = "wongtty-node"
+description = "N-API binding for wongtty (daemons, Electron main process)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+wongtty = { path = "../wongtty" }
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+
+[build-dependencies]
+napi-build = "2"

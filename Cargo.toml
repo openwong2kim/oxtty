@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/oxtty", "crates/oxtty-wasm", "crates/oxtty-node", "crates/oxtty-web"]
+members = ["crates/wongtty", "crates/wongtty-wasm", "crates/wongtty-node", "crates/wongtty-web"]
 
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/openwong2kim/oxtty"
+repository = "https://github.com/openwong2kim/wongtty"
 authors = ["openwong2kim"]
 
 [profile.release]

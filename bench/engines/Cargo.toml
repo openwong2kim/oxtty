@@ -1,6 +1,6 @@
 [package]
-name = "oxtty-engine-bench"
-description = "Parser throughput and memory of oxtty against other Rust terminal engines on the throughput.mjs corpus."
+name = "wongtty-engine-bench"
+description = "Parser throughput and memory of wongtty against other Rust terminal engines on the throughput.mjs corpus."
 version = "0.0.1"
 edition = "2021"
 license = "Apache-2.0"
@@ -14,8 +14,8 @@ publish = false
 ghostty = ["dep:ghostty-vt-rs-sys"]
 
 [dependencies]
-oxtty = { path = "../../crates/oxtty" }
-# oxtty's upstream, unpatched (Apache-2.0).
+wongtty = { path = "../../crates/wongtty" }
+# wongtty's upstream, unpatched (Apache-2.0).
 alacritty_terminal = "=0.26.0"
 # MIT.
 vt100 = "=0.18.1"

@@ -1,5 +1,5 @@
-// A shell in the browser: node-pty on the server, oxtty/xterm on the page, one WebSocket between them.
-//   (cd packages/oxtty && npm run build) && cd examples/browser && npm install && npm start
+// A shell in the browser: node-pty on the server, wongtty/xterm on the page, one WebSocket between them.
+//   (cd packages/wongtty && npm run build) && cd examples/browser && npm install && npm start
 // then open http://localhost:8080. Listens on localhost only: anyone who can connect gets your shell.
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -10,12 +10,12 @@ import pty from 'node-pty';
 import { WebSocketServer } from 'ws';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const dist = dirname(createRequire(import.meta.url).resolve('oxtty'));
+const dist = dirname(createRequire(import.meta.url).resolve('wongtty'));
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.wasm': 'application/wasm' };
 
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
-  const file = url.pathname === '/' ? join(here, 'index.html') : url.pathname.startsWith('/oxtty/') ? join(dist, url.pathname.slice(7)) : undefined;
+  const file = url.pathname === '/' ? join(here, 'index.html') : url.pathname.startsWith('/wongtty/') ? join(dist, url.pathname.slice(7)) : undefined;
   if (!file || file.includes('..')) return res.writeHead(404).end();
   try {
     res.writeHead(200, { 'content-type': TYPES[extname(file)] ?? 'application/octet-stream' }).end(await readFile(file));

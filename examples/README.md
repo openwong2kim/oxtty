@@ -1,8 +1,8 @@
 # Examples
 
-A real shell drawn by `oxtty/xterm`. Build the package first: `(cd packages/oxtty && npm run build)`.
+A real shell drawn by `wongtty/xterm`. Build the package first: `(cd packages/wongtty && npm run build)`.
 
-**Not runnable right now:** `oxtty/xterm` is being rewritten in Rust (PRD v0.4) and these examples come back with it.
+**Not runnable right now:** `wongtty/xterm` is being rewritten in Rust (PRD v0.4) and these examples come back with it.
 
 | Example | Run | What it shows |
 | --- | --- | --- |

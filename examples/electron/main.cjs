@@ -1,5 +1,5 @@
-// A shell in Electron: node-pty in the main process, oxtty/xterm in the renderer, IPC between them.
-//   (cd packages/oxtty && npm run build) && cd examples/electron && npm install && npm start
+// A shell in Electron: node-pty in the main process, wongtty/xterm in the renderer, IPC between them.
+//   (cd packages/wongtty && npm run build) && cd examples/electron && npm install && npm start
 const { app, BrowserWindow, ipcMain } = require('electron');
 const { readFileSync } = require('node:fs');
 const { dirname, join } = require('node:path');
@@ -14,7 +14,7 @@ app.whenReady().then(() => {
   ipcMain.on('pty:input', (_, data) => term.write(data));
   ipcMain.on('pty:resize', (_, cols, rows) => term.resize(cols, rows));
   // The renderer cannot fetch file:// URLs, so it gets both modules' bytes over IPC and passes them to init().
-  ipcMain.handle('oxtty:wasm', () => ['oxtty.wasm', 'xterm_web_bg.wasm'].map(file => readFileSync(join(dirname(require.resolve('oxtty')), file))));
+  ipcMain.handle('wongtty:wasm', () => ['wongtty.wasm', 'xterm_web_bg.wasm'].map(file => readFileSync(join(dirname(require.resolve('wongtty')), file))));
   win.on('closed', () => term.kill());
   win.loadFile('index.html');
 });

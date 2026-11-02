@@ -1,5 +1,5 @@
 {
-  "name": "oxtty-example-electron",
+  "name": "wongtty-example-electron",
   "private": true,
   "main": "main.cjs",
   "scripts": {
@@ -8,7 +8,7 @@
   },
   "dependencies": {
     "node-pty": "^1.1.0",
-    "oxtty": "file:../../packages/oxtty"
+    "wongtty": "file:../../packages/wongtty"
   },
   "devDependencies": {
     "electron": "^42.0.0"

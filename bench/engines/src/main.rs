@@ -1,11 +1,11 @@
-//! Feeds the throughput.mjs corpus to oxtty and other Rust terminal engines: MiB/s (median of 5 runs, engines in
+//! Feeds the throughput.mjs corpus to wongtty and other Rust terminal engines: MiB/s (median of 5 runs, engines in
 //! turn within each run) and the peak memory one engine takes to swallow one scenario (a fresh process each).
 //!
 //!   node bench/engines/corpus.mjs <dir>
 //!   cargo run --release --manifest-path bench/engines/Cargo.toml [--features ghostty] -- <dir> [out.json]
 //!
 //! Every engine gets the same 64 KiB chunks at 120×40 with 10,000 lines of scrollback, and its visible screen text
-//! is compared with oxtty's at the end.
+//! is compared with wongtty's at the end.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fmt::Write as _;
@@ -76,9 +76,9 @@ trait Engine {
     }
 }
 
-struct Oxtty(oxtty::Engine);
+struct Wongtty(wongtty::Engine);
 
-impl Engine for Oxtty {
+impl Engine for Wongtty {
     fn feed(&mut self, bytes: &[u8]) {
         self.0.feed(bytes);
     }
@@ -387,8 +387,8 @@ mod ghostty {
 
 fn engines() -> Vec<&'static str> {
     let mut all = vec![
-        "oxtty",
-        "oxtty-uncompressed",
+        "wongtty",
+        "wongtty-uncompressed",
         "alacritty",
         "vt100",
         "avt",
@@ -402,8 +402,8 @@ fn engines() -> Vec<&'static str> {
 
 fn make(name: &str) -> Box<dyn Engine> {
     match name {
-        "oxtty" => Box::new(Oxtty(oxtty::Engine::new(COLS, ROWS, SCROLLBACK))),
-        "oxtty-uncompressed" => Box::new(Oxtty(oxtty::Engine::new_uncompressed(
+        "wongtty" => Box::new(Wongtty(wongtty::Engine::new(COLS, ROWS, SCROLLBACK))),
+        "wongtty-uncompressed" => Box::new(Wongtty(wongtty::Engine::new_uncompressed(
             COLS, ROWS, SCROLLBACK,
         ))),
         "alacritty" => Box::new(alacritty::Alacritty::new()),
@@ -471,7 +471,7 @@ fn main() {
     }
     let dir = args
         .get(1)
-        .expect("usage: oxtty-engine-bench <corpus-dir> [out.json]");
+        .expect("usage: wongtty-engine-bench <corpus-dir> [out.json]");
     let names = engines();
     let mut rows = Vec::new();
     for case in CASES {
@@ -506,7 +506,7 @@ fn main() {
             } else {
                 let i = differ[0];
                 format!(
-                    "{} rows differ; row {i}: {:?} vs oxtty {:?}",
+                    "{} rows differ; row {i}: {:?} vs wongtty {:?}",
                     differ.len(),
                     screens[e][i].chars().take(60).collect::<String>(),
                     screens[0][i].chars().take(60).collect::<String>()

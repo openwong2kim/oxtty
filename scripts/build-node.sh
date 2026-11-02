@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Builds the N-API binding for this machine and places it at crates/oxtty-node/oxtty.node.
+# Builds the N-API binding for this machine and places it at crates/wongtty-node/wongtty.node.
 # (Publishing per-platform prebuilds via @napi-rs/cli is a later step.)
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
-cargo build --manifest-path "$root/Cargo.toml" -p oxtty-node --release
+cargo build --manifest-path "$root/Cargo.toml" -p wongtty-node --release
 case "$(uname -s)" in
-  Darwin) lib="liboxtty_node.dylib" ;;
-  MINGW*|MSYS*|CYGWIN*) lib="oxtty_node.dll" ;;
-  *) lib="liboxtty_node.so" ;;
+  Darwin) lib="libwongtty_node.dylib" ;;
+  MINGW*|MSYS*|CYGWIN*) lib="wongtty_node.dll" ;;
+  *) lib="libwongtty_node.so" ;;
 esac
-cp "$root/target/release/$lib" "$root/crates/oxtty-node/oxtty.node"
-echo "crates/oxtty-node/oxtty.node: $(wc -c < "$root/crates/oxtty-node/oxtty.node") bytes"
+cp "$root/target/release/$lib" "$root/crates/wongtty-node/wongtty.node"
+echo "crates/wongtty-node/wongtty.node: $(wc -c < "$root/crates/wongtty-node/wongtty.node") bytes"

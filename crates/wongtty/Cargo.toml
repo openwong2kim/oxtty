@@ -1,0 +1,37 @@
+[package]
+name = "wongtty"
+description = "A terminal emulator engine in Rust: parse VT bytes, keep the screen, hand any renderer the rows that changed. Runs natively and in WebAssembly."
+version.workspace = true
+# The embedded vt module (Alacritty 0.26) is 2024 edition.
+edition = "2024"
+rust-version.workspace = true
+# wongtty code and the embedded vt module are Apache-2.0; the bundled Unicode 11 table and the input encoders ported
+# from xterm.js (src/input) are xterm.js's MIT (LICENSE-XTERM). See NOTICE.md.
+license = "Apache-2.0 AND MIT"
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+# The xterm.js parity test and its fixtures (about 2.5 MB) stay out of the package.
+exclude = ["tests/fixtures", "tests/input.rs"]
+keywords = ["terminal", "vt100", "xterm", "wasm", "emulator"]
+categories = ["command-line-interface", "wasm"]
+
+[features]
+# serde support for the vt module (embedded Alacritty). Off by default.
+serde = ["dep:serde", "bitflags/serde"]
+
+[dependencies]
+# Dependencies of the vt module (embedded Alacritty) — only these, since PTY and the event loop were removed.
+base64 = "0.22.0"
+bitflags = "2.4.1"
+log = "0.4"
+regex-automata = "0.4.3"
+unicode-width = "0.2.0"
+# Dependencies of the `vte` crate, which is built into the vt module (vt/vte).
+memchr = { version = "2.7.4", default-features = false }
+cursor-icon = { version = "1.0.0", default-features = false }
+serde = { version = "1", features = ["derive", "rc"], optional = true }
+
+[dev-dependencies]
+# Reads the xterm.js parity fixtures of tests/input.rs.
+serde_json = "1"

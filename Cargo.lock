@@ -274,50 +274,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "oxtty"
-version = "0.0.1"
-dependencies = [
- "base64",
- "bitflags",
- "cursor-icon",
- "log",
- "memchr",
- "regex-automata",
- "serde",
- "serde_json",
- "unicode-width",
-]
-
-[[package]]
-name = "oxtty-node"
-version = "0.0.1"
-dependencies = [
- "napi",
- "napi-build",
- "napi-derive",
- "oxtty",
-]
-
-[[package]]
-name = "oxtty-wasm"
-version = "0.0.1"
-dependencies = [
- "dlmalloc",
- "oxtty",
-]
-
-[[package]]
-name = "oxtty-web"
-version = "0.0.1"
-dependencies = [
- "js-sys",
- "oxtty",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -542,6 +498,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "wongtty"
+version = "0.0.1"
+dependencies = [
+ "base64",
+ "bitflags",
+ "cursor-icon",
+ "log",
+ "memchr",
+ "regex-automata",
+ "serde",
+ "serde_json",
+ "unicode-width",
+]
+
+[[package]]
+name = "wongtty-node"
+version = "0.0.1"
+dependencies = [
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "wongtty",
+]
+
+[[package]]
+name = "wongtty-wasm"
+version = "0.0.1"
+dependencies = [
+ "dlmalloc",
+ "wongtty",
+]
+
+[[package]]
+name = "wongtty-web"
+version = "0.0.1"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "wongtty",
 ]
 
 [[package]]

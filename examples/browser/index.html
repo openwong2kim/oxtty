@@ -1,6 +1,6 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>oxtty</title>
+<title>wongtty</title>
 <link rel="icon" href="data:,">
 <style>
   html, body { height: 100%; margin: 0; background: #1e1e1e; }
@@ -8,9 +8,9 @@
 </style>
 <div id="terminal"></div>
 <script type="module">
-  import { init, Terminal, FitAddon } from '/oxtty/xterm.js';
+  import { init, Terminal, FitAddon } from '/wongtty/xterm.js';
 
-  await init(); // loads oxtty.wasm next to xterm.js; the only step xterm.js does not have
+  await init(); // loads wongtty.wasm next to xterm.js; the only step xterm.js does not have
   const term = new Terminal({ fontFamily: 'Menlo, Consolas, monospace', fontSize: 14, theme: { background: '#1e1e1e' } });
   const fit = new FitAddon();
   term.loadAddon(fit);

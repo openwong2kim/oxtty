@@ -1,5 +1,5 @@
 {
-  "name": "oxtty-example-browser",
+  "name": "wongtty-example-browser",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,7 +8,7 @@
   },
   "dependencies": {
     "node-pty": "^1.1.0",
-    "oxtty": "file:../../packages/oxtty",
+    "wongtty": "file:../../packages/wongtty",
     "ws": "^8.18.0"
   }
 }

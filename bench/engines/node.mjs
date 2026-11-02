@@ -1,6 +1,6 @@
-// oxtty (wasm) against libghostty-vt (wasm, from ghostty-web) and xterm.js headless in Node, on the throughput.mjs
+// wongtty (wasm) against libghostty-vt (wasm, from ghostty-web) and xterm.js headless in Node, on the throughput.mjs
 // corpus: MiB/s (median of 5 runs, engines in turn within each run), and from a fresh process per engine and
-// scenario the peak RSS growth, the lines of scrollback kept and the visible screen text (compared with oxtty's).
+// scenario the peak RSS growth, the lines of scrollback kept and the visible screen text (compared with wongtty's).
 //
 //   bash scripts/build-wasm.sh && (cd bench/engines && npm ci)   (repository root)
 //   node bench/engines/corpus.mjs <dir>
@@ -20,8 +20,8 @@ const RUNS = 5;
 const GHOSTTY_SCROLLBACK_BYTES = 16 * 1024 * 1024;
 
 async function engine(name) {
-  if (name === 'oxtty-wasm') {
-    const { init, Terminal } = await import('../../packages/oxtty/dist/index.js');
+  if (name === 'wongtty-wasm') {
+    const { init, Terminal } = await import('../../packages/wongtty/dist/index.js');
     await init();
     return {
       make: () => new Terminal({ cols: COLS, rows: ROWS, scrollback: SCROLLBACK }),
@@ -74,7 +74,7 @@ async function engine(name) {
   };
 }
 
-const ENGINES = ['oxtty-wasm', 'ghostty-web', 'xterm-headless'];
+const ENGINES = ['wongtty-wasm', 'ghostty-web', 'xterm-headless'];
 
 function load(dir, name) {
   const bytes = readFileSync(join(dir, `${name}.vt`));
@@ -130,7 +130,7 @@ for (const caseName of CASES) {
     const memory = child.status === 0 ? JSON.parse(child.stdout) : { screen: [] };
     screens[name] = memory.screen;
     const differ = screens[name].flatMap((row, i) => (row === screens[ENGINES[0]][i] ? [] : [i]));
-    const screen = differ.length === 0 ? 'same' : `${differ.length} rows differ; row ${differ[0]}: ${JSON.stringify(screens[name][differ[0]].slice(0, 60))} vs oxtty ${JSON.stringify(screens[ENGINES[0]][differ[0]].slice(0, 60))}`;
+    const screen = differ.length === 0 ? 'same' : `${differ.length} rows differ; row ${differ[0]}: ${JSON.stringify(screens[name][differ[0]].slice(0, 60))} vs wongtty ${JSON.stringify(screens[ENGINES[0]][differ[0]].slice(0, 60))}`;
     const row = { case: caseName, engine: name, mibPerSec: +s[s.length >> 1].toFixed(1), min: +s[0].toFixed(1), max: +s.at(-1).toFixed(1), peakBytes: memory.peak ?? null, retainedBytes: memory.retained ?? null, history: memory.history ?? null, screen };
     results.push(row);
     const m = (b) => (b === null ? '?' : (b / 1048576).toFixed(1).padStart(6));

@@ -1211,7 +1211,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxtty"
+name = "wongtty"
 version = "0.0.1"
 dependencies = [
  "base64",
@@ -1224,14 +1224,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxtty-engine-bench"
+name = "wongtty-engine-bench"
 version = "0.0.1"
 dependencies = [
  "alacritty_terminal",
  "avt",
  "ghostty-vt-rs-sys",
  "libc",
- "oxtty",
+ "wongtty",
  "vt100",
  "zeughaus-wezterm-term",
 ]
