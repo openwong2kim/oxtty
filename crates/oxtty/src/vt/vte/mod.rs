@@ -36,7 +36,7 @@ use core::mem::MaybeUninit;
 use core::str;
 
 mod params;
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
 mod scan;
 
 pub mod ansi;
@@ -804,10 +804,10 @@ fn printable_ascii(word: u64) -> bool {
 }
 
 /// oxtty: where the text from `i` on stops being valid UTF-8 without controls: at a C0 or C1 control, or at the
-/// first character that is not valid or not complete. With NEON, 16 bytes at a time first.
+/// first character that is not valid or not complete. With NEON or SIMD128, 16 bytes at a time first.
 #[inline]
 fn text_end(bytes: &[u8], mut i: usize) -> usize {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
     if bytes.len() - i >= 16 {
         i = scan::printable(bytes, i).0;
     }

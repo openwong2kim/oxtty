@@ -1,8 +1,7 @@
-//! oxtty: finds text the ground state prints unchanged, 16 bytes at a time with NEON on aarch64: valid UTF-8
-//! (the rules of `str::from_utf8`, checked as simdjson's and simdutf's lookup algorithm by John Keiser and Daniel
-//! Lemire does) holding no C0 controls (ESC among them) and no C1 controls (U+0080..U+009F).
-
-use core::arch::aarch64::*;
+//! oxtty: finds text the ground state prints unchanged, 16 bytes at a time with NEON on aarch64 or SIMD128 on
+//! WebAssembly built with it: valid UTF-8 (the rules of `str::from_utf8`, checked as simdjson's and simdutf's
+//! lookup algorithm by John Keiser and Daniel Lemire does) holding no C0 controls (ESC among them) and no C1
+//! controls (U+0080..U+009F).
 
 /// Errors of the byte before a position and the high nibble of the byte at it (Keiser and Lemire's names).
 const TOO_SHORT: u8 = 1 << 0;
@@ -83,24 +82,16 @@ const BYTE_2_HIGH: [u8; 16] = [
 #[inline(never)]
 pub(super) fn printable(bytes: &[u8], start: usize) -> (usize, usize) {
     let mut i = start;
-    // SAFETY: NEON is part of every aarch64 target; each load reads 16 bytes that `i + 16 <= bytes.len()` keeps
-    // inside `bytes`.
-    let stop = unsafe {
-        let tables = (vld1q_u8(BYTE_1_HIGH.as_ptr()), vld1q_u8(BYTE_1_LOW.as_ptr()), vld1q_u8(BYTE_2_HIGH.as_ptr()));
-        // What comes before `start` reads as ASCII.
-        let mut prev = vdupq_n_u8(0);
-        loop {
-            if bytes.len() - i < 16 {
-                break i;
-            }
-            let input = vld1q_u8(bytes.as_ptr().add(i));
-            let rejected = rejected(input, prev, tables);
-            if rejected != 0 {
-                break i + rejected.trailing_zeros() as usize / 4;
-            }
-            prev = input;
-            i += 16;
+    let mut blocks = Blocks::new();
+    let stop = loop {
+        if bytes.len() - i < 16 {
+            break i;
         }
+        let block: &[u8; 16] = bytes[i..i + 16].try_into().unwrap();
+        if let Some(at) = blocks.first_rejected(block) {
+            break i + at;
+        }
+        i += 16;
     };
     // No rejection before `stop`, so the characters that end before the one holding `stop - 1` are all valid: a
     // missing continuation byte is rejected where it should be.
@@ -114,26 +105,100 @@ pub(super) fn printable(bytes: &[u8], start: usize) -> (usize, usize) {
     (clean, stop)
 }
 
-/// Four bits for each byte of `input` (the lowest first), set where it is a control or breaks UTF-8 after `prev`.
-#[inline(always)]
-unsafe fn rejected(input: uint8x16_t, prev: uint8x16_t, tables: (uint8x16_t, uint8x16_t, uint8x16_t)) -> u64 {
-    unsafe {
-        let prev1 = vextq_u8::<15>(prev, input);
-        let prev2 = vextq_u8::<14>(prev, input);
-        let prev3 = vextq_u8::<13>(prev, input);
-        let byte_1_high = vqtbl1q_u8(tables.0, vshrq_n_u8::<4>(prev1));
-        let byte_1_low = vqtbl1q_u8(tables.1, vandq_u8(prev1, vdupq_n_u8(0x0F)));
-        let byte_2_high = vqtbl1q_u8(tables.2, vshrq_n_u8::<4>(input));
-        let special = vandq_u8(vandq_u8(byte_1_high, byte_1_low), byte_2_high);
-        // A third or fourth byte must be a continuation byte; only bytes from 0xE0 and 0xF0 stay at 0x80 and above.
-        let third = vqsubq_u8(prev2, vdupq_n_u8(0xE0 - 0x80));
-        let fourth = vqsubq_u8(prev3, vdupq_n_u8(0xF0 - 0x80));
-        let must_continue = vandq_u8(vorrq_u8(third, fourth), vdupq_n_u8(0x80));
-        let invalid = veorq_u8(must_continue, special);
-        let c0 = vcltq_u8(input, vdupq_n_u8(0x20));
-        let c1 = vandq_u8(vceqq_u8(prev1, vdupq_n_u8(0xC2)), vcltq_u8(input, vdupq_n_u8(0xA0)));
-        let rejected = vtstq_u8(vorrq_u8(invalid, vorrq_u8(c0, c1)), vdupq_n_u8(0xFF));
-        vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(rejected))))
+/// The lookup tables and the block before, for checking one block of 16 after another.
+#[cfg(target_arch = "aarch64")]
+struct Blocks {
+    tables: [core::arch::aarch64::uint8x16_t; 3],
+    prev: core::arch::aarch64::uint8x16_t,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl Blocks {
+    #[inline(always)]
+    fn new() -> Self {
+        use core::arch::aarch64::*;
+        // SAFETY: NEON is part of every aarch64 target, and each table is 16 bytes.
+        unsafe {
+            let tables = [vld1q_u8(BYTE_1_HIGH.as_ptr()), vld1q_u8(BYTE_1_LOW.as_ptr()), vld1q_u8(BYTE_2_HIGH.as_ptr())];
+            // What comes before the first block reads as ASCII.
+            Self { tables, prev: vdupq_n_u8(0) }
+        }
+    }
+
+    /// The first byte of `block` that is a control or breaks UTF-8 after the blocks before.
+    #[inline(always)]
+    fn first_rejected(&mut self, block: &[u8; 16]) -> Option<usize> {
+        use core::arch::aarch64::*;
+        // SAFETY: NEON is part of every aarch64 target, and `block` is 16 bytes.
+        unsafe {
+            let (input, prev, tables) = (vld1q_u8(block.as_ptr()), self.prev, self.tables);
+            let prev1 = vextq_u8::<15>(prev, input);
+            let prev2 = vextq_u8::<14>(prev, input);
+            let prev3 = vextq_u8::<13>(prev, input);
+            let byte_1_high = vqtbl1q_u8(tables[0], vshrq_n_u8::<4>(prev1));
+            let byte_1_low = vqtbl1q_u8(tables[1], vandq_u8(prev1, vdupq_n_u8(0x0F)));
+            let byte_2_high = vqtbl1q_u8(tables[2], vshrq_n_u8::<4>(input));
+            let special = vandq_u8(vandq_u8(byte_1_high, byte_1_low), byte_2_high);
+            // A third or fourth byte must be a continuation byte; only bytes from 0xE0 and 0xF0 stay at 0x80 and
+            // above.
+            let third = vqsubq_u8(prev2, vdupq_n_u8(0xE0 - 0x80));
+            let fourth = vqsubq_u8(prev3, vdupq_n_u8(0xF0 - 0x80));
+            let must_continue = vandq_u8(vorrq_u8(third, fourth), vdupq_n_u8(0x80));
+            let invalid = veorq_u8(must_continue, special);
+            let c0 = vcltq_u8(input, vdupq_n_u8(0x20));
+            let c1 = vandq_u8(vceqq_u8(prev1, vdupq_n_u8(0xC2)), vcltq_u8(input, vdupq_n_u8(0xA0)));
+            let rejected = vtstq_u8(vorrq_u8(invalid, vorrq_u8(c0, c1)), vdupq_n_u8(0xFF));
+            // Four bits for each byte, the lowest first.
+            let bits = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(rejected))));
+            self.prev = input;
+            (bits != 0).then(|| bits.trailing_zeros() as usize / 4)
+        }
+    }
+}
+
+/// The lookup tables and the block before, for checking one block of 16 after another.
+#[cfg(target_arch = "wasm32")]
+struct Blocks {
+    tables: [core::arch::wasm32::v128; 3],
+    prev: core::arch::wasm32::v128,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Blocks {
+    #[inline(always)]
+    fn new() -> Self {
+        use core::arch::wasm32::*;
+        let table = |t: &[u8; 16]| u8x16(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10], t[11],
+            t[12], t[13], t[14], t[15]);
+        // What comes before the first block reads as ASCII.
+        Self { tables: [table(&BYTE_1_HIGH), table(&BYTE_1_LOW), table(&BYTE_2_HIGH)], prev: u8x16_splat(0) }
+    }
+
+    /// The first byte of `block` that is a control or breaks UTF-8 after the blocks before (as for aarch64).
+    #[inline(always)]
+    fn first_rejected(&mut self, block: &[u8; 16]) -> Option<usize> {
+        use core::arch::wasm32::*;
+        // SAFETY: `block` is 16 bytes; `v128_load` needs no alignment.
+        let input = unsafe { v128_load(block.as_ptr().cast()) };
+        let (prev, tables) = (self.prev, self.tables);
+        let prev1 = i8x16_shuffle::<15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30>(prev, input);
+        let prev2 = i8x16_shuffle::<14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29>(prev, input);
+        let prev3 = i8x16_shuffle::<13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28>(prev, input);
+        let byte_1_high = u8x16_swizzle(tables[0], u8x16_shr(prev1, 4));
+        let byte_1_low = u8x16_swizzle(tables[1], v128_and(prev1, u8x16_splat(0x0F)));
+        let byte_2_high = u8x16_swizzle(tables[2], u8x16_shr(input, 4));
+        let special = v128_and(v128_and(byte_1_high, byte_1_low), byte_2_high);
+        let third = u8x16_sub_sat(prev2, u8x16_splat(0xE0 - 0x80));
+        let fourth = u8x16_sub_sat(prev3, u8x16_splat(0xF0 - 0x80));
+        let must_continue = v128_and(v128_or(third, fourth), u8x16_splat(0x80));
+        let invalid = v128_xor(must_continue, special);
+        let c0 = u8x16_lt(input, u8x16_splat(0x20));
+        let c1 = v128_and(u8x16_eq(prev1, u8x16_splat(0xC2)), u8x16_lt(input, u8x16_splat(0xA0)));
+        let rejected = v128_or(u8x16_ne(invalid, u8x16_splat(0)), v128_or(c0, c1));
+        // One bit for each byte, the lowest first.
+        let bits = u8x16_bitmask(rejected);
+        self.prev = input;
+        (bits != 0).then(|| bits.trailing_zeros() as usize)
     }
 }
 

@@ -300,8 +300,9 @@ same input one byte at a time, `vte/mod.rs` `chunked_input_matches_byte_by_byte`
   skipped eight bytes at a time (`printable_ascii`), other text goes to
   `text_end`, which on aarch64 first checks 16 bytes at a time with NEON
   (`vte/scan.rs`: UTF-8 by Keiser and Lemire's lookup algorithm, as simdjson
-  and simdutf do, plus C0 and C1 controls). Other targets, WebAssembly among
-  them, use the scalar path.
+  and simdutf do, plus C0 and C1 controls), and so on WebAssembly built with
+  SIMD128 (`scripts/build-wasm.sh` turns it on). Other targets use the
+  scalar path.
 - A whole CSI after ESC (private marker, parameters, intermediates, final byte,
   all within the bytes given) is dispatched by `csi_fast` without leaving
   ground. A CSI of one parameter of at most two digits, or none (`CSI m`,
