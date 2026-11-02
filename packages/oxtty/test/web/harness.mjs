@@ -43,9 +43,11 @@ export async function withPage(page, fn, { viewport = { width: 1000, height: 700
     }
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const browser = await chromium.launch({ channel: 'chrome', headless: true, args: ['--enable-unsafe-swiftshader', '--use-angle=swiftshader'] });
   const errors = [];
+  let browser;
   try {
+    // Launched inside the try, so a failed launch still closes the server instead of keeping the process alive.
+    browser = await chromium.launch({ channel: 'chrome', headless: true, args: ['--enable-unsafe-swiftshader', '--use-angle=swiftshader'] });
     const tab = await browser.newPage({ viewport, deviceScaleFactor });
     tab.on('console', (m) => m.type() === 'error' && errors.push(`console: ${m.text()}`));
     tab.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
@@ -54,7 +56,7 @@ export async function withPage(page, fn, { viewport = { width: 1000, height: 700
     if (errors.length) throw new Error(errors.join('\n'));
     return result;
   } finally {
-    await browser.close();
+    await browser?.close();
     server.close();
   }
 }
