@@ -535,6 +535,7 @@ later.** xterm.js members outside the checklist are not provided.
 
 | | |
 | --- | --- |
+| WebAssembly SIMD | Required: the engine is built with SIMD128 (Chrome 91, Firefox 89, Safari 16.4, Node 16.4 and later) |
 | WebGL2 | Required to draw. All panes share one WebGL2 context and glyph atlas; a lost context is restored or replaced for every pane at once |
 | Without WebGL2 | `open()` works, as in xterm.js, with one console warning: input, the buffer API and events work, but nothing is drawn and `dimensions` stays `undefined` |
 | DOM renderer | None, and none planned for now |
