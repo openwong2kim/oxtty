@@ -10,11 +10,11 @@
 //! `ris_keeps_cursor_visibility` aligns RIS behavior with xterm.js.
 use crate::history::History;
 use crate::vt::event::EventListener;
-use crate::vt::grid::{Dimensions, Grid, Row};
+use crate::vt::grid::{Charsets, Cursor, Dimensions, Grid, Row};
 use crate::vt::index::{Column, Line};
 use crate::vt::term::cell::{Cell, Flags, Hyperlink};
 use crate::vt::term::{Term, TermMode};
-use crate::vt::vte::ansi::{Color, NamedColor};
+use crate::vt::vte::ansi::{CharsetIndex, Color, CursorShape, NamedColor, StandardCharset};
 use std::fmt::{self, Write};
 
 /// Why [`crate::Engine::ansi_snapshot`] cannot rebuild the screen; replay the
@@ -59,8 +59,9 @@ pub struct SnapshotOptions {
     /// Keep only the newest this many history lines (`Some(0)`: the screen alone); `None` keeps them all.
     pub scrollback: Option<usize>,
     /// Leave out the modes (cursor keys, keypad, mouse, focus reports, bracketed paste, insert, origin, autowrap
-    /// off, cursor visibility) and what continues the output (the unfinished sequence at the end, a synchronized
-    /// update in progress), so the bytes only paint the screen. Scroll margins are then not refused.
+    /// off, cursor visibility), the state (charsets, saved cursors, tab stops, cursor shape) and what continues the
+    /// output (the unfinished sequence at the end, a synchronized update in progress), so the bytes only paint the
+    /// screen. Scroll margins are then not refused.
     pub exclude_modes: bool,
 }
 
@@ -77,11 +78,12 @@ pub(crate) struct RawTail {
     /// Raw incomplete sequence (including ESC). On overflow it is cleared and `overflowed` is set.
     escape: Vec<u8>,
     overflowed: bool,
-    /// Up to the last 3 bytes of the stream — for computing the incomplete UTF-8 suffix.
+    /// Up to the last 3 bytes of the plain text the stream ends with — for computing the incomplete UTF-8 suffix.
     last: Vec<u8>,
 }
 
-/// wmux `ScanState`. An ESC inside a string (OSC/DCS/SOS/PM/APC) proceeds the same as `Esc`, whether it is ST or an abort.
+/// The states of vte's parser (0.15) that decide where a sequence ends. An ESC inside a string proceeds the same as
+/// `Esc`, whether it is ST or an abort.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Scan {
     #[default]
@@ -89,34 +91,47 @@ enum Scan {
     Esc,
     EscIntermediate,
     Csi,
-    String,
+    Osc,
+    DcsEntry,
+    DcsParam,
+    DcsIntermediate,
+    DcsPassthrough,
+    /// SOS, PM, APC and a malformed DCS: ignored up to their end.
+    Ignored,
 }
 
 impl RawTail {
     pub(crate) fn push(&mut self, bytes: &[u8]) {
+        // Where the plain text `bytes` ends with starts, if it ends with any: after the sequence that ends in it,
+        // or all of it.
+        let mut text = None;
         let start = match bytes.iter().rposition(|&b| b == 0x1b) {
             Some(at) => {
                 self.state = Scan::Ground;
                 at
             }
-            None if self.state == Scan::Ground => bytes.len(),
+            None if self.state == Scan::Ground => {
+                text = Some(0);
+                bytes.len()
+            }
             None => 0,
         };
-        for &b in &bytes[start..] {
+        for (i, &b) in bytes.iter().enumerate().skip(start) {
             let was = self.state;
-            self.state = step(was, b);
+            let keep;
+            (self.state, keep) = step(was, b);
             if self.state == Scan::Ground {
                 // This is after the last ESC, so the remaining bytes are plain text.
                 self.escape.clear();
                 self.overflowed = false;
+                text = Some(i + 1);
                 break;
             }
             if was == Scan::Ground {
                 self.escape.clear();
                 self.overflowed = false;
             }
-            // A C0 inside a sequence (the LF in `\x1b[31\n`) has already been executed here. Dropping it so it does not run again leaves the parameter state the same.
-            if b < 0x20 && b != 0x1b {
+            if !keep {
                 continue;
             }
             if !self.overflowed {
@@ -128,10 +143,22 @@ impl RawTail {
                 }
             }
         }
-        let keep = self.last.len().min(3 - bytes.len().min(3));
+        // Bytes inside a sequence never start a character (a 0x9c there may end a DCS).
+        let text = match text {
+            Some(0) => bytes,
+            Some(from) => {
+                self.last.clear();
+                &bytes[from..]
+            }
+            None => {
+                self.last.clear();
+                return;
+            }
+        };
+        let keep = self.last.len().min(3 - text.len().min(3));
         self.last.drain(..self.last.len() - keep);
         self.last
-            .extend_from_slice(&bytes[bytes.len().saturating_sub(3)..]);
+            .extend_from_slice(&text[text.len().saturating_sub(3)..]);
     }
 
     /// Raw bytes to append to the payload: the incomplete sequence (including any incomplete UTF-8 in it), or else the incomplete UTF-8 suffix.
@@ -147,32 +174,34 @@ impl RawTail {
     }
 }
 
-/// Byte version of wmux `PartialSequenceTracker.advance`.
-fn step(state: Scan, b: u8) -> Scan {
-    if b == 0x1b {
-        return Scan::Esc;
-    }
-    match state {
-        Scan::Ground => Scan::Ground,
-        Scan::Esc => match b {
-            b'[' => Scan::Csi,
-            b']' | b'P' | b'X' | b'^' | b'_' => Scan::String,
-            0x20..=0x2f => Scan::EscIntermediate,
-            _ => Scan::Ground,
-        },
-        Scan::EscIntermediate => match b {
-            0x20..=0x2f => Scan::EscIntermediate,
-            _ => Scan::Ground,
-        },
-        Scan::Csi => match b {
-            0x40..=0x7e | 0x18 | 0x1a => Scan::Ground,
-            // Parameter and intermediate bytes, and C0s that do not end the sequence.
-            _ => Scan::Csi,
-        },
-        Scan::String => match b {
-            0x07 | 0x18 | 0x1a => Scan::Ground,
-            _ => Scan::String,
-        },
+/// The state after `b`, and whether the receiver needs `b` again: bytes vte executes (a C0 inside a sequence, such
+/// as the LF in `\x1b[31\n`, has already run here) or ignores are dropped from the tail.
+fn step(state: Scan, b: u8) -> (Scan, bool) {
+    match (state, b) {
+        (_, 0x1b) => (Scan::Esc, true),
+        (_, 0x18 | 0x1a) | (Scan::Ground, _) => (Scan::Ground, false),
+        (Scan::Esc, b'[') => (Scan::Csi, true),
+        (Scan::Esc, b']') => (Scan::Osc, true),
+        (Scan::Esc, b'P') => (Scan::DcsEntry, true),
+        (Scan::Esc, b'X' | b'^' | b'_') => (Scan::Ignored, true),
+        (Scan::Esc | Scan::EscIntermediate, 0x20..=0x2f) => (Scan::EscIntermediate, true),
+        (Scan::Esc | Scan::EscIntermediate, 0x30..=0x7e) | (Scan::Csi, 0x40..=0x7e) => {
+            (Scan::Ground, false)
+        }
+        (Scan::Osc, 0x07) | (Scan::DcsPassthrough, 0x9c) => (Scan::Ground, false),
+        (Scan::Csi | Scan::Osc, 0x20..) => (state, state == Scan::Osc || b < 0x7f),
+        (Scan::DcsEntry | Scan::DcsParam | Scan::DcsIntermediate, 0x40..=0x7e) => {
+            (Scan::DcsPassthrough, true)
+        }
+        (Scan::DcsEntry | Scan::DcsParam | Scan::DcsIntermediate, 0x20..=0x2f) => {
+            (Scan::DcsIntermediate, true)
+        }
+        (Scan::DcsEntry | Scan::DcsParam, 0x30..=0x3b) | (Scan::DcsEntry, 0x3c..=0x3f) => {
+            (Scan::DcsParam, true)
+        }
+        (Scan::DcsParam | Scan::DcsIntermediate, 0x30..=0x3f) => (Scan::Ignored, true),
+        (Scan::DcsPassthrough, ..0x7f) => (state, true),
+        _ => (state, false),
     }
 }
 
@@ -240,8 +269,36 @@ fn color(out: &mut String, value: Color, foreground: bool) {
     }
 }
 
-fn style(cell: &Cell) -> String {
-    let mut out = String::from("\x1b[0");
+/// The attributes [`style`] writes. Cells with the same pen get the same SGR.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Pen {
+    flags: Flags,
+    fg: Color,
+    bg: Color,
+    underline: Option<Color>,
+}
+
+impl Pen {
+    fn of(cell: &Cell) -> Self {
+        let sgr = Flags::BOLD
+            | Flags::DIM
+            | Flags::ITALIC
+            | Flags::BLINK
+            | Flags::INVERSE
+            | Flags::HIDDEN
+            | Flags::STRIKEOUT
+            | Flags::ALL_UNDERLINES;
+        Self {
+            flags: cell.flags & sgr,
+            fg: cell.fg,
+            bg: cell.bg,
+            underline: cell.underline_color(),
+        }
+    }
+}
+
+fn style(out: &mut String, cell: &Cell) {
+    out.push_str("\x1b[0");
     for (flag, code) in [
         (Flags::BOLD, 1),
         (Flags::DIM, 2),
@@ -271,8 +328,8 @@ fn style(cell: &Cell) -> String {
     if let Some(kind) = underline {
         let _ = write!(out, ";4:{kind}");
     }
-    color(&mut out, cell.fg, true);
-    color(&mut out, cell.bg, false);
+    color(out, cell.fg, true);
+    color(out, cell.bg, false);
     if let Some(value) = cell.underline_color() {
         match value {
             Color::Spec(rgb) => {
@@ -285,7 +342,6 @@ fn style(cell: &Cell) -> String {
         }
     }
     out.push('m');
-    out
 }
 
 /// Opens `link` or closes the open one. A program's own id is kept so separate runs of one
@@ -325,7 +381,7 @@ fn cursor(out: &mut String, grid: &Grid<Cell>) {
     // CUP clears the pending wrap at line end, so rewrite the edge cell to restore that state.
     if grid.cursor.input_needs_wrap {
         let cell = &grid[point.line][Column(col)];
-        out.push_str(&style(cell));
+        style(out, cell);
         let edge = cell.hyperlink();
         if edge.is_some() {
             link(out, edge.as_ref());
@@ -335,10 +391,56 @@ fn cursor(out: &mut String, grid: &Grid<Cell>) {
             link(out, None);
         }
     }
-    out.push_str(&style(&grid.cursor.template));
+    style(out, &grid.cursor.template);
     // The program may be in the middle of writing a link.
     if let Some(open) = grid.cursor.template.hyperlink() {
         link(out, Some(&open));
+    }
+}
+
+/// Designates the charsets in `charsets` that are not ASCII, or designates ASCII in their place (`back`).
+fn designate(out: &mut String, charsets: &Charsets, back: bool) {
+    for (index, slot) in [(CharsetIndex::G0, '('), (CharsetIndex::G1, ')')] {
+        let code = match charsets[index] {
+            StandardCharset::Ascii => continue,
+            StandardCharset::SpecialCharacterAndLineDrawing => '0',
+        };
+        let _ = write!(out, "\x1b{slot}{}", if back { 'B' } else { code });
+    }
+}
+
+/// Saves `saved` with DECSC: position, pen, link and charsets. Leaves the charsets ASCII and the link closed, so
+/// text printed afterwards is not changed. Nothing is written for a cursor that was never saved.
+fn save(out: &mut String, saved: &Cursor<Cell>) {
+    if *saved == Cursor::default() {
+        return;
+    }
+    let point = saved.point;
+    let _ = write!(out, "\x1b[{};{}H", point.line.0 + 1, point.column.0 + 1);
+    style(out, &saved.template);
+    let open = saved.template.hyperlink();
+    if open.is_some() {
+        link(out, open.as_ref());
+    }
+    designate(out, &saved.charsets, false);
+    out.push_str("\x1b7");
+    designate(out, &saved.charsets, true);
+    if open.is_some() {
+        link(out, None);
+    }
+}
+
+/// Clears the tab stops and sets them again, when they are not the default ones every 8 columns. Moves the cursor.
+fn tab_stops<T>(out: &mut String, term: &Term<T>) {
+    if term
+        .tab_stops()
+        .eq((0..term.columns()).step_by(8).map(Column))
+    {
+        return;
+    }
+    out.push_str("\x1b[3g");
+    for column in term.tab_stops() {
+        let _ = write!(out, "\x1b[{}G\x1bH", column.0 + 1);
     }
 }
 
@@ -354,17 +456,28 @@ fn erased(cell: &Cell) -> bool {
 
 /// Writes rows one after another, keeping the pen and link between them.
 struct Rows {
+    /// The pen of the last SGR written; `None` writes the next one.
+    previous_pen: Option<Pen>,
     previous_style: String,
+    /// Where the next SGR is built, to compare with the last one.
+    next_style: String,
     previous_link: Option<Hyperlink>,
     columns: usize,
 }
 
 impl Rows {
     fn pen(&mut self, out: &mut String, cell: &Cell) {
-        let next_style = style(cell);
-        if next_style != self.previous_style {
-            out.push_str(&next_style);
-            self.previous_style = next_style;
+        let pen = Pen::of(cell);
+        if self.previous_pen == Some(pen) {
+            return;
+        }
+        self.previous_pen = Some(pen);
+        // Pens can differ and still write the same SGR (colours it leaves out).
+        self.next_style.clear();
+        style(&mut self.next_style, cell);
+        if self.next_style != self.previous_style {
+            out.push_str(&self.next_style);
+            std::mem::swap(&mut self.next_style, &mut self.previous_style);
         }
     }
 
@@ -433,6 +546,7 @@ impl Rows {
                 // Clear attributes before scrolling. Otherwise a colored blank template
                 // paints cells outside the serialized content.
                 out.push_str("\x1b[0m\r\n");
+                self.previous_pen = None;
                 self.previous_style.clear();
             }
             return;
@@ -465,7 +579,9 @@ impl Rows {
 /// are left out.
 fn screen(out: &mut String, grid: &Grid<Cell>, older: Option<&History>, skip: usize) {
     let mut rows = Rows {
+        previous_pen: None,
         previous_style: String::new(),
+        next_style: String::new(),
         previous_link: None,
         columns: grid.columns(),
     };
@@ -544,13 +660,31 @@ fn serialize<T: EventListener>(
             return Err(SnapshotRefusal::WideEdge);
         }
     }
-    let mut out = String::from("\x1b[0m\x1b[?6l\x1b[?7h\x1b[4l\x1b[H");
+    let mut out = String::new();
     let modes = term.mode();
     let alt = modes.contains(TermMode::ALT_SCREEN);
+    let state = !options.exclude_modes;
+    // The alternate screen keeps its saved cursor while the primary one is shown. Entering and leaving it first
+    // leaves nothing else behind in an empty terminal.
+    if state && !alt && term.inactive_grid().saved_cursor != Cursor::default() {
+        out.push_str("\x1b[?1049h");
+        save(&mut out, &term.inactive_grid().saved_cursor);
+        out.push_str("\x1b[?1049l");
+    }
+    out.push_str("\x1b[0m\x1b[?6l\x1b[?7h\x1b[4l\x1b[H");
     if alt {
         screen(&mut out, term.inactive_grid(), older, skip);
         cursor(&mut out, term.inactive_grid());
+        // Each screen's cursor has its own charsets. While the alternate screen is shown, the primary one's saved
+        // cursor is its cursor (1049 saves it on entering).
+        if state {
+            designate(&mut out, &term.inactive_grid().cursor.charsets, false);
+        }
         out.push_str("\x1b[?1049h\x1b[0m\x1b[H");
+        // The alternate screen's cursor starts as a copy; put ASCII back so its text prints as it is.
+        if state {
+            designate(&mut out, &term.inactive_grid().cursor.charsets, true);
+        }
         // Entering clears the alternate screen with the primary pen's background; erased cells are not printed
         // over, so clear it again with the default one.
         if term.inactive_grid().cursor.template.bg != Color::Named(NamedColor::Background) {
@@ -570,11 +704,28 @@ fn serialize<T: EventListener>(
         cursor(&mut out, term.grid());
         return Ok(out);
     }
+    tab_stops(&mut out, term);
+    save(&mut out, &term.grid().saved_cursor);
     // Turning on DECOM sends the cursor home, so emit it before CUP (margins are rejected, so CUP is relative to the whole screen).
     if modes.contains(TermMode::ORIGIN) {
         out.push_str("\x1b[?6h");
     }
     cursor(&mut out, term.grid());
+    // After the cursor, whose pending wrap may print the edge cell again.
+    designate(&mut out, &term.grid().cursor.charsets, false);
+    // The shift is shared by both screens.
+    if term.active_charset() == CharsetIndex::G1 {
+        out.push('\x0e');
+    }
+    if term.cursor_style_set() {
+        let style = term.cursor_style();
+        let shape = match style.shape {
+            CursorShape::Underline => 3,
+            CursorShape::Beam => 5,
+            _ => 1,
+        };
+        let _ = write!(out, "\x1b[{} q", shape + u8::from(!style.blinking));
+    }
     for (mode, code) in [
         (TermMode::APP_CURSOR, 1),
         (TermMode::FOCUS_IN_OUT, 1004),

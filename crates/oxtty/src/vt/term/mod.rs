@@ -914,6 +914,16 @@ impl<T> Term<T> {
         &self.scroll_region
     }
 
+    /// oxtty snapshot access: the charset slot SI/SO selected (G0 or G1).
+    pub fn active_charset(&self) -> CharsetIndex {
+        self.active_charset
+    }
+
+    /// oxtty snapshot access: the columns with a tab stop, left to right.
+    pub fn tab_stops(&self) -> impl Iterator<Item = Column> + '_ {
+        self.tabs.tabs.iter().enumerate().filter(|(_, stop)| **stop).map(|(i, _)| Column(i))
+    }
+
     /// Resize terminal to new dimensions.
     pub fn resize<S: Dimensions>(&mut self, size: S) {
         let old_cols = self.columns();
