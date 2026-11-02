@@ -247,7 +247,7 @@ M2 runs on key input code borrowed from xterm.js. M3 moves encoding to Rust.
 | Requirement | Acceptance criteria |
 | --- | --- |
 | Selection range computation and link detection in Rust | Same selection results as xterm.js (word, line, rectangular selection) |
-| Viewport-only mode: the screen holds only visible lines ± a margin, fetching from the host on scroll | Per-pane renderer memory measured and published against the M1 baseline |
+| ✅ Viewport-only mode: the screen holds only visible lines ± a margin, fetching from the host on scroll | Per-pane renderer memory measured and published against the M1 baseline — `term.setHistoryProvider` (design below); 17 panes × 10,000 lines: renderer footprint +86 → +26 MB, engine wasm memory 69 → 9 MB; 20 panes: +100 → +29 MB, 81 → 13 MB (README measurements) |
 | Web Worker parsing option | Measure the reduction in main thread usage with 20 panes outputting concurrently |
 | Skip drawing inactive panes | Hidden panes receive output but do not draw |
 
@@ -322,6 +322,15 @@ their line leaves its scrollback, as with any `scrollback`. The alternate screen
 **Memory.** The engine holds `rows + scrollback` lines; fetched rows are JavaScript `Uint32Array`s (garbage
 collected, not wasm memory, which never shrinks), at most `cacheLines` (the rows farthest from the view go first);
 a search holds at most four pages of logical-line text.
+
+**Measured (2026-11-02).** `npm run bench:memory -- 17 10000 oxtty,viewport` (Apple M4, real GPU, 120×40 panes,
+200-line margin), default against viewport-only: 17 panes, renderer footprint +86 → +26 MB (RSS +117 → +58 MB),
+engine wasm memory 69 → 9 MB; 20 panes, +100 → +29 MB (RSS +130 → +61 MB), 81 → 13 MB. Front-end wasm memory (8–9
+MB) and the JS heap (3 MB) do not change. Tests: `packages/oxtty/test/web/viewport.test.mjs`.
+
+**Follow-ups outside this change.** The scrollbar's drag (`scrollbar.rs`, `apply_scroll_requests`) and
+`IMarker.line` (`markers.rs`) still read the engine's own numbers, so a drag cannot reach host lines and a marker's
+line leaves out `H`; both move to `LocalEngineView::{history_length, display_offset, scroll_display, remote_lines}`.
 
 **wmux wiring (not done here).** The renderer builds each pane's terminal with `scrollback` 200 and, after
 attaching, calls `setHistoryProvider({ length, fetch })` with `length` from the daemon. The daemon answers `fetch`

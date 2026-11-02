@@ -128,6 +128,27 @@ figures. Apple M4, 2026-11-01/02.
 The cells and scrollback move from the JS heap into WebAssembly memory, where
 they take less room.
 
+**Viewport-only mode** — the same bench with each pane keeping 200 lines of
+scrollback and reading older lines from a history provider
+(`setHistoryProvider`), as wmux's daemon would serve them, against the
+default `oxtty/xterm` holding all 10,000 lines. Renderer process memory over
+an empty page (macOS physical footprint, which counts the memory the system
+compresses; RSS in brackets) and the two WebAssembly memories. Apple M4,
+2026-11-02, two runs each, equal to the MB.
+`npm run bench:memory -- 17 10000 oxtty,viewport` reproduces it.
+
+| Panes | | default | viewport-only |
+| --- | --- | ---: | ---: |
+| 17 | Renderer footprint (RSS) | +86 MB (+117) | +26 MB (+58) |
+| 17 | Engine wasm memory | 69 MB | 9 MB |
+| 17 | Front-end wasm memory | 8 MB | 8 MB |
+| 20 | Renderer footprint (RSS) | +100 MB (+130) | +29 MB (+61) |
+| 20 | Engine wasm memory | 81 MB | 13 MB |
+| 20 | Front-end wasm memory | 9 MB | 9 MB |
+
+The JS heap stays at 3 MB in both modes; rows fetched for the view are kept
+as JS arrays, at most 256 per pane by default.
+
 **Engine memory for 17 terminals** — each parser used to reserve 2 MiB to
 hold synchronized updates. Since the engine applies them at once, as xterm.js
 does, 17 terminals take 5.1 MiB of engine memory instead of 41.1 MiB
@@ -341,6 +362,7 @@ later.** xterm.js members outside the checklist are not provided.
 | `element`, `rows`, `cols`, `dimensions`, `modes`, `unicode.activeVersion` | ✅ | `unicode.activeVersion` is always `"11"` |
 | `onData`, `onBinary`, `onResize`, `onScroll`, `onRender`, `onCursorMove`, `onWriteParsed`, `onTitleChange`, `onBell`, `onDimensionsChange`, `onSelectionChange` | ✅ | |
 | `ansiSnapshot()`, `kittyKeyboardFlags`, `resetKittyKeyboard()`, `onUserInput` | ✅ | oxtty additions that replace `@xterm/addon-serialize` and `_core` workarounds |
+| `setHistoryProvider(provider)` | ✅ | oxtty addition, viewport-only mode: the terminal keeps its `scrollback` lines and reads older history from the host as the view scrolls to it ([PRD M4](docs/PRD.md#viewport-only-mode-design-2026-11-02)) |
 | DOM: `.terminal.xterm`, `.xterm-screen`, `.xterm-helpers`, `.xterm-helper-textarea`, `.composition-view`, `.xterm-scrollable-element` scrollbar | ✅ | The class names xterm.js 6.1 uses |
 | `@xterm/xterm/css/xterm.css` | — | `open()` injects its own styles |
 | `_core._renderService`, `_core._charSizeService`, `_core._compositionHelper`, `WebglAddon._renderer` | — | No internals: use `dimensions` and `onDimensionsChange`; context loss and the atlas are handled inside the renderer |
@@ -409,6 +431,12 @@ Beyond the notes in the tables above:
 - Character widths are Unicode 11 only.
 - `buffer.active.cursorX` stays on the last column at the right edge (xterm.js
   reports `cols` while a wrap is pending).
+- Viewport-only mode (`setHistoryProvider`): host lines not fetched yet read
+  as blank lines (in `getLine`, a copied selection and the picture) until the
+  host answers; a search that needs host lines returns `false` and selects
+  the match later, firing `onDidChangeResults`; logical lines are cut every
+  256 host lines for search; search decorations, `ansiSnapshot` and markers
+  cover only the terminal's own lines.
 
 ## The model
 

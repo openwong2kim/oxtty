@@ -6,10 +6,16 @@
 //! [`Frame`] and [`Viewport`], never [`Engine`], so the engine can later move to a Web Worker and these become
 //! messages. Only the buffer API (`buffer.active.getLine()`), search and serialize call [`Engine`] directly; a
 //! Worker build needs a main-thread mirror for those.
+//!
+//! In viewport-only mode ([`crate::remote`]) the history above the engine's own lines lives in the host:
+//! [`LocalEngineView`] counts it in `history_length`, `display_offset` and `trimmed_lines`, scrolls over it and fills
+//! the rows it shows from the fetched rows, so frames and the viewport read as if the engine held everything.
 use std::collections::HashMap;
 
 use js_sys::{Array, Object, Reflect, Uint32Array, Uint8Array};
 use wasm_bindgen::prelude::*;
+
+use crate::remote::Remote;
 
 #[wasm_bindgen(raw_module = "./index.js")]
 extern "C" {
@@ -162,6 +168,12 @@ pub mod mode {
     pub const SGR_PIXELS_MOUSE: u32 = 1 << 16;
 }
 
+/// Packed colours of a cell's second and third words (the engine's `color` module).
+pub mod color {
+    pub const DEFAULT_FG: u32 = (1 << 24) | 256;
+    pub const DEFAULT_BG: u32 = (1 << 24) | 257;
+}
+
 /// `Attr` bits of a cell's fourth word.
 pub mod attr {
     pub const BOLD: u32 = 1;
@@ -292,11 +304,114 @@ pub trait EngineView {
 pub struct LocalEngineView {
     engine: Engine,
     full: bool,
+    /// Viewport-only mode: the host's history above the engine's own (boxed: most terminals have none).
+    remote: Option<Box<Remote>>,
 }
 
 impl LocalEngineView {
     pub fn new(engine: Engine) -> Self {
-        Self { engine, full: true }
+        Self {
+            engine,
+            full: true,
+            remote: None,
+        }
+    }
+
+    /// Viewport-only mode, while a history provider is set.
+    pub(crate) fn remote(&self) -> Option<&Remote> {
+        self.remote.as_deref()
+    }
+
+    pub(crate) fn remote_mut(&mut self) -> Option<&mut Remote> {
+        self.remote.as_deref_mut()
+    }
+
+    /// Sets (or with `None` drops) the history provider; the view stays where it is in the engine's own lines.
+    pub(crate) fn set_remote(&mut self, remote: Option<Remote>) {
+        self.remote = remote.map(Box::new);
+        if let Some(r) = self.remote.as_mut() {
+            r.attach(&self.engine);
+        } else {
+            self.full = true;
+        }
+    }
+
+    /// Host lines above the engine's own history (0 without a provider and on the alternate screen).
+    pub fn remote_lines(&self) -> u32 {
+        self.remote().map_or(0, Remote::visible_lines)
+    }
+
+    /// History lines, the host's included: `buffer.active.baseY`.
+    pub fn history_length(&self) -> u32 {
+        self.engine.history_length() + self.remote_lines()
+    }
+
+    /// Rows the view is scrolled back, into the host's lines too.
+    pub fn display_offset(&self) -> u32 {
+        self.engine.display_offset() + self.remote.as_ref().map_or(0, |r| r.extra.get())
+    }
+
+    /// Lines that left the top of the whole history so far (the host's own trimming in viewport-only mode).
+    pub fn trimmed_lines(&self) -> f64 {
+        match &self.remote {
+            Some(r) => r.trimmed,
+            None => self.engine.trimmed_lines(),
+        }
+    }
+
+    /// Scrolls the view; positive `delta` goes back into history, past the engine's own into the host's.
+    pub fn scroll_display(&self, delta: i32) -> Result<(), JsValue> {
+        let Some(r) = self.remote().filter(|r| r.visible_lines() > 0) else {
+            return self.engine.scroll_display(delta);
+        };
+        let (offset, local) = (self.engine.display_offset(), self.engine.history_length());
+        let total = i64::from(local) + i64::from(r.lines);
+        let wanted =
+            (i64::from(offset) + i64::from(r.extra.get()) + i64::from(delta)).clamp(0, total);
+        let engine = wanted.min(i64::from(local));
+        self.engine
+            .scroll_display((engine - i64::from(offset)) as i32)?;
+        r.extra.set((wanted - engine) as u32);
+        r.seen_offset.set(self.engine.display_offset());
+        Ok(())
+    }
+
+    /// Back to the newest output.
+    pub fn scroll_to_bottom(&self) -> Result<(), JsValue> {
+        if let Some(r) = &self.remote {
+            r.extra.set(0);
+        }
+        self.engine.scroll_to_bottom()?;
+        if let Some(r) = &self.remote {
+            r.seen_offset.set(0);
+        }
+        Ok(())
+    }
+
+    /// Follows the engine after it changed (output, a reset): counts the lines that went to the host and keeps a
+    /// scrolled-back view on its text. `reset` is true after a full reset (RIS).
+    pub fn sync(&mut self, reset: bool) {
+        if let Some(r) = self.remote.as_mut() {
+            if r.sync(&self.engine, reset) {
+                self.full = true;
+            }
+        }
+    }
+
+    /// After an engine crash, which starts the engine over empty.
+    pub fn restarted(&mut self) {
+        if let Some(r) = self.remote.as_mut() {
+            r.restarted(&self.engine);
+        }
+        self.full = true;
+    }
+
+    /// After a resize: rows fetched at the old width are dropped (the host calls `setHistoryProvider` again).
+    pub fn resized(&mut self) {
+        if let Some(r) = self.remote.as_mut() {
+            r.resized(&self.engine);
+            self.full = true;
+        }
     }
 
     /// For the buffer API, search and serialize only (module docs).
@@ -352,9 +467,15 @@ impl EngineView for LocalEngineView {
         if e.sync_pending().unwrap_or(false) {
             return None;
         }
-        let (cols, rows, display_offset) = (e.cols(), e.rows(), e.display_offset());
+        let (cols, rows) = (e.cols(), e.rows());
+        let display_offset = self.display_offset();
+        // Rows above this engine line are the host's (viewport-only mode).
+        let local_top = -(e.history_length() as i32);
+        let remote = self.remote.as_deref().filter(|r| r.visible_lines() > 0);
         let damage = e.take_damage_js().unwrap_or(JsValue::NULL);
+        // Engine damage counts rows from the engine's own view, which stops at its oldest line.
         let full = self.full
+            || remote.is_some_and(|r| r.extra.get() > 0)
             || damage.is_null()
             || get(&damage, "full").is_truthy()
             || get(&damage, "scroll").as_f64().unwrap_or(0.0) > 0.0;
@@ -372,9 +493,29 @@ impl EngineView for LocalEngineView {
         let stride = cols as usize * 4;
         let mut cells = vec![0; lines.len() * stride];
         let mut extras = HashMap::new();
+        if let Some(r) = remote {
+            r.viewed(display_offset, e.history_length(), rows);
+        }
         for (k, &y) in lines.iter().enumerate() {
             let line = y as i32 - display_offset as i32;
             let row = &mut cells[k * stride..(k + 1) * stride];
+            if let Some(r) = remote.filter(|_| line < local_top) {
+                // Host line `v`: the fetched row, or a blank placeholder until it comes.
+                let v = (i64::from(r.lines) + i64::from(line) - i64::from(local_top)) as u32;
+                match r.row(v) {
+                    Some(fetched) => {
+                        fetched.copy_cells(row);
+                        if !fetched.extras.is_empty() {
+                            extras.insert(y, fetched.extras.clone());
+                        }
+                    }
+                    None => {
+                        blank_row(row);
+                        r.want(v, v + 1);
+                    }
+                }
+                continue;
+            }
             let Ok(Some(view)) = e.row_cells_view(line) else {
                 continue;
             };
@@ -406,11 +547,21 @@ impl EngineView for LocalEngineView {
             extras,
             cursor,
             display_offset,
-            history_length: e.history_length(),
-            trimmed_lines: e.trimmed_lines(),
+            history_length: self.history_length(),
+            trimmed_lines: self.trimmed_lines(),
             modes: e.modes().unwrap_or(0),
             kitty_flags: e.kitty_flags().unwrap_or(0),
         })
+    }
+}
+
+/// An erased cell in the default colours.
+pub(crate) const BLANK_CELL: [u32; 4] = [b' ' as u32, color::DEFAULT_FG, color::DEFAULT_BG, 0];
+
+/// Fills `row` (4 words per cell) with erased cells.
+pub(crate) fn blank_row(row: &mut [u32]) {
+    for cell in row.chunks_exact_mut(4) {
+        cell.copy_from_slice(&BLANK_CELL);
     }
 }
 
@@ -516,7 +667,7 @@ fn add_images(extras: &mut Vec<CellExtra>, cells: &[u32]) {
     }
 }
 
-fn parse_extras(value: &JsValue) -> Vec<CellExtra> {
+pub(crate) fn parse_extras(value: &JsValue) -> Vec<CellExtra> {
     if !Array::is_array(value) {
         return Vec::new();
     }

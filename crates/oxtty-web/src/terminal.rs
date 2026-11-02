@@ -362,6 +362,7 @@ impl Terminal {
             let old_rows = engine.rows();
             engine.resize(cols, rows)?;
             let (cols, rows) = (engine.cols(), engine.rows());
+            core.view.resized();
             Reflect::set(&core.options, &"cols".into(), &cols.into())?;
             Reflect::set(&core.options, &"rows".into(), &rows.into())?;
             if let Some(renderer) = core.renderer.as_mut() {
@@ -385,19 +386,14 @@ impl Terminal {
     /// Positive `amount` scrolls down towards the newest output.
     #[wasm_bindgen(js_name = scrollLines)]
     pub fn scroll_lines(&self, amount: i32) -> Result<(), JsValue> {
-        self.shared
-            .core
-            .borrow()
-            .view
-            .engine()
-            .scroll_display(-amount)?;
+        self.shared.core.borrow().view.scroll_display(-amount)?;
         self.shared.after_change();
         Ok(())
     }
 
     #[wasm_bindgen(js_name = scrollToBottom)]
     pub fn scroll_to_bottom(&self) -> Result<(), JsValue> {
-        self.shared.core.borrow().view.engine().scroll_to_bottom()?;
+        self.shared.core.borrow().view.scroll_to_bottom()?;
         self.shared.after_change();
         Ok(())
     }
@@ -418,6 +414,7 @@ impl Terminal {
         core.a11y = None;
         core.scrollbar = None;
         core.renderer = None;
+        core.view.set_remote(None);
         if let Some(element) = core.element.take() {
             element.remove();
         }
@@ -559,7 +556,10 @@ impl Shared {
             if core.disposed {
                 return;
             }
-            (core.view.take_events(), get(&core.options, "clipboard"))
+            let events = core.view.take_events();
+            // Hook: viewport-only mode counts the lines that went to the host.
+            core.view.sync(events.resets > 0);
+            (events, get(&core.options, "clipboard"))
         };
         // Hook: input encodes with the modes this parse left, as xterm.js has them at once.
         crate::input::follow_modes(self, events.modes, events.kitty_flags);
@@ -689,8 +689,12 @@ impl Shared {
 
     /// Fires the state events and schedules a frame after the engine changed.
     pub(crate) fn after_change(self: &Rc<Self>) {
-        if self.core.borrow().disposed {
-            return;
+        match self.core.try_borrow_mut() {
+            Ok(mut core) if !core.disposed => core.view.sync(false),
+            Ok(_) => return,
+            // Under a caller's borrow the next change syncs; the events still fire.
+            Err(_) if self.core.borrow().disposed => return,
+            Err(_) => {}
         }
         let (old, new) = (self.state.get(), self.read_state());
         self.state.set(new);
@@ -711,11 +715,11 @@ impl Shared {
     fn read_state(&self) -> State {
         let core = self.core.borrow();
         let cursor = core.view.cursor();
-        let e = core.view.engine();
+        let view = &core.view;
         State {
             cursor: (cursor.line, cursor.col),
-            viewport_y: e.history_length() - e.display_offset(),
-            alternate: e.modes().unwrap_or(0) & mode::ALT_SCREEN != 0,
+            viewport_y: view.history_length() - view.display_offset(),
+            alternate: view.engine().modes().unwrap_or(0) & mode::ALT_SCREEN != 0,
         }
     }
 
@@ -723,6 +727,7 @@ impl Shared {
     fn handle_crash(self: &Rc<Self>) {
         {
             let mut core = self.core.borrow_mut();
+            core.view.restarted();
             core.view.invalidate();
             core.dirty = Dirty::All;
         }
@@ -769,6 +774,7 @@ impl Shared {
                     crate::selection::screen_switched(self);
                 }
                 crate::input::after_frame(self);
+                crate::remote::fetch_wanted(self);
                 return;
             }
             let dirty = std::mem::replace(&mut core.dirty, Dirty::Rows(Vec::new()));
@@ -806,6 +812,8 @@ impl Shared {
             crate::selection::screen_switched(self);
         }
         crate::input::after_frame(self);
+        // Hook: viewport-only mode fetches the host rows the frame drew as placeholders.
+        crate::remote::fetch_wanted(self);
         // A hovered link on rows the output changed is looked up again (xterm.js `onRenderedViewportChange`).
         if let Some((start, end)) = content {
             crate::links::after_render(self, start, end);
