@@ -310,4 +310,7 @@ same input one byte at a time, `vte/mod.rs` `chunked_input_matches_byte_by_byte`
   ASCII byte after a split `é` was lost when an incomplete character followed
   within four bytes); it now takes only the first character's bytes.
 - `vte/ansi.rs`: `parse_sgr_color` is generic over its iterator instead of
-  `dyn`, and `Performer::hooked` skips the hash lookup while no hook is set.
+  `dyn`, and while no hook is set `csi_dispatch` neither builds the hook id
+  nor looks it up. CUP (`H`, `f`) and DECSTBM (`r`) with at most two plain
+  parameters are handled before the general match, from `Params::two`
+  instead of the parameter iterator.

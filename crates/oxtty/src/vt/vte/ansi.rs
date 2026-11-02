@@ -1590,10 +1590,31 @@ where
         }
 
         // oxtty: a hooked CSI stops parsing before its default action.
-        let id = hook_id(intermediates, action as u8);
-        if self.hooked(HookKind::Csi, id) {
-            self.stop_at(Hook::Csi { id, params: hook_params(params) });
-            return;
+        if !self.state.hooks.is_empty() {
+            let id = hook_id(intermediates, action as u8);
+            if self.hooked(HookKind::Csi, id) {
+                self.stop_at(Hook::Csi { id, params: hook_params(params) });
+                return;
+            }
+        }
+
+        // oxtty: cursor position and scrolling region, the commonest, without the parameter iterator.
+        if let (Some([first, second]), []) = (params.two(), intermediates) {
+            let or = |param: u16, default: u16| if param == 0 { default } else { param };
+            match action {
+                'H' | 'f' => {
+                    if action == 'H' {
+                        self.handler.windows_wrap_heuristic();
+                    }
+                    self.handler.goto(or(first, 1) as i32 - 1, or(second, 1) as usize - 1);
+                    return;
+                },
+                'r' => {
+                    self.handler.set_scrolling_region(or(first, 1) as usize, (second != 0).then_some(second as usize));
+                    return;
+                },
+                _ => (),
+            }
         }
 
         let mut params_iter = params.iter();
@@ -2113,6 +2134,48 @@ mod tests {
                 color: None,
                 reset_colors: Vec::new(),
             }
+        }
+    }
+
+    /// Cursor moves and scrolling regions as text.
+    #[derive(Default)]
+    struct MoveHandler(Vec<String>);
+
+    impl Handler for MoveHandler {
+        fn goto(&mut self, line: i32, col: usize) {
+            self.0.push(format!("goto {line} {col}"));
+        }
+
+        fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
+            self.0.push(format!("region {top} {bottom:?}"));
+        }
+
+        fn windows_wrap_heuristic(&mut self) {
+            self.0.push("heuristic".into());
+        }
+    }
+
+    #[test]
+    fn cursor_position_and_region_without_iterator() {
+        // The direct path for at most two plain parameters, and the iterator for the rest.
+        let cases: [(&[u8], &[&str]); 12] = [
+            (b"\x1b[H", &["heuristic", "goto 0 0"]),
+            (b"\x1b[;5H", &["heuristic", "goto 0 4"]),
+            (b"\x1b[3H", &["heuristic", "goto 2 0"]),
+            (b"\x1b[0;0f", &["goto 0 0"]),
+            (b"\x1b[7;9f", &["goto 6 8"]),
+            (b"\x1b[2:1;4H", &["heuristic", "goto 1 3"]),
+            (b"\x1b[1;2;3H", &["heuristic", "goto 0 1"]),
+            (b"\x1b[65535;65535H", &["heuristic", "goto 65534 65534"]),
+            (b"\x1b[r", &["region 1 None"]),
+            (b"\x1b[5;0r", &["region 5 None"]),
+            (b"\x1b[0;12r", &["region 1 Some(12)"]),
+            (b"\x1b[2;3:1r", &["region 2 Some(3)"]),
+        ];
+        for (input, expected) in cases {
+            let mut handler = MoveHandler::default();
+            Processor::new().advance(&mut handler, input);
+            assert_eq!(handler.0, expected, "{input:?}");
         }
     }
 
