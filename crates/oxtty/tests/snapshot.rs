@@ -417,6 +417,54 @@ fn exclude_modes_paints_only_the_screen() {
     assert!(!String::from_utf8_lossy(&cold).contains("2026"));
 }
 
+/// Snapshots `input` at every split (fed whole and byte by byte), restores it into a new engine and feeds both the
+/// rest: the screens match at the split and at the end.
+fn resumes_at_every_split(input: &[u8]) {
+    for at in 0..=input.len() {
+        for bytewise in [false, true] {
+            let mut t = Engine::new(20, 4, 0);
+            if bytewise {
+                input[..at].iter().for_each(|b| t.feed(&[*b]));
+            } else {
+                t.feed(&input[..at]);
+            }
+            let mut copy = Engine::new(20, 4, 0);
+            copy.feed(&snapshot(&mut t));
+            assert_same_screen(&t, &copy);
+            t.feed(&input[at..]);
+            copy.feed(&input[at..]);
+            assert_eq!(rows(&copy), rows(&t), "{at} {bytewise}");
+            assert_same_screen(&t, &copy);
+        }
+    }
+}
+
+#[test]
+fn tail_keeps_escape_across_c0_and_del() {
+    // vte executes C0s and ignores DEL after ESC (and after its intermediates) without leaving the sequence.
+    resumes_at_every_split(b"ab\x1b\r[31mX\x1b\x7f[1mY\x1b(\n0qq\x1b(\x7fBq");
+}
+
+#[test]
+fn tail_keeps_dcs_and_apc_across_bel() {
+    // Only OSC ends on BEL; DCS passes it to its handler, SOS/PM/APC ignore it.
+    resumes_at_every_split(
+        b"\x1bPzz\x07ab\x1b\\cd\x1bP1<z\x07ab\x1b\\ef\x1b_x\x07ab\x1b\\gh\x1bXy\x07ab\x1b\\ij",
+    );
+}
+
+#[test]
+fn tail_ends_dcs_on_c1_st_byte() {
+    // vte takes a 0x9c byte in a DCS string as ST, even inside a UTF-8 sequence.
+    resumes_at_every_split(b"\x1bPzz\xe4\x9c\xadcd");
+}
+
+#[test]
+fn tail_keeps_escape_across_utf8_right_after_it() {
+    // vte ignores bytes from 0x80 after ESC, so a UTF-8 character there does not end the sequence.
+    resumes_at_every_split("ab\x1b中M\x1b(\u{e9}0q".as_bytes());
+}
+
 /// Restores `input`'s snapshot into a new engine, then feeds both `follow`: the screens match before and after.
 fn carries(input: &[u8], follow: &[u8]) {
     let mut t = Engine::new(20, 4, 10);

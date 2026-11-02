@@ -78,11 +78,12 @@ pub(crate) struct RawTail {
     /// Raw incomplete sequence (including ESC). On overflow it is cleared and `overflowed` is set.
     escape: Vec<u8>,
     overflowed: bool,
-    /// Up to the last 3 bytes of the stream — for computing the incomplete UTF-8 suffix.
+    /// Up to the last 3 bytes of the plain text the stream ends with — for computing the incomplete UTF-8 suffix.
     last: Vec<u8>,
 }
 
-/// wmux `ScanState`. An ESC inside a string (OSC/DCS/SOS/PM/APC) proceeds the same as `Esc`, whether it is ST or an abort.
+/// The states of vte's parser (0.15) that decide where a sequence ends. An ESC inside a string proceeds the same as
+/// `Esc`, whether it is ST or an abort.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum Scan {
     #[default]
@@ -90,34 +91,47 @@ enum Scan {
     Esc,
     EscIntermediate,
     Csi,
-    String,
+    Osc,
+    DcsEntry,
+    DcsParam,
+    DcsIntermediate,
+    DcsPassthrough,
+    /// SOS, PM, APC and a malformed DCS: ignored up to their end.
+    Ignored,
 }
 
 impl RawTail {
     pub(crate) fn push(&mut self, bytes: &[u8]) {
+        // Where the plain text `bytes` ends with starts, if it ends with any: after the sequence that ends in it,
+        // or all of it.
+        let mut text = None;
         let start = match bytes.iter().rposition(|&b| b == 0x1b) {
             Some(at) => {
                 self.state = Scan::Ground;
                 at
             }
-            None if self.state == Scan::Ground => bytes.len(),
+            None if self.state == Scan::Ground => {
+                text = Some(0);
+                bytes.len()
+            }
             None => 0,
         };
-        for &b in &bytes[start..] {
+        for (i, &b) in bytes.iter().enumerate().skip(start) {
             let was = self.state;
-            self.state = step(was, b);
+            let keep;
+            (self.state, keep) = step(was, b);
             if self.state == Scan::Ground {
                 // This is after the last ESC, so the remaining bytes are plain text.
                 self.escape.clear();
                 self.overflowed = false;
+                text = Some(i + 1);
                 break;
             }
             if was == Scan::Ground {
                 self.escape.clear();
                 self.overflowed = false;
             }
-            // A C0 inside a sequence (the LF in `\x1b[31\n`) has already been executed here. Dropping it so it does not run again leaves the parameter state the same.
-            if b < 0x20 && b != 0x1b {
+            if !keep {
                 continue;
             }
             if !self.overflowed {
@@ -129,10 +143,22 @@ impl RawTail {
                 }
             }
         }
-        let keep = self.last.len().min(3 - bytes.len().min(3));
+        // Bytes inside a sequence never start a character (a 0x9c there may end a DCS).
+        let text = match text {
+            Some(0) => bytes,
+            Some(from) => {
+                self.last.clear();
+                &bytes[from..]
+            }
+            None => {
+                self.last.clear();
+                return;
+            }
+        };
+        let keep = self.last.len().min(3 - text.len().min(3));
         self.last.drain(..self.last.len() - keep);
         self.last
-            .extend_from_slice(&bytes[bytes.len().saturating_sub(3)..]);
+            .extend_from_slice(&text[text.len().saturating_sub(3)..]);
     }
 
     /// Raw bytes to append to the payload: the incomplete sequence (including any incomplete UTF-8 in it), or else the incomplete UTF-8 suffix.
@@ -148,32 +174,34 @@ impl RawTail {
     }
 }
 
-/// Byte version of wmux `PartialSequenceTracker.advance`.
-fn step(state: Scan, b: u8) -> Scan {
-    if b == 0x1b {
-        return Scan::Esc;
-    }
-    match state {
-        Scan::Ground => Scan::Ground,
-        Scan::Esc => match b {
-            b'[' => Scan::Csi,
-            b']' | b'P' | b'X' | b'^' | b'_' => Scan::String,
-            0x20..=0x2f => Scan::EscIntermediate,
-            _ => Scan::Ground,
-        },
-        Scan::EscIntermediate => match b {
-            0x20..=0x2f => Scan::EscIntermediate,
-            _ => Scan::Ground,
-        },
-        Scan::Csi => match b {
-            0x40..=0x7e | 0x18 | 0x1a => Scan::Ground,
-            // Parameter and intermediate bytes, and C0s that do not end the sequence.
-            _ => Scan::Csi,
-        },
-        Scan::String => match b {
-            0x07 | 0x18 | 0x1a => Scan::Ground,
-            _ => Scan::String,
-        },
+/// The state after `b`, and whether the receiver needs `b` again: bytes vte executes (a C0 inside a sequence, such
+/// as the LF in `\x1b[31\n`, has already run here) or ignores are dropped from the tail.
+fn step(state: Scan, b: u8) -> (Scan, bool) {
+    match (state, b) {
+        (_, 0x1b) => (Scan::Esc, true),
+        (_, 0x18 | 0x1a) | (Scan::Ground, _) => (Scan::Ground, false),
+        (Scan::Esc, b'[') => (Scan::Csi, true),
+        (Scan::Esc, b']') => (Scan::Osc, true),
+        (Scan::Esc, b'P') => (Scan::DcsEntry, true),
+        (Scan::Esc, b'X' | b'^' | b'_') => (Scan::Ignored, true),
+        (Scan::Esc | Scan::EscIntermediate, 0x20..=0x2f) => (Scan::EscIntermediate, true),
+        (Scan::Esc | Scan::EscIntermediate, 0x30..=0x7e) | (Scan::Csi, 0x40..=0x7e) => {
+            (Scan::Ground, false)
+        }
+        (Scan::Osc, 0x07) | (Scan::DcsPassthrough, 0x9c) => (Scan::Ground, false),
+        (Scan::Csi | Scan::Osc, 0x20..) => (state, state == Scan::Osc || b < 0x7f),
+        (Scan::DcsEntry | Scan::DcsParam | Scan::DcsIntermediate, 0x40..=0x7e) => {
+            (Scan::DcsPassthrough, true)
+        }
+        (Scan::DcsEntry | Scan::DcsParam | Scan::DcsIntermediate, 0x20..=0x2f) => {
+            (Scan::DcsIntermediate, true)
+        }
+        (Scan::DcsEntry | Scan::DcsParam, 0x30..=0x3b) | (Scan::DcsEntry, 0x3c..=0x3f) => {
+            (Scan::DcsParam, true)
+        }
+        (Scan::DcsParam | Scan::DcsIntermediate, 0x30..=0x3f) => (Scan::Ignored, true),
+        (Scan::DcsPassthrough, ..0x7f) => (state, true),
+        _ => (state, false),
     }
 }
 
