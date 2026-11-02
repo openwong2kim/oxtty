@@ -10,11 +10,11 @@
 //! `ris_keeps_cursor_visibility` aligns RIS behavior with xterm.js.
 use crate::history::History;
 use crate::vt::event::EventListener;
-use crate::vt::grid::{Dimensions, Grid, Row};
+use crate::vt::grid::{Charsets, Cursor, Dimensions, Grid, Row};
 use crate::vt::index::{Column, Line};
 use crate::vt::term::cell::{Cell, Flags, Hyperlink};
 use crate::vt::term::{Term, TermMode};
-use crate::vt::vte::ansi::{Color, NamedColor};
+use crate::vt::vte::ansi::{CharsetIndex, Color, CursorShape, NamedColor, StandardCharset};
 use std::fmt::{self, Write};
 
 /// Why [`crate::Engine::ansi_snapshot`] cannot rebuild the screen; replay the
@@ -59,8 +59,9 @@ pub struct SnapshotOptions {
     /// Keep only the newest this many history lines (`Some(0)`: the screen alone); `None` keeps them all.
     pub scrollback: Option<usize>,
     /// Leave out the modes (cursor keys, keypad, mouse, focus reports, bracketed paste, insert, origin, autowrap
-    /// off, cursor visibility) and what continues the output (the unfinished sequence at the end, a synchronized
-    /// update in progress), so the bytes only paint the screen. Scroll margins are then not refused.
+    /// off, cursor visibility), the state (charsets, saved cursors, cursor shape) and what continues the
+    /// output (the unfinished sequence at the end, a synchronized update in progress), so the bytes only paint the
+    /// screen. Scroll margins are then not refused.
     pub exclude_modes: bool,
 }
 
@@ -369,6 +370,38 @@ fn cursor(out: &mut String, grid: &Grid<Cell>) {
     }
 }
 
+/// Designates the charsets in `charsets` that are not ASCII, or designates ASCII in their place (`back`).
+fn designate(out: &mut String, charsets: &Charsets, back: bool) {
+    for (index, slot) in [(CharsetIndex::G0, '('), (CharsetIndex::G1, ')')] {
+        let code = match charsets[index] {
+            StandardCharset::Ascii => continue,
+            StandardCharset::SpecialCharacterAndLineDrawing => '0',
+        };
+        let _ = write!(out, "\x1b{slot}{}", if back { 'B' } else { code });
+    }
+}
+
+/// Saves `saved` with DECSC: position, pen, link and charsets. Leaves the charsets ASCII and the link closed, so
+/// text printed afterwards is not changed. Nothing is written for a cursor that was never saved.
+fn save(out: &mut String, saved: &Cursor<Cell>) {
+    if *saved == Cursor::default() {
+        return;
+    }
+    let point = saved.point;
+    let _ = write!(out, "\x1b[{};{}H", point.line.0 + 1, point.column.0 + 1);
+    style(out, &saved.template);
+    let open = saved.template.hyperlink();
+    if open.is_some() {
+        link(out, open.as_ref());
+    }
+    designate(out, &saved.charsets, false);
+    out.push_str("\x1b7");
+    designate(out, &saved.charsets, true);
+    if open.is_some() {
+        link(out, None);
+    }
+}
+
 /// A blank that was erased or never written, with at most a background: xterm.js holds nothing there, so it is not
 /// printed (a printed space would be text). A blank with more attributes is printed, as an erase keeps only the
 /// background.
@@ -585,13 +618,31 @@ fn serialize<T: EventListener>(
             return Err(SnapshotRefusal::WideEdge);
         }
     }
-    let mut out = String::from("\x1b[0m\x1b[?6l\x1b[?7h\x1b[4l\x1b[H");
+    let mut out = String::new();
     let modes = term.mode();
     let alt = modes.contains(TermMode::ALT_SCREEN);
+    let state = !options.exclude_modes;
+    // The alternate screen keeps its saved cursor while the primary one is shown. Entering and leaving it first
+    // leaves nothing else behind in an empty terminal.
+    if state && !alt && term.inactive_grid().saved_cursor != Cursor::default() {
+        out.push_str("\x1b[?1049h");
+        save(&mut out, &term.inactive_grid().saved_cursor);
+        out.push_str("\x1b[?1049l");
+    }
+    out.push_str("\x1b[0m\x1b[?6l\x1b[?7h\x1b[4l\x1b[H");
     if alt {
         screen(&mut out, term.inactive_grid(), older, skip);
         cursor(&mut out, term.inactive_grid());
+        // Each screen's cursor has its own charsets. While the alternate screen is shown, the primary one's saved
+        // cursor is its cursor (1049 saves it on entering).
+        if state {
+            designate(&mut out, &term.inactive_grid().cursor.charsets, false);
+        }
         out.push_str("\x1b[?1049h\x1b[0m\x1b[H");
+        // The alternate screen's cursor starts as a copy; put ASCII back so its text prints as it is.
+        if state {
+            designate(&mut out, &term.inactive_grid().cursor.charsets, true);
+        }
         // Entering clears the alternate screen with the primary pen's background; erased cells are not printed
         // over, so clear it again with the default one.
         if term.inactive_grid().cursor.template.bg != Color::Named(NamedColor::Background) {
@@ -611,11 +662,23 @@ fn serialize<T: EventListener>(
         cursor(&mut out, term.grid());
         return Ok(out);
     }
+    save(&mut out, &term.grid().saved_cursor);
     // Turning on DECOM sends the cursor home, so emit it before CUP (margins are rejected, so CUP is relative to the whole screen).
     if modes.contains(TermMode::ORIGIN) {
         out.push_str("\x1b[?6h");
     }
     cursor(&mut out, term.grid());
+    // After the cursor, whose pending wrap may print the edge cell again.
+    designate(&mut out, &term.grid().cursor.charsets, false);
+    if term.cursor_style_set() {
+        let style = term.cursor_style();
+        let shape = match style.shape {
+            CursorShape::Underline => 3,
+            CursorShape::Beam => 5,
+            _ => 1,
+        };
+        let _ = write!(out, "\x1b[{} q", shape + u8::from(!style.blinking));
+    }
     for (mode, code) in [
         (TermMode::APP_CURSOR, 1),
         (TermMode::FOCUS_IN_OUT, 1004),

@@ -492,8 +492,9 @@ During a synchronized update `CSI ? 2026 h` comes before the unfinished tail,
 so the receiver is inside the same update. Taking a snapshot never changes the engine, so it is safe on
 the terminal a renderer is drawing.
 
-Not carried over yet: charset designation and shift, the DECSC saved cursor,
-custom tab stops and cursor shape.
+The payload also carries the G0/G1 charset designations, the DECSC saved
+cursor of both screens and the DECSCUSR cursor shape; `excludeModes` leaves
+them out. Not carried over yet: the charset shift (SO/SI) and custom tab stops.
 
 </details>
 

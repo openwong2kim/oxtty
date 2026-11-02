@@ -416,3 +416,80 @@ fn exclude_modes_paints_only_the_screen() {
         .unwrap();
     assert!(!String::from_utf8_lossy(&cold).contains("2026"));
 }
+
+/// Restores `input`'s snapshot into a new engine, then feeds both `follow`: the screens match before and after.
+fn carries(input: &[u8], follow: &[u8]) {
+    let mut t = Engine::new(20, 4, 10);
+    t.feed(input);
+    let mut copy = assert_round_trip(&mut t, 10);
+    t.feed(follow);
+    copy.feed(follow);
+    assert_eq!(
+        rows(&copy),
+        rows(&t),
+        "{:?}",
+        String::from_utf8_lossy(input)
+    );
+    assert_same_screen(&t, &copy);
+}
+
+#[test]
+fn charsets_are_carried() {
+    let follow = b"q\x0fq\x0eq\x1b[?1049lq";
+    for input in [
+        &b"qq\x1b(0"[..],
+        b"\x1b(0\x1b)0\x0e\x0f",
+        // The edge cell a pending wrap rewrites is printed before the charsets come back.
+        b"qqqqqqqqqqqqqqqqqqqq\x1b(0",
+        // Each screen's cursor has its own charsets.
+        b"\x1b(0\x1b[?1049hq\x1b(B\x1b)0q",
+    ] {
+        carries(input, follow);
+    }
+}
+
+#[test]
+fn saved_cursor_is_carried() {
+    let follow = b"\x1b8qX\x1b[?1049h\x1b8Y\x1b[?1049l\x1b8Z";
+    for input in [
+        // Position, pen, link and charsets, saved apart from the cursor's own.
+        &b"\x1b[3;5H\x1b[31;1m\x1b]8;;https://a\x1b\\\x1b(0\x1b7\x1b[H\x1b[0m\x1b]8;;\x1b\\\x1b(Bhome"[..],
+        // Saved in a pending wrap.
+        b"\x1b[1;20HW\x1b7\x1b[2;1H",
+        // The alternate screen's own saved cursor, while on it and after leaving it.
+        b"\x1b[2;2H\x1b7\x1b[3;3H\x1b[?1049h\x1b[4;4H\x1b[32m\x1b7\x1b[Halt",
+        b"\x1b[?1049h\x1b[4;6H\x1b[44m\x1b7\x1b[?1049l\x1b[2;2Hmain",
+    ] {
+        carries(input, follow);
+    }
+}
+
+#[test]
+fn cursor_shape_is_carried() {
+    for input in [
+        &b"\x1b[5 q"[..],
+        b"\x1b[4 q",
+        b"\x1b[2 q",
+        b"\x1b[?12h",
+        b"\x1b[3 q\x1b[0 q",
+    ] {
+        carries(input, b"\x1b[?12lx");
+    }
+}
+
+#[test]
+fn exclude_modes_leaves_out_the_carried_state() {
+    let mut t = Engine::new(20, 4, 0);
+    t.feed(b"\x1b(0\x1b7\x1b[3g\x1b[5 qx");
+    let cold = t
+        .ansi_snapshot_with(SnapshotOptions {
+            scrollback: None,
+            exclude_modes: true,
+        })
+        .unwrap();
+    let mut copy = Engine::new(20, 4, 0);
+    copy.feed(&cold);
+    copy.feed(b"\tq\x1b8");
+    assert_eq!(copy.row_text(0).unwrap(), "\u{2502}       q");
+    assert_eq!((copy.cursor().styled, copy.cursor().col), (false, 0));
+}
