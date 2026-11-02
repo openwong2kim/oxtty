@@ -71,6 +71,15 @@ test('CSI, OSC and DCS handlers see what xterm.js handlers see and decide the de
   assert.deepEqual(ox.cursor, xt.cursor);
 });
 
+test('term.parser is the same object on every read, as in xterm.js, also after dispose', async () => {
+  for (const t of [new m.Terminal(), new xtermHeadless.Terminal({ allowProposedApi: true })]) {
+    const p = t.parser;
+    assert.equal(t.parser, p);
+    t.dispose();
+    assert.equal(t.parser, p);
+  }
+});
+
 test('the newest handler goes first, and a disposed one no longer runs', async () => {
   const [ox, xt] = await compare({ cols: 10, rows: 2 }, async (t, log) => {
     const older = t.parser.registerCsiHandler({ final: 'n' }, () => { log.push('older'); return false; });

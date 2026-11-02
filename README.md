@@ -390,8 +390,7 @@ Beyond the notes in the tables above:
   the next animation frame, not during the write (PRD D7).
 - Markers do not exist on the alternate screen: `registerMarker` returns
   `undefined` there and `markers` is `[]`.
-- `term.parser`, the buffer objects and `term.markers` return new objects on
-  every read.
+- The buffer objects and `term.markers` return new objects on every read.
 - DECRQSS reports the protection attribute (DECSCA) as `0`: the engine has no
   protected cells.
 - With `scrollbar.showScrollbar: false` there is no

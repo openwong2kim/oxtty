@@ -3,8 +3,8 @@
 //! unless one did. A handler returning a Promise holds the write queue until it settles, as in xterm.js.
 //!
 //! Memory: a terminal without handlers stores an empty list, sets no engine hook and is fed with plain `write`;
-//! only terminals with handlers feed through `writeUntilHook`. `term.parser` is a small object made per read (so
-//! `term.parser !== term.parser`, unlike xterm.js) that holds the terminal weakly.
+//! only terminals with handlers feed through `writeUntilHook`. `term.parser` is a small object made on the first
+//! read and kept (so `term.parser === term.parser`, as in xterm.js); it holds the terminal weakly.
 //!
 //! The identifier checks are ported from xterm.js `src/common/parser/EscapeSequenceParser.ts` @
 //! 08829c7eb6279dda2a9e86df901353a1a89858ca (npm `@xterm/xterm` 6.1.0-beta.336), Copyright (c) 2018 The xterm.js
@@ -84,6 +84,8 @@ pub(crate) struct ParserState {
     next: Cell<u32>,
     /// An async handler holds the write queue.
     paused: Cell<bool>,
+    /// The `term.parser` object, once read.
+    object: RefCell<Option<JsValue>>,
 }
 
 impl ParserState {
@@ -492,9 +494,15 @@ impl Parser {
 #[wasm_bindgen]
 impl Terminal {
     #[wasm_bindgen(getter, unchecked_return_type = "IParser")]
-    pub fn parser(&self) -> Parser {
-        Parser {
-            shared: Rc::downgrade(&self.shared),
+    pub fn parser(&self) -> JsValue {
+        if let Some(object) = self.shared.parser.object.borrow().as_ref() {
+            return object.clone();
         }
+        // Made with no borrow held: the wrapper is made in JS.
+        let object = JsValue::from(Parser {
+            shared: Rc::downgrade(&self.shared),
+        });
+        *self.shared.parser.object.borrow_mut() = Some(object.clone());
+        object
     }
 }
