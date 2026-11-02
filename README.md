@@ -410,15 +410,12 @@ Beyond the notes in the tables above:
 
 - A selection follows lines trimmed off the scrollback and screen switches at
   the next animation frame, not during the write (PRD D7).
-- Markers do not exist on the alternate screen: `registerMarker` returns
-  `undefined` there and `markers` is `[]`.
-- `term.parser`, the buffer objects and `term.markers` return new objects on
-  every read.
-- An empty CSI sub-parameter is `0` (xterm.js: `-1`).
-- The engine does not answer DECRQSS, so a DCS handler that falls through
-  sends nothing.
-- With `scrollbar.showScrollbar: false` there is no
-  `.xterm-scrollable-element` wrapper.
+- A marker in a scroll region below the top row follows its line when a line
+  feed at the region's bottom or a reverse index at its top scrolls it;
+  xterm.js leaves markers on their rows then.
+- The buffer objects and `term.markers` return new objects on every read.
+- DECRQSS reports the protection attribute (DECSCA) as `0`: the engine has no
+  protected cells.
 - Without an `ImageAddon` the engine always answers `CSI 18 t` (xterm.js only
   when `windowOptions` allows it).
 - `ImageAddon`: no kitty graphics, no QOI images, no
@@ -520,8 +517,9 @@ During a synchronized update `CSI ? 2026 h` comes before the unfinished tail,
 so the receiver is inside the same update. Taking a snapshot never changes the engine, so it is safe on
 the terminal a renderer is drawing.
 
-Not carried over yet: charset designation and shift, the DECSC saved cursor,
-custom tab stops and cursor shape.
+The payload also carries the charsets (G0/G1 designation and SO/SI), the
+DECSC saved cursor of both screens, custom tab stops and the DECSCUSR cursor
+shape; `excludeModes` leaves them out.
 
 </details>
 

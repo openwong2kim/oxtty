@@ -95,6 +95,9 @@ extern "C" {
     /// `{ backend?: 'conpty' | 'winpty', buildNumber?: number }` or `null`: xterm.js 6.1's Windows PTY rules.
     #[wasm_bindgen(method, catch, js_name = setWindowsPty)]
     pub fn set_windows_pty(this: &Engine, pty: &JsValue) -> Result<(), JsValue>;
+    /// `'block' | 'underline' | 'bar'` and whether it blinks: the `cursorStyle` and `cursorBlink` options.
+    #[wasm_bindgen(method, catch, js_name = setCursorDefault)]
+    pub fn set_cursor_default(this: &Engine, shape: &JsValue, blink: bool) -> Result<(), JsValue>;
     /// `options` is `{ scrollback?: number, excludeModes?: boolean }` or `undefined`.
     #[wasm_bindgen(method, catch, js_name = ansiSnapshot)]
     pub fn ansi_snapshot(this: &Engine, options: &JsValue) -> Result<JsValue, JsValue>;

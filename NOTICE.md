@@ -15,12 +15,12 @@ PTY/event-loop modules and their dependencies so the code builds for
 
 ## vte 0.15.0
 
-`crates/oxtty/src/vt/vte/ansi.rs` is the `ansi` module of the published `vte`
-0.15.0 crate by Joe Wilm, Christian Duerr and the Alacritty contributors,
-licensed under the Apache License 2.0 or the MIT license (used under the Apache
-License 2.0, `crates/oxtty/LICENSE-APACHE`). It is modified so parsing can stop
-at sequences the host hooked; the changes are listed in
-`crates/oxtty/src/vt/PATCHES.md`.
+`crates/oxtty/src/vt/vte` is the published `vte` 0.15.0 crate (crates.io, git 3b3da71c34cc1256c7e20981cf03f8eb95e08ffc) by Joe Wilm,
+Christian Duerr and the Alacritty contributors, licensed under the Apache
+License 2.0 or the MIT license (used under the Apache License 2.0,
+`crates/oxtty/LICENSE-APACHE`). It is modified so parsing can stop at sequences
+the host hooked and tells an empty sub-parameter from 0; the changes are listed
+in `crates/oxtty/src/vt/PATCHES.md`.
 
 ## xterm.js Unicode 11 width table
 

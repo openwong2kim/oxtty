@@ -69,6 +69,48 @@ test('dispose, erase in display, reset and terminal dispose fire onDispose once,
   assert.deepEqual(seen[0], ['own', 'ED', 'RIS', 'reset', 'dispose']);
 });
 
+test('the alternate buffer has its own markers, moved and disposed like xterm.js, all gone when it is left', async () => {
+  const { both, step, dispose } = pair({ cols: 10, rows: 5, scrollback: 10 });
+  await step('p0\r\np1\r\np2');
+  const seen = [[], []];
+  const mark = (name, offset) => both.map((t, k) => {
+    const marker = t.registerMarker(offset);
+    marker.onDispose(() => seen[k].push(name));
+    return marker;
+  });
+  const marks = { primary: mark('primary', 0) };
+  const state = () => [0, 1].map((k) => ({
+    lines: Object.fromEntries(Object.entries(marks).map(([name, pair]) => [name, pair[k].line])),
+    markers: both[k].markers.map((marker) => marker.line),
+    seen: seen[k],
+  }));
+  const check = (label) => {
+    const [ox, xt] = state();
+    assert.deepEqual(ox, xt, label);
+  };
+  await step('\x1b[?1049h\x1b[Ha\r\nb\r\nc\r\nd');
+  for (const [name, offset] of [['top', -3], ['b', -2], ['c', -1], ['d', 0]]) marks[name] = mark(name, offset);
+  check('registered');
+  await step('\x1b[2;1H\x1b[M');
+  check('a deleted line');
+  await step('\x1b[1;1H\x1b[L');
+  check('an inserted line');
+  await step('\x1b[5;1H\n\n');
+  check('the screen scrolled');
+  marks.e = mark('e', 0);
+  both.forEach((t) => t.resize(10, 4));
+  check('fewer rows');
+  await step('\x1b[?1049l');
+  check('back on the normal buffer');
+  assert.deepEqual(state()[0].markers, [2]);
+  marks.again = await step('\x1b[?1049h').then(() => mark('again', 0));
+  await step('\x1b[2J');
+  check('erase in display');
+  await step('\x1b[?1049l');
+  check('left again');
+  dispose();
+});
+
 test('registerMarker checks its offset like xterm.js; listeners added after dispose never run', async () => {
   const t = new m.Terminal({ cols: 10, rows: 3, scrollback: 5 });
   await write(t, 'x\r\ny');
@@ -79,11 +121,13 @@ test('registerMarker checks its offset like xterm.js; listeners added after disp
   // Outside the buffer xterm.js still hands out a marker (on a line that does not exist); oxtty returns undefined.
   assert.equal(t.registerMarker(-10), undefined);
   assert.equal(t.registerMarker(10), undefined);
-  // xterm.js marks the alternate buffer too; the engine keeps markers on the normal one only.
+  // The alternate buffer has markers of its own, which go when it is left.
   await write(t, '\x1b[?1049h');
-  assert.deepEqual([t.registerMarker(0), t.markers], [undefined, []]);
+  const alt = t.registerMarker(0);
+  assert.deepEqual(t.markers.map((m) => m.id), [alt.id]);
   await write(t, '\x1b[?1049l');
   assert.equal(t.markers.length, 2);
+  assert.equal(alt.isDisposed, true);
   marker.dispose();
   const late = [];
   marker.onDispose(() => late.push(1));
