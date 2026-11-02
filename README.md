@@ -158,8 +158,8 @@ does, 17 terminals take 5.1 MiB of engine memory instead of 41.1 MiB
 
 | Module | Bytes | gzip | Budget |
 | --- | ---: | ---: | --- |
-| Engine `oxtty.wasm` | 307,707 | 111,732 | 340 KiB |
-| Front end `xterm_web_bg.wasm` (`oxtty/xterm` only) | 734,291 | 277,775 | 800 KiB raw, 300 KiB gzip |
+| Engine `oxtty.wasm` | 325,972 | 117,985 | 340 KiB |
+| Front end `xterm_web_bg.wasm` (`oxtty/xterm` only) | 774,054 | 292,912 | 800 KiB raw, 300 KiB gzip |
 
 One instance of each serves every terminal on a page, so the code is paid
 once, not per pane. `scripts/build-web.sh` and `test/web/size.test.mjs` fail
