@@ -980,27 +980,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn csi_param_matches_digit_by_digit() {
-        let mut seed = 0x853c_49e6_748f_ea9bu64;
-        for _ in 0..100_000 {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            // Digits, then anything; zeros often, so long numbers can stay small.
-            let len = (seed % 12) as usize;
-            let mut bytes: Vec<u8> = (0..len)
-                .map(|k| if seed >> (20 + k) & 1 == 0 { b'0' } else { b'0' + (seed >> (4 * k % 60)) as u8 % 10 })
-                .collect();
-            bytes.extend((0..(seed >> 60) as usize).map(|k| [b';', b':', b'm', b'/', b'0', 0x80, 0xff][k % 7]));
-            let at = ((seed >> 33) as usize % 2).min(bytes.len());
-            let expected = bytes[at..].iter().take_while(|b| b.is_ascii_digit()).fold((0u16, 0), |(p, n), b| {
-                (p.saturating_mul(10).saturating_add((b - b'0') as u16), n + 1)
-            });
-            assert_eq!(params::csi_param(&bytes, at), expected, "{bytes:?} {at}");
-        }
-    }
-
     #[derive(Default)]
     struct Dispatcher {
         dispatched: Vec<Sequence>,

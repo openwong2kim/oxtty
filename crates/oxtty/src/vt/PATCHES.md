@@ -281,10 +281,11 @@ same input one byte at a time, `vte/mod.rs` `chunked_input_matches_byte_by_byte`
   them, use the scalar path.
 - A whole CSI after ESC (private marker, parameters, intermediates, final byte,
   all within the bytes given) is dispatched by `csi_fast` without leaving
-  ground; `Params::parse` (`vte/params.rs`) reads each parameter's digits
-  from a word at once (`csi_param`). Anything else — a control or DEL inside,
-  a cut-off sequence, a full parameter list, too many intermediates — goes
-  through the state machine from the ESC as before.
+  ground; `Params::parse` (`vte/params.rs`) finds the separators of a list
+  longer than eight bytes a word at a time (`classify`), then reads each
+  parameter's digits from a word at once (`word_value`). Anything else — a
+  control or DEL inside, a cut-off sequence, a full parameter list, too many
+  intermediates — goes through the state machine from the ESC as before.
 - `advance_partial_utf8` took the bytes of every valid character after the
   first one it completed but printed only the first, dropping the others (an
   ASCII byte after a split `é` was lost when an incomplete character followed
