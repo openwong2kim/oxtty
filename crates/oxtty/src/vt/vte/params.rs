@@ -88,6 +88,13 @@ impl Params {
         }
     }
 
+    /// Sets the list to the one parameter `param`, without sub-parameters (oxtty).
+    #[inline]
+    pub(crate) fn set_one(&mut self, param: u16) {
+        (self.subparams[0], self.params[0]) = (1, param);
+        (self.len, self.current_subparams, self.empty) = (1, 0, 0);
+    }
+
     /// Parses the parameters of a CSI at `bytes[i..]` into the cleared list, as the parser would one byte at a
     /// time, and returns where the first byte that is not a digit, `:` or `;` is (oxtty). `None` where the bytes end
     /// first or the parameters would fill the list, whose handling the parser keeps.
