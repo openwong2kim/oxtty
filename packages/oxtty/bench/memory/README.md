@@ -120,3 +120,48 @@ other builds), with the renderer process for comparison:
 17 hidden, dpr 2    490 401 379    22  49  77
 20 hidden, dpr 2    472 534 470    33  -9  29
 ```
+
+## Busy
+
+```sh
+node bench/memory/busy.mjs [panes] [seconds] [dpr] [interval]   # defaults: 17 12 1 50
+MIXED=1 node bench/memory/busy.mjs                               # sizes from 92×30 to 120×40
+```
+
+Every terminal gets three lines of output every `interval` ms, as agents
+printing; near the end of the window the GPU process's footprint is read, and
+the page counts WebGL draw calls, `drawImage` calls and animation frames. Then
+the footprint again after 5 s of idling.
+
+17 panes of 120×40, dpr 1, 12 s (Apple M4, loaded machine, 2026-11-02; GPU
+process footprint while busy, three runs, and over the empty page):
+
+```
+                     footprint      over empty     draws/frame  drawImage/frame
+oxtty before         457 462 440    270 232 208    22.6         5.7
+oxtty after          438 462 461    218 274 233    16.9         5.6
+xterm.js             407 409 409    189 190 182    16.9         0
+oxtty, mixed sizes   399 382 391    180 194 165    16.9–21.3    5.6–7.1
+xterm.js, mixed      384 399        154 171        17.0         0
+```
+
+A pane frame made four WebGL draw calls (backgrounds, glyphs, the highlight
+overlay and the cursor), the overlay and often the cursor with nothing in
+them; empty rectangle layers are now skipped, three calls like xterm.js. The
+memory did not move. What the busy oxtty page holds over xterm.js is
+`IOAccelerator (graphics)`, Chromium's working set for drawing into 2D
+canvases every frame; it is gone 5 s after the output stops (oxtty 173–186 MB
+then, xterm.js about 270 MB). Measured with probes:
+
+- Without the copy into the pane canvases, the busy page is +61 MB over the
+  empty page; the WebGL drawing alone costs little.
+- 17 plain 2D canvases filled every frame (no WebGL) take +66 MB of
+  `IOAccelerator (graphics)`; `copy` or `source-over` makes no difference.
+- `bitmaprenderer` canvases fed by `transferToImageBitmap` halve the busy cost
+  (+113 to +150 MB) but freeze the page when the WebGL context is lost (the
+  context-restore test hangs right after `loseContext`), as `gpu.rs` notes.
+  `transferToImageBitmap` + `drawImage` + `close` did not measurably help.
+- Keeping one surface sized for the largest pane, instead of resizing it at
+  every draw of a pane of another size, kept the frame rate steady with mixed
+  sizes but held about 55 MB more while busy (the copy snapshots the whole
+  surface), so the surface still takes each pane's size.

@@ -79,3 +79,33 @@ test('a pane with display: none has no canvas pixels, and has its last frame bac
   }, TEXT);
   assert.deepEqual(r, { hidden: [true, 0, 0], restoredSame: 0, afterSame: 0, shown: [false, true, true] });
 });
+
+test('a frame makes one WebGL draw call per layer that has something to draw', async () => {
+  const r = await inPage(async (text) => {
+    const p = new T.Pane(30, 4, { theme: { background: '#101010', cursor: '#ff0000' } });
+    await p.write(text);
+    await p.pixels();
+    let calls = 0;
+    const proto = WebGL2RenderingContext.prototype;
+    const original = proto.drawElementsInstanced;
+    proto.drawElementsInstanced = function (...args) {
+      calls++;
+      return original.apply(this, args);
+    };
+    const count = async () => {
+      calls = 0;
+      p.term.options.drawBoldTextInBrightColors = false;
+      p.term.options.drawBoldTextInBrightColors = true;
+      await p.pixels();
+      return calls;
+    };
+    // Backgrounds, glyphs and the cursor; no highlight or link overlay
+    const out = { cursor: await count() };
+    await p.write('\x1b[?25l');
+    out.hidden = await count();
+    proto.drawElementsInstanced = original;
+    p.dispose();
+    return out;
+  }, TEXT);
+  assert.deepEqual(r, { cursor: 3, hidden: 2 });
+});
