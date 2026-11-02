@@ -101,6 +101,18 @@ RSS moves between runs, the GPU process the most: another run on 2026-11-02
 gave +123 against +413 MB for the renderer and +21 against +48 MB for the GPU
 process.
 
+**Idle with a blinking cursor** — the same 17 panes, the first one focused
+with `cursorBlink` on, GPU process footprint (macOS `footprint`) after 10 s.
+A blinking cursor is a layer whose opacity flips, so the pane makes no WebGL
+draw; Chromium then purges the GPU memory a periodic WebGL redraw keeps in
+use. Apple M4, 2026-11-02, same bench.
+
+| | oxtty/xterm | xterm.js |
+| --- | ---: | ---: |
+| Blink on | 216 MB (366 MB before the layer) | 437 MB |
+| Blink off | 217 MB | 315 MB |
+| WebGL draw calls in 10 s, blink on | 0 (60 before) | 43 |
+
 **In wmux** — wmux (Electron) with 17 panes and 10,000 lines of scrollback,
 the xterm.js renderer against oxtty, three alternating runs, macOS footprint
 figures. Apple M4, 2026-11-01/02.
@@ -126,7 +138,7 @@ does, 17 terminals take 5.1 MiB of engine memory instead of 41.1 MiB
 | Module | Bytes | gzip | Budget |
 | --- | ---: | ---: | --- |
 | Engine `oxtty.wasm` | 307,707 | 111,732 | 340 KiB |
-| Front end `xterm_web_bg.wasm` (`oxtty/xterm` only) | 727,245 | 274,609 | 800 KiB raw, 300 KiB gzip |
+| Front end `xterm_web_bg.wasm` (`oxtty/xterm` only) | 734,291 | 277,775 | 800 KiB raw, 300 KiB gzip |
 
 One instance of each serves every terminal on a page, so the code is paid
 once, not per pane. `scripts/build-web.sh` and `test/web/size.test.mjs` fail

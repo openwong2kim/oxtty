@@ -1,5 +1,6 @@
-// The page bench.mjs opens: `setup(kind, n, cols, rows, lines)` builds `n` terminals of one kind ('oxtty' or
-// 'xterm' with @xterm/addon-webgl), all in view, feeds each the same log output and waits a few frames.
+// The page bench.mjs opens: `setup(kind, n, cols, rows, lines, blink)` builds `n` terminals of one kind ('oxtty' or
+// 'xterm' with @xterm/addon-webgl), all in view, feeds each the same log output and waits a few frames. `idle()`
+// focuses the first terminal; `counts()` reports the WebGL draw calls and canvas `drawImage` calls since its last call.
 import { Terminal as XtermTerminal } from '@xterm/xterm';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { init, Terminal } from 'oxtty/xterm';
@@ -22,19 +23,39 @@ function chunk(cols, seed0) {
   return s;
 }
 
+// Counts every WebGL draw call and 2D `drawImage`, whichever terminal or context makes it
+const counts = { gl: 0, drawImage: 0 };
+for (const proto of [WebGLRenderingContext.prototype, WebGL2RenderingContext.prototype]) {
+  for (const name of ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced', 'drawRangeElements']) {
+    const original = proto[name];
+    if (!original) continue;
+    proto[name] = function (...args) {
+      counts.gl++;
+      return original.apply(this, args);
+    };
+  }
+}
+for (const proto of [CanvasRenderingContext2D.prototype, OffscreenCanvasRenderingContext2D.prototype]) {
+  const original = proto.drawImage;
+  proto.drawImage = function (...args) {
+    counts.drawImage++;
+    return original.apply(this, args);
+  };
+}
+
 const frames = (n) =>
   new Promise((resolve) => {
     const next = () => (n-- > 0 ? requestAnimationFrame(next) : resolve());
     next();
   });
 
-window.setup = async (kind, n, cols, rows, lines) => {
+window.setup = async (kind, n, cols, rows, lines, blink) => {
   const terms = [];
   for (let i = 0; i < n; i++) {
     const host = document.createElement('div');
     host.style.cssText = 'display:inline-block;vertical-align:top';
     document.body.appendChild(host);
-    const options = { cols, rows, scrollback: 10000, fontFamily: 'Menlo, monospace', fontSize: 12 };
+    const options = { cols, rows, scrollback: 10000, fontFamily: 'Menlo, monospace', fontSize: 12, cursorBlink: blink };
     const term = kind === 'xterm' ? new XtermTerminal(options) : new Terminal(options);
     term.open(host);
     if (kind === 'xterm') term.loadAddon(new WebglAddon());
@@ -46,6 +67,16 @@ window.setup = async (kind, n, cols, rows, lines) => {
   const gl = document.createElement('canvas').getContext('webgl2');
   const info = gl?.getExtension('WEBGL_debug_renderer_info');
   return { gpuName: info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : '?', canvases: document.querySelectorAll('canvas').length };
+};
+
+window.idle = () => {
+  window.terms[0].focus();
+  return document.hasFocus();
+};
+window.counts = () => {
+  const out = { ...counts };
+  counts.gl = counts.drawImage = 0;
+  return out;
 };
 
 await init();
