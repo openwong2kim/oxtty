@@ -234,8 +234,9 @@ pub struct Hook {
     pub kind: HookKind,
     /// [`hook_id`] for CSI and DCS, the number before the first `;` for OSC.
     pub id: u32,
-    /// CSI and DCS parameters, each followed by its sub-parameters (an empty parameter is 0, values stop at 65535).
-    pub params: Vec<Vec<u16>>,
+    /// CSI and DCS parameters, each followed by its sub-parameters (an empty parameter is 0 and an empty
+    /// sub-parameter -1, as in xterm.js; values stop at 65535).
+    pub params: Vec<Vec<i32>>,
     /// OSC: everything after the first `;`. DCS: the payload.
     pub data: Vec<u8>,
 }

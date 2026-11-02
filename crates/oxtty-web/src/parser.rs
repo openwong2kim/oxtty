@@ -36,7 +36,7 @@ export interface IFunctionIdentifier {
     final: string;
 }
 
-/** Each parameter, followed by an array of its sub-parameters if it has any (an empty one is 0, not -1). */
+/** Each parameter, followed by an array of its sub-parameters if it has any (an empty one is -1). */
 export type IParams = (number | number[])[];
 "#;
 

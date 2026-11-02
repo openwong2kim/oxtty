@@ -27,8 +27,8 @@ bitflags = "2.4.1"
 log = "0.4"
 regex-automata = "0.4.3"
 unicode-width = "0.2.0"
-vte = { version = "0.15.0", default-features = false, features = ["std"] }
-# Dependencies of vte's `ansi` module, which is built into the vt module (vt/vte).
+# Dependencies of the `vte` crate, which is built into the vt module (vt/vte).
+memchr = { version = "2.7.4", default-features = false }
 cursor-icon = { version = "1.0.0", default-features = false }
 serde = { version = "1", features = ["derive", "rc"], optional = true }
 

@@ -75,7 +75,10 @@ export interface Hook {
   kind: 'csi' | 'osc' | 'dcs';
   /** As given to `setHook`. */
   id: number;
-  /** CSI and DCS parameters, each followed by its sub-parameters (an empty parameter is 0, values stop at 65535). */
+  /**
+   * CSI and DCS parameters, each followed by its sub-parameters (an empty parameter is 0 and an empty sub-parameter
+   * -1, as in xterm.js; values stop at 65535).
+   */
   params: number[][];
   /** OSC: everything after the first `;`. DCS: the payload. */
   data: Uint8Array;

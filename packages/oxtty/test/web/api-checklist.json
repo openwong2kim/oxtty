@@ -210,7 +210,7 @@
     },
     "Terminal.parser.registerCsiHandler": {
       "status": "supported",
-      "reason": "As registerOscHandler; identifiers are checked with xterm.js's errors. An empty sub-parameter is 0 (xterm.js -1).",
+      "reason": "As registerOscHandler; identifiers are checked with xterm.js's errors. Parameters as xterm.js Params.toArray (an empty sub-parameter is -1).",
       "exercisedBy": "registerCsiHandler\\("
     },
     "Terminal.parser.registerDcsHandler": {

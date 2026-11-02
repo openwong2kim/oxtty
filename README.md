@@ -392,7 +392,6 @@ Beyond the notes in the tables above:
   `undefined` there and `markers` is `[]`.
 - `term.parser`, the buffer objects and `term.markers` return new objects on
   every read.
-- An empty CSI sub-parameter is `0` (xterm.js: `-1`).
 - The engine does not answer DECRQSS, so a DCS handler that falls through
   sends nothing.
 - With `scrollbar.showScrollbar: false` there is no

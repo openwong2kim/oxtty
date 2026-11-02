@@ -64,10 +64,8 @@ test('CSI, OSC and DCS handlers see what xterm.js handlers see and decide the de
     await write(t, '\x1b]133;A;cl=m\x07\x1b]2;hidden\x1b\\\x1b]2;shown\x07\x1b]7\x07\x1b]133;D;0\x07');
     await write(t, '\x1bP1$qm\x1b\\\x1b[2 q\x1b[3;5HZ\x1b[6n');
   });
-  // xterm.js gives an empty sub-parameter as -1; the engine as 0.
-  const sgr = xt.log.find(([k]) => k === 'sgr');
-  assert.deepEqual(sgr, ['sgr', [1, 38, [2, -1, 10, 20, 30], 4]]);
-  sgr[1][2][1] = 0;
+  // An empty sub-parameter is -1, an empty parameter 0.
+  assert.deepEqual(xt.log.find(([k]) => k === 'sgr'), ['sgr', [1, 38, [2, -1, 10, 20, 30], 4]]);
   assert.deepEqual(ox.log, xt.log);
   assert.deepEqual(ox.text, xt.text);
   assert.deepEqual(ox.cursor, xt.cursor);

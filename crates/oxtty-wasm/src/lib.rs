@@ -110,7 +110,7 @@ fn set_out(bytes: Vec<u8>) -> u32 {
 /// ABI version of these exports; bump on any incompatible change.
 #[no_mangle]
 pub extern "C" fn oxtty_abi() -> u32 {
-    12
+    13
 }
 
 #[no_mangle]
@@ -546,7 +546,7 @@ pub unsafe extern "C" fn oxtty_feed_until_hook(h: u32, ptr: *const u8, len: u32)
 }
 
 /// The pending hook's kind, or -1 if none. OUT32 holds its id, the parameter count, then each parameter as its
-/// length and values (sub-parameters after the first); OUT holds its data.
+/// length and values (sub-parameters after the first, an empty one as -1 in two's complement); OUT holds its data.
 #[no_mangle]
 pub extern "C" fn oxtty_pending_hook(h: u32) -> i32 {
     with(h, -1, |t| {
@@ -559,7 +559,7 @@ pub extern "C" fn oxtty_pending_hook(h: u32) -> i32 {
             out.push(hook.params.len() as u32);
             for param in &hook.params {
                 out.push(param.len() as u32);
-                out.extend(param.iter().map(|&v| u32::from(v)));
+                out.extend(param.iter().map(|&v| v as u32));
             }
         });
         set_out(hook.data);

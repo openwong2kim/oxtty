@@ -50,6 +50,28 @@ fn csi_hook_stops_right_after_the_sequence() {
 }
 
 #[test]
+fn empty_sub_parameters_are_minus_one_and_the_default_still_reads_them() {
+    let mut t = term();
+    t.set_hook(HookKind::Csi, hook_id(b"", b'm'), true);
+    t.set_hook(HookKind::Dcs, hook_id(b"$", b'q'), true);
+    let hooks = feed_with(
+        &mut t,
+        b"\x1b[1;38:2::10:20:30;:5mA\x1bP1:;2::$qm\x1b\\",
+        |h| h.kind == HookKind::Dcs,
+    );
+    // As xterm.js `Params`: an empty sub-parameter is -1, an empty parameter (also before a `:`) is 0.
+    assert_eq!(
+        hooks[0].params,
+        [vec![1], vec![38, 2, -1, 10, 20, 30], vec![0, 5]]
+    );
+    assert_eq!(hooks[1].params, [vec![1, -1], vec![2, -1, -1]]);
+    let mut cells = Vec::new();
+    t.row_cells(0, &mut cells);
+    assert_eq!(cells[0].fg, oxtty::color::RGB | 0x0a141e);
+    assert_ne!(cells[0].attrs & oxtty::attr::BOLD, 0);
+}
+
+#[test]
 fn handled_hook_skips_the_default_action() {
     let mut t = term();
     t.set_hook(HookKind::Csi, hook_id(b"", b'n'), true);

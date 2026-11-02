@@ -251,12 +251,12 @@ pub enum HookKind {
 /// A hooked sequence parsing stopped at; its default action has not run (see [`Processor::finish_hook`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hook {
-    /// `id` is [`hook_id`]. Each parameter comes with its sub-parameters after it.
-    Csi { id: u32, params: Vec<Vec<u16>> },
+    /// `id` is [`hook_id`]. Each parameter comes with its sub-parameters after it; an empty sub-parameter is -1.
+    Csi { id: u32, params: Vec<Vec<i32>> },
     /// `id` is the number before the first `;`. `params` are all the `;`-separated fields, the number first.
     Osc { id: u32, params: Vec<Vec<u8>>, bell_terminated: bool },
-    /// `id` is [`hook_id`]; `data` is the payload.
-    Dcs { id: u32, params: Vec<Vec<u16>>, data: Vec<u8> },
+    /// `id` is [`hook_id`]; `data` is the payload. `params` as for CSI.
+    Dcs { id: u32, params: Vec<Vec<i32>>, data: Vec<u8> },
 }
 
 /// Identifier of a CSI or DCS sequence: its intermediates as the parser collects them (a private marker such as
@@ -387,13 +387,25 @@ impl<'a, H: Handler + 'a> Performer<'a, H> {
     }
 }
 
-/// Parameters as [`Hook`] keeps them: each with its sub-parameters.
-fn hook_params(params: &Params) -> Vec<Vec<u16>> {
-    params.iter().map(<[u16]>::to_vec).collect()
+/// Parameters as [`Hook`] keeps them: each with its sub-parameters, an empty sub-parameter as -1 (xterm.js).
+fn hook_params(params: &Params) -> Vec<Vec<i32>> {
+    let mut index = 0;
+    params
+        .iter()
+        .map(|param| {
+            param
+                .iter()
+                .map(|&value| {
+                    index += 1;
+                    if params.is_empty_subparam(index - 1) { -1 } else { i32::from(value) }
+                })
+                .collect()
+        })
+        .collect()
 }
 
-/// The CSI sequence a [`Hook::Csi`] came from, up to the spelling of its parameters.
-fn csi_bytes(id: u32, params: &[Vec<u16>]) -> Vec<u8> {
+/// The CSI sequence a [`Hook::Csi`] came from, up to the spelling of its parameters (an empty parameter is 0).
+fn csi_bytes(id: u32, params: &[Vec<i32>]) -> Vec<u8> {
     let ident = id.to_be_bytes();
     let collected = &ident[ident.iter().position(|&b| b != 0).unwrap_or(3)..3];
     // The parser collects a private marker only right after `CSI`, and other intermediates after the parameters.
@@ -408,7 +420,9 @@ fn csi_bytes(id: u32, params: &[Vec<u16>]) -> Vec<u8> {
             if j > 0 {
                 bytes.push(b':');
             }
-            bytes.extend_from_slice(value.to_string().as_bytes());
+            if *value >= 0 {
+                bytes.extend_from_slice(value.to_string().as_bytes());
+            }
         }
     }
     bytes.extend_from_slice(intermediates);

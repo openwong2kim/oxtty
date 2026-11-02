@@ -89,8 +89,8 @@ pub struct Hook {
     /// `"csi"`, `"osc"` or `"dcs"`.
     pub kind: String,
     pub id: u32,
-    /// Each parameter followed by its sub-parameters.
-    pub params: Vec<Vec<u32>>,
+    /// Each parameter followed by its sub-parameters (an empty sub-parameter is -1).
+    pub params: Vec<Vec<i32>>,
     /// OSC: everything after the first `;`. DCS: the payload.
     pub data: Buffer,
 }
@@ -444,11 +444,7 @@ impl Terminal {
             }
             .into(),
             id: hook.id,
-            params: hook
-                .params
-                .iter()
-                .map(|p| p.iter().map(|&v| v.into()).collect())
-                .collect(),
+            params: hook.params,
             data: hook.data.into(),
         })
     }
