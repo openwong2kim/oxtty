@@ -252,15 +252,17 @@ for (const c of CASES) {
 }
 
 // ── State the snapshot carries ───────────────────────────────────────────────────
-// Charsets and the saved cursor are not in the screen record, so each tail shows them on the screen.
+// Charsets, the saved cursor and tab stops are not in the screen record, so each tail shows them on the screen.
 // Proof A first pins that xterm.js and oxtty agree on the input itself.
 const CARRIED = [
   ['G0 line drawing', '\x1b(0', 'qx'],
+  ['G1 shifted in', '\x1b)0\x0e', 'q\x0fq\x0eq'],
   ['saved cursor and pen', '\x1b[3;5H\x1b[31m\x1b7\x1b[H\x1b[0mhome', '\x1b8X'],
   ['saved charset', '\x1b(0\x1b[2;2H\x1b7\x1b(B\x1b[H', '\x1b8q'],
+  ['tab stops', '\x1b[3g\x1b[5G\x1bH\x1b[12G\x1bH\r', '\tA\tB\tC'],
 ];
 
-test('B: charsets and the saved cursor carry into xterm.js', async () => {
+test('B: charsets, the saved cursor and tab stops carry into xterm.js', async () => {
   if (ORACLE) return assert.fail(ORACLE);
   for (const [name, input, tail] of CARRIED) {
     const c = { cols: 20, rows: 6, scrollback: 100, input: [input], tail, bytes: new TextEncoder().encode(input).length };

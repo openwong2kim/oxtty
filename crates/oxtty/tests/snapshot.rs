@@ -486,11 +486,12 @@ fn charsets_are_carried() {
     let follow = b"q\x0fq\x0eq\x1b[?1049lq";
     for input in [
         &b"qq\x1b(0"[..],
+        b"\x1b)0\x0e",
         b"\x1b(0\x1b)0\x0e\x0f",
         // The edge cell a pending wrap rewrites is printed before the charsets come back.
         b"qqqqqqqqqqqqqqqqqqqq\x1b(0",
-        // Each screen's cursor has its own charsets.
-        b"\x1b(0\x1b[?1049hq\x1b(B\x1b)0q",
+        // Each screen's cursor has its own charsets; the shift is shared.
+        b"\x1b(0\x1b[?1049hq\x1b(B\x1b)0\x0eq",
     ] {
         carries(input, follow);
     }
@@ -507,6 +508,18 @@ fn saved_cursor_is_carried() {
         // The alternate screen's own saved cursor, while on it and after leaving it.
         b"\x1b[2;2H\x1b7\x1b[3;3H\x1b[?1049h\x1b[4;4H\x1b[32m\x1b7\x1b[Halt",
         b"\x1b[?1049h\x1b[4;6H\x1b[44m\x1b7\x1b[?1049l\x1b[2;2Hmain",
+    ] {
+        carries(input, follow);
+    }
+}
+
+#[test]
+fn tab_stops_are_carried() {
+    let follow = b"\r\tA\tB\tC\x1b[?1049h\tD";
+    for input in [
+        &b"\x1b[3g\x1b[5G\x1bH\x1b[12G\x1bH\r"[..],
+        b"\x1b[9G\x1b[g\x1b[3G\x1bH\x1b[2;7H",
+        b"\x1b[3g",
     ] {
         carries(input, follow);
     }

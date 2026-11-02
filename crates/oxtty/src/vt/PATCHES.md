@@ -15,6 +15,8 @@ single crate.
 - `mod.rs` registers that module; `term/mod.rs` uses its width lookup for
   character input and exposes read-only `inactive_grid()` and
   `scroll_region()` for snapshot replay.
+- `term/mod.rs` also exposes read-only `active_charset()` and `tab_stops()`
+  for snapshot replay.
 - Cursor-paragraph resize (xterm.js `reflowCursorLine: false`) is an option:
   `term::Config::reflow_cursor_line` (default `true`, upstream behaviour) sets
   `Grid::set_keep_cursor_paragraph`. When kept, `grid/resize.rs` leaves the

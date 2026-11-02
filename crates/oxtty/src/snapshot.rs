@@ -59,7 +59,7 @@ pub struct SnapshotOptions {
     /// Keep only the newest this many history lines (`Some(0)`: the screen alone); `None` keeps them all.
     pub scrollback: Option<usize>,
     /// Leave out the modes (cursor keys, keypad, mouse, focus reports, bracketed paste, insert, origin, autowrap
-    /// off, cursor visibility), the state (charsets, saved cursors, cursor shape) and what continues the
+    /// off, cursor visibility), the state (charsets, saved cursors, tab stops, cursor shape) and what continues the
     /// output (the unfinished sequence at the end, a synchronized update in progress), so the bytes only paint the
     /// screen. Scroll margins are then not refused.
     pub exclude_modes: bool,
@@ -430,6 +430,20 @@ fn save(out: &mut String, saved: &Cursor<Cell>) {
     }
 }
 
+/// Clears the tab stops and sets them again, when they are not the default ones every 8 columns. Moves the cursor.
+fn tab_stops<T>(out: &mut String, term: &Term<T>) {
+    if term
+        .tab_stops()
+        .eq((0..term.columns()).step_by(8).map(Column))
+    {
+        return;
+    }
+    out.push_str("\x1b[3g");
+    for column in term.tab_stops() {
+        let _ = write!(out, "\x1b[{}G\x1bH", column.0 + 1);
+    }
+}
+
 /// A blank that was erased or never written, with at most a background: xterm.js holds nothing there, so it is not
 /// printed (a printed space would be text). A blank with more attributes is printed, as an erase keeps only the
 /// background.
@@ -690,6 +704,7 @@ fn serialize<T: EventListener>(
         cursor(&mut out, term.grid());
         return Ok(out);
     }
+    tab_stops(&mut out, term);
     save(&mut out, &term.grid().saved_cursor);
     // Turning on DECOM sends the cursor home, so emit it before CUP (margins are rejected, so CUP is relative to the whole screen).
     if modes.contains(TermMode::ORIGIN) {
@@ -698,6 +713,10 @@ fn serialize<T: EventListener>(
     cursor(&mut out, term.grid());
     // After the cursor, whose pending wrap may print the edge cell again.
     designate(&mut out, &term.grid().cursor.charsets, false);
+    // The shift is shared by both screens.
+    if term.active_charset() == CharsetIndex::G1 {
+        out.push('\x0e');
+    }
     if term.cursor_style_set() {
         let style = term.cursor_style();
         let shape = match style.shape {
