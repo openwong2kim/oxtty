@@ -36,6 +36,8 @@ use core::mem::MaybeUninit;
 use core::str;
 
 mod params;
+#[cfg(target_arch = "aarch64")]
+mod scan;
 
 pub mod ansi;
 pub use params::{Params, ParamsIter};
@@ -580,75 +582,94 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// Advance the parser state from ground.
     ///
     /// The ground state is handled separately since it can only be left using
-    /// the escape character (`\x1b`). This allows more efficient parsing by
-    /// using SIMD search with [`memchr`].
+    /// the escape character (`\x1b`).
+    ///
+    /// oxtty: `ground_dispatch` stops at ESC, so the text is read once, and a whole CSI after it is dispatched by
+    /// `csi_fast` without leaving ground.
     #[inline]
     fn advance_ground<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
-        // Find the next escape character.
         let num_bytes = bytes.len();
-        let plain_chars = memchr::memchr(0x1B, bytes).unwrap_or(num_bytes);
+        let mut i = 0;
+        loop {
+            i += Self::ground_dispatch(performer, &bytes[i..]);
+            if i == num_bytes {
+                return i;
+            }
 
-        // If the next character is ESC, just process it and short-circuit.
-        if plain_chars == 0 {
-            self.state = State::Escape;
-            self.reset_params();
-            return 1;
-        }
-
-        // oxtty: `ground_dispatch` validates as it dispatches; the error is read only where the bytes are not
-        // valid UTF-8.
-        let valid_bytes = Self::ground_dispatch(performer, &bytes[..plain_chars]);
-        match str::from_utf8(&bytes[valid_bytes..plain_chars]) {
-            Ok(_) => {
-                let mut processed = plain_chars;
-
-                // If there's another character, it must be escape so process it directly.
-                if processed < num_bytes {
-                    self.state = State::Escape;
-                    self.reset_params();
-                    processed += 1;
+            if bytes[i] == 0x1B {
+                if let Some(len) = self.csi_fast(performer, &bytes[i + 1..]) {
+                    i += 1 + len;
+                    if performer.terminated() {
+                        return i;
+                    }
+                    continue;
                 }
+                self.state = State::Escape;
+                self.reset_params();
+                return i + 1;
+            }
 
-                processed
-            },
-            // Handle invalid and partial utf8.
-            Err(err) => {
-                match err.error_len() {
-                    Some(len) => {
-                        // Execute C1 escapes or emit replacement character.
-                        if len == 1 && bytes[valid_bytes] <= 0x9F {
-                            performer.execute(bytes[valid_bytes]);
-                        } else {
-                            performer.print('�');
-                        }
+            // Handle invalid and partial utf8: the first character is at most 4 bytes, cut off by ESC as before.
+            let window = &bytes[i..num_bytes.min(i + 4)];
+            let end = i + memchr::memchr(0x1B, window).unwrap_or(window.len());
+            let Err(err) = str::from_utf8(&bytes[i..end]) else { unreachable!() };
+            match err.error_len() {
+                Some(len) => {
+                    // Execute C1 escapes or emit replacement character.
+                    if len == 1 && bytes[i] <= 0x9F {
+                        performer.execute(bytes[i]);
+                    } else {
+                        performer.print('�');
+                    }
 
-                        // Restart processing after the invalid bytes.
-                        //
-                        // While we could theoretically try to just re-parse
-                        // `bytes[valid_bytes + len..plain_chars]`, it's easier
-                        // to just skip it and invalid utf8 is pretty rare anyway.
-                        valid_bytes + len
-                    },
-                    None => {
-                        if plain_chars < num_bytes {
-                            // Process bytes cut off by escape.
-                            performer.print('�');
-                            self.state = State::Escape;
-                            self.reset_params();
-                            plain_chars + 1
-                        } else {
-                            // Process bytes cut off by the buffer end.
-                            let extra_bytes = num_bytes - valid_bytes;
-                            let partial_len = self.partial_utf8_len + extra_bytes;
-                            self.partial_utf8[self.partial_utf8_len..partial_len]
-                                .copy_from_slice(&bytes[valid_bytes..valid_bytes + extra_bytes]);
-                            self.partial_utf8_len = partial_len;
-                            num_bytes
-                        }
-                    },
-                }
-            },
+                    // Restart processing after the invalid bytes.
+                    i += len;
+                },
+                None => {
+                    if end < num_bytes {
+                        // Process bytes cut off by escape.
+                        performer.print('�');
+                        self.state = State::Escape;
+                        self.reset_params();
+                        return end + 1;
+                    }
+                    // Process bytes cut off by the buffer end.
+                    let extra_bytes = num_bytes - i;
+                    let partial_len = self.partial_utf8_len + extra_bytes;
+                    self.partial_utf8[self.partial_utf8_len..partial_len].copy_from_slice(&bytes[i..]);
+                    self.partial_utf8_len = partial_len;
+                    return num_bytes;
+                },
+            }
         }
+    }
+
+    /// oxtty: dispatches the CSI `bytes` starts with (after its ESC) as the state machine would byte by byte, and
+    /// returns its length. `None` where it is cut off or holds anything but a private marker, parameters,
+    /// intermediates and a final byte, or fills the parameters; then nothing was dispatched and the state machine
+    /// takes it from the ESC.
+    #[inline]
+    fn csi_fast<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> Option<usize> {
+        if bytes.first() != Some(&b'[') {
+            return None;
+        }
+        self.reset_params();
+        let mut i = 1;
+        if let Some(&byte @ 0x3C..=0x3F) = bytes.get(i) {
+            self.action_collect(byte);
+            i += 1;
+        }
+        i = self.params.parse(bytes, i)?;
+        while let byte @ 0x20..=0x2F = *bytes.get(i)? {
+            if self.intermediate_idx == MAX_INTERMEDIATES {
+                return None;
+            }
+            self.action_collect(byte);
+            i += 1;
+        }
+        let byte @ 0x40..=0x7E = *bytes.get(i)? else { return None };
+        performer.csi_dispatch(self.params(), self.intermediates(), false, byte as char);
+        Some(i + 1)
     }
 
     /// Advance the parser while processing a partial utf8 codepoint.
@@ -684,7 +705,8 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                     performer.print(c);
 
                     self.partial_utf8_len = 0;
-                    return valid_bytes - old_bytes;
+                    // oxtty: only the first character is taken; the valid ones after it are parsed again.
+                    return c.len_utf8() - old_bytes;
                 }
 
                 match err.error_len() {
@@ -705,8 +727,9 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
     /// Handle ground dispatch of print/execute for all characters in a string.
     ///
-    /// oxtty: dispatches the longest valid UTF-8 prefix of `bytes` and returns its length. The characters
-    /// between controls go to `print_str` together; C1 controls are U+0080..U+009F (0xC2 0x80..0x9F).
+    /// oxtty: dispatches the longest valid UTF-8 prefix of `bytes` before any ESC and returns its length. The
+    /// characters between controls go to `print_str` together; C1 controls are U+0080..U+009F (0xC2 0x80..0x9F).
+    /// Printable ASCII stays in this loop; other text goes to `text_end`.
     #[inline]
     fn ground_dispatch<P: Perform>(performer: &mut P, bytes: &[u8]) -> usize {
         let (mut start, mut i) = (0, 0);
@@ -716,36 +739,79 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 performer.print_str(unsafe { str::from_utf8_unchecked(&bytes[start..end]) });
             }
         };
-        while i < bytes.len() {
-            let byte = bytes[i];
-            if (0x20..0x80).contains(&byte) {
-                i += 1;
-                continue;
+        loop {
+            // Printable ASCII, eight bytes at a time first.
+            while let Some(word) = bytes.get(i..i + 8) {
+                if !printable_ascii(u64::from_le_bytes(word.try_into().unwrap())) {
+                    break;
+                }
+                i += 8;
             }
-            // Three bytes (most of CJK and Hangul) without the general checks.
-            if let (0xe1..=0xef, Some(&[b1, b2])) = (byte, bytes.get(i + 1..i + 3)) {
-                let last = if byte == 0xed { 0x9f } else { 0xbf };
-                if (0x80..=last).contains(&b1) && b2 & 0xc0 == 0x80 {
-                    i += 3;
+            while bytes.get(i).is_some_and(|byte| (0x20..0x80).contains(byte)) {
+                i += 1;
+            }
+            let Some(&byte) = bytes.get(i) else { break };
+            let len = if byte < 0x20 {
+                if byte == 0x1b {
+                    break;
+                }
+                1
+            } else {
+                let end = text_end(bytes, i);
+                if end > i {
+                    i = end;
                     continue;
                 }
-            }
-            let Some(len) = utf8_len(&bytes[i..]) else { break };
-            let control = match byte {
-                0x00..=0x1f => Some(byte),
-                0xc2 => Some(bytes[i + 1]).filter(|b| *b <= 0x9f),
-                _ => None,
+                match bytes.get(i + 1) {
+                    Some(0x80..=0x9f) if byte == 0xc2 => 2,
+                    _ => break,
+                }
             };
-            if let Some(control) = control {
-                flush(performer, start, i);
-                performer.execute(control);
-                start = i + len;
-            }
+            flush(performer, start, i);
+            performer.execute(bytes[i + len - 1]);
             i += len;
+            start = i;
         }
         flush(performer, start, i);
         i
     }
+}
+
+/// oxtty: whether the eight bytes of `word` are all printable ASCII (0x20..0x7F). Adding 0x60 sets the high bit
+/// of a byte from 0x20 on and carries out of none below 0x80.
+#[inline(always)]
+fn printable_ascii(word: u64) -> bool {
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    word.wrapping_add(0x6060_6060_6060_6060) & !word & HIGH == HIGH
+}
+
+/// oxtty: where the text from `i` on stops being valid UTF-8 without controls: at a C0 or C1 control, or at the
+/// first character that is not valid or not complete. With NEON, 16 bytes at a time first.
+#[inline]
+fn text_end(bytes: &[u8], mut i: usize) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    if bytes.len() - i >= 16 {
+        i = scan::printable(bytes, i).0;
+    }
+    while let Some(&byte) = bytes.get(i) {
+        if (0x20..0x80).contains(&byte) {
+            i += 1;
+            continue;
+        }
+        // Three bytes (most of CJK and Hangul) without the general checks.
+        if let (0xe1..=0xef, Some(&[b1, b2])) = (byte, bytes.get(i + 1..i + 3)) {
+            let last = if byte == 0xed { 0x9f } else { 0xbf };
+            if (0x80..=last).contains(&b1) && b2 & 0xc0 == 0x80 {
+                i += 3;
+                continue;
+            }
+        }
+        match utf8_len(&bytes[i..]) {
+            Some(len) if byte >= 0x80 && !(byte == 0xc2 && bytes[i + 1] <= 0x9f) => i += len,
+            _ => break,
+        }
+    }
+    i
 }
 
 /// oxtty: the length of the UTF-8 character `bytes` starts with, or `None` where it is not valid or not complete
@@ -1514,6 +1580,115 @@ mod tests {
         assert_eq!(dispatcher.dispatched[8], Sequence::Execute(158));
         assert_eq!(dispatcher.dispatched[9], Sequence::Execute(159));
         assert_eq!(dispatcher.dispatched[10], Sequence::Print('a'));
+    }
+
+    /// Every action as text, with the empty sub-parameters, for comparing two runs.
+    #[derive(Default)]
+    struct Recorder(Vec<String>);
+
+    impl Perform for Recorder {
+        fn print(&mut self, c: char) {
+            // A C1 control split across `advance` calls is printed, not executed: as one.
+            if ('\u{80}'..='\u{9f}').contains(&c) {
+                return self.execute(c as u8);
+            }
+            self.0.push(format!("print {c:?}"));
+        }
+
+        fn execute(&mut self, byte: u8) {
+            self.0.push(format!("execute {byte:02x}"));
+        }
+
+        fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, c: char) {
+            let empty: Vec<bool> = (0..params.len()).map(|i| params.is_empty_subparam(i)).collect();
+            self.0.push(format!("csi {params:?} {empty:?} {intermediates:?} {ignore} {c:?}"));
+        }
+
+        fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+            self.0.push(format!("esc {intermediates:?} {ignore} {byte:02x}"));
+        }
+
+        fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, c: char) {
+            self.0.push(format!("hook {params:?} {intermediates:?} {ignore} {c:?}"));
+        }
+
+        fn put(&mut self, byte: u8) {
+            self.0.push(format!("put {byte:02x}"));
+        }
+
+        fn unhook(&mut self) {
+            self.0.push("unhook".into());
+        }
+
+        fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+            self.0.push(format!("osc {params:?} {bell_terminated}"));
+        }
+    }
+
+    /// Random input of the bytes the fast paths branch on: text in every UTF-8 length, broken UTF-8, C0 and C1
+    /// controls, and CSI, ESC, OSC and DCS sequences whole, cut off or overlong.
+    fn random_input(seed: &mut u64, len: usize) -> Vec<u8> {
+        let mut next = move || {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        };
+        let pieces: [&[u8]; 39] = [
+            b"a", b"hello world ", b"0123456789abcdef", "가".as_bytes(), "漢字".as_bytes(), "é".as_bytes(),
+            "😀".as_bytes(), "\u{a0}".as_bytes(), "\u{fffd}".as_bytes(), b"\xc2\x9b", b"\x80", b"\xe4\xb8",
+            b"\xf0\x9f", b"\xed\xa0\x80", b"\xff", b"\xc0\xaf", b"\r\n", b"\t", b"\x07", b"\x18", b"\x7f",
+            b"\x1b", b"\x1b[", b"\x1b[38;2;12;34;56;48;2;7;8;9m", b"\x1b[1;1H", b"\x1b[?25h", b"\x1b[4:3m",
+            b"\x1b[38::2:1:2:3m", b"\x1b[;4:;m", b"\x1b[?1$p", b"\x1b[>4;2m", b"\x1b[1 2q", b"\x1b[0m",
+            b"\x1b[ q", b"\x1b(B", b"\x1b]0;title\x07", b"\x1bP1$qm\x1b\\", b";", b":",
+        ];
+        let mut out = Vec::new();
+        while out.len() < len {
+            match next() % 8 {
+                // A random byte.
+                0 => out.push(next() as u8),
+                // A long parameter list or parameter, which fills or saturates.
+                1 if next() % 8 == 0 => {
+                    out.extend_from_slice(b"\x1b[");
+                    for _ in 0..next() % 40 {
+                        out.extend_from_slice(if next() % 2 == 0 { b"1;" } else { b"99999:" });
+                    }
+                    out.push(b'm');
+                },
+                _ => out.extend_from_slice(pieces[next() as usize % pieces.len()]),
+            }
+        }
+        out
+    }
+
+    fn record(chunks: impl Iterator<Item = Vec<u8>>) -> Vec<String> {
+        let mut recorder = Recorder::default();
+        let mut parser = Parser::new();
+        for chunk in chunks {
+            parser.advance(&mut recorder, &chunk);
+        }
+        recorder.0
+    }
+
+    #[test]
+    fn chunked_input_matches_byte_by_byte() {
+        // One byte at a time, nothing is whole: the state machine and the byte-at-a-time UTF-8 path take all of it.
+        let mut seed = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..2000 {
+            let len = 1 + seed as usize % 300;
+            let input = random_input(&mut seed, len);
+            let expected = record(input.iter().map(|&b| vec![b]));
+            assert_eq!(record(std::iter::once(input.clone())), expected, "{input:02x?}");
+            let mut rest = input.as_slice();
+            let mut chunks = Vec::new();
+            while !rest.is_empty() {
+                let (chunk, tail) = rest.split_at((1 + seed as usize % 37).min(rest.len()));
+                seed = seed.rotate_left(7) ^ 0x5bd1_e995;
+                chunks.push(chunk.to_vec());
+                rest = tail;
+            }
+            assert_eq!(record(chunks.into_iter()), expected, "{input:02x?}");
+        }
     }
 
     #[test]

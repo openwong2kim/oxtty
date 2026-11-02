@@ -389,9 +389,10 @@ impl<'a, H: Handler + 'a> Performer<'a, H> {
         Performer { state, handler, terminated: Default::default() }
     }
 
-    /// Whether parsing stops at a sequence of `kind` with `id` (oxtty).
+    /// Whether parsing stops at a sequence of `kind` with `id` (oxtty). Without hooks no hash is computed.
+    #[inline]
     fn hooked(&self, kind: HookKind, id: u32) -> bool {
-        !self.state.hook_default && self.state.hooks.contains(&(kind, id))
+        !self.state.hooks.is_empty() && !self.state.hook_default && self.state.hooks.contains(&(kind, id))
     }
 
     /// Keeps `hook` as the pending one and stops parsing after the current byte (oxtty).
@@ -1972,7 +1973,7 @@ fn handle_colon_rgb(params: &[u16]) -> Option<Color> {
 }
 
 /// Parse a color specifier from list of attributes.
-fn parse_sgr_color(params: &mut dyn Iterator<Item = u16>) -> Option<Color> {
+fn parse_sgr_color(params: &mut impl Iterator<Item = u16>) -> Option<Color> {
     match params.next() {
         Some(2) => Some(Color::Spec(Rgb {
             r: u8::try_from(params.next()?).ok()?,

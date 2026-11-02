@@ -284,3 +284,30 @@ Same results as upstream, in less time:
   emoticon (U+1F5FB–U+1F64F) and transport (U+1F680–U+1F6C5) emoji, which
   the table gives two cells; `scroll_up_relative` and
   `scroll_down_relative` touch the selection only when there is one.
+
+## Parser fast paths
+
+The ground state and CSI parsing take shortcuts with the same actions as
+upstream's byte-at-a-time state machine (checked against it by feeding the
+same input one byte at a time, `vte/mod.rs` `chunked_input_matches_byte_by_byte`).
+
+- `vte/mod.rs`: `advance_ground` no longer searches for ESC first;
+  `ground_dispatch` stops at it, so the text is read once. Printable ASCII is
+  skipped eight bytes at a time (`printable_ascii`), other text goes to
+  `text_end`, which on aarch64 first checks 16 bytes at a time with NEON
+  (`vte/scan.rs`: UTF-8 by Keiser and Lemire's lookup algorithm, as simdjson
+  and simdutf do, plus C0 and C1 controls). Other targets, WebAssembly among
+  them, use the scalar path.
+- A whole CSI after ESC (private marker, parameters, intermediates, final byte,
+  all within the bytes given) is dispatched by `csi_fast` without leaving
+  ground; `Params::parse` (`vte/params.rs`) finds the separators of a list
+  longer than eight bytes a word at a time (`classify`), then reads each
+  parameter's digits from a word at once (`word_value`). Anything else — a
+  control or DEL inside, a cut-off sequence, a full parameter list, too many
+  intermediates — goes through the state machine from the ESC as before.
+- `advance_partial_utf8` took the bytes of every valid character after the
+  first one it completed but printed only the first, dropping the others (an
+  ASCII byte after a split `é` was lost when an incomplete character followed
+  within four bytes); it now takes only the first character's bytes.
+- `vte/ansi.rs`: `parse_sgr_color` is generic over its iterator instead of
+  `dyn`, and `Performer::hooked` skips the hash lookup while no hook is set.
