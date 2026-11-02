@@ -11,50 +11,13 @@
 // Then the idle phase, once with `cursorBlink` on and once off: the first terminal takes focus, and after
 // IDLE_MS the GPU process's physical footprint is read (macOS `footprint`; RSS misses memory Chromium marks
 // purgeable once nothing redraws) along with the WebGL draw calls and canvas `drawImage` calls of that window.
-import { chromium } from 'playwright-core';
-import { createServer } from 'node:http';
-import { readFile } from 'node:fs/promises';
-import { execFileSync } from 'node:child_process';
-import { dirname, extname, join, normalize } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { footprint, launch, mb, rss, serve } from './common.mjs';
 
-const here = dirname(fileURLToPath(import.meta.url));
-const root = join(here, '..', '..');
 const [panes = 17, lines = 10000] = process.argv.slice(2).map(Number);
 /** How long the focused terminal idles before the GPU process is read; the first second settles the focus. */
 const SETTLE_MS = 1000;
 const IDLE_MS = 10000;
-const TYPES = { '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm', '.css': 'text/css' };
-const IMPORTS = {
-  'oxtty/xterm': '/dist/xterm.js',
-  '@xterm/xterm': '/node_modules/@xterm/xterm/lib/xterm.mjs',
-  '@xterm/addon-webgl': '/node_modules/@xterm/addon-webgl/lib/addon-webgl.mjs',
-};
-const html = `<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,">
-<link rel="stylesheet" href="/node_modules/@xterm/xterm/css/xterm.css">
-<script type="importmap">${JSON.stringify({ imports: IMPORTS })}</script>
-<body style="margin:0"><script type="module" src="/bench/memory/page.mjs"></script>`;
-
-const server = createServer(async (req, res) => {
-  const path = normalize(new URL(req.url, 'http://x').pathname);
-  if (path === '/') return res.writeHead(200, { 'content-type': 'text/html' }).end(html);
-  if (path.includes('..')) return res.writeHead(404).end();
-  try {
-    const body = await readFile(join(root, path));
-    res.writeHead(200, { 'content-type': TYPES[extname(path)] ?? 'application/octet-stream' }).end(body);
-  } catch {
-    res.writeHead(404).end();
-  }
-});
-await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-
-function rss(pid) {
-  try {
-    return Number(execFileSync('ps', ['-o', 'rss=', '-p', String(pid)]).toString().trim()) * 1024;
-  } catch {
-    return 0;
-  }
-}
+const server = await serve();
 
 /** Resident bytes per Chrome process type ('renderer', 'GPU', ...). */
 async function byType(cdp) {
@@ -64,22 +27,12 @@ async function byType(cdp) {
 }
 const gpuOf = (sums) => sums.GPU ?? sums.gpu ?? 0;
 
-/** Physical footprint in bytes (macOS `footprint`), 0 where it is missing. */
-function footprint(pid) {
-  try {
-    const m = /Footprint: ([\d.]+) (KB|MB|GB)/.exec(execFileSync('footprint', ['-p', String(pid)]).toString());
-    return m ? Number(m[1]) * { KB: 1024, MB: 1048576, GB: 1073741824 }[m[2]] : 0;
-  } catch {
-    return 0;
-  }
-}
-
 async function gpuPid(cdp) {
   return (await cdp.send('SystemInfo.getProcessInfo')).processInfo.find((p) => /^gpu$/i.test(p.type))?.id;
 }
 
 async function measure(kind, blink) {
-  const browser = await chromium.launch({ channel: 'chrome', headless: true, args: ['--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist'] });
+  const browser = await launch();
   try {
     const page = await browser.newPage({ viewport: { width: 4500, height: 4500 } });
     const errors = [];
@@ -121,7 +74,6 @@ async function measure(kind, blink) {
   }
 }
 
-const mb = (b) => (b / 1048576).toFixed(0);
 console.log(`${panes} panes of 120×40, ${lines} lines each`);
 try {
   const idle = [];

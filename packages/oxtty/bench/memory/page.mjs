@@ -1,6 +1,8 @@
 // The page bench.mjs opens: `setup(kind, n, cols, rows, lines, blink)` builds `n` terminals of one kind ('oxtty' or
 // 'xterm' with @xterm/addon-webgl), all in view, feeds each the same log output and waits a few frames. `idle()`
 // focuses the first terminal; `counts()` reports the WebGL draw calls and canvas `drawImage` calls since its last call.
+// `breakdown()` reports the WebAssembly memories and canvas backing stores (for breakdown.mjs); `hide(hidden)` and
+// `dispose()` take the terminals out of view and dispose of them.
 import { Terminal as XtermTerminal } from '@xterm/xterm';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { init, Terminal } from 'oxtty/xterm';
@@ -43,6 +45,46 @@ for (const proto of [CanvasRenderingContext2D.prototype, OffscreenCanvasRenderin
   };
 }
 
+// Every WebAssembly memory the page instantiates, and every canvas it makes, to report their sizes
+const memories = [];
+function recordInstance(instance) {
+  const memory = instance?.exports?.memory;
+  if (memory instanceof WebAssembly.Memory && !memories.some((m) => m.memory === memory)) {
+    memories.push({ name: 'oxtty_out_ptr' in instance.exports ? 'engine' : 'front end', memory });
+  }
+}
+for (const key of ['instantiate', 'instantiateStreaming']) {
+  const original = WebAssembly[key];
+  WebAssembly[key] = async function (...args) {
+    const result = await original.apply(this, args);
+    recordInstance(result.instance ?? result);
+    return result;
+  };
+}
+WebAssembly.Instance = new Proxy(WebAssembly.Instance, {
+  construct(target, args) {
+    const instance = Reflect.construct(target, args);
+    recordInstance(instance);
+    return instance;
+  },
+});
+const canvases = [];
+const createElement = Document.prototype.createElement;
+Document.prototype.createElement = function (name, ...rest) {
+  const element = createElement.call(this, name, ...rest);
+  if (String(name).toLowerCase() === 'canvas') canvases.push(new WeakRef(element));
+  return element;
+};
+const Offscreen = globalThis.OffscreenCanvas;
+if (Offscreen) {
+  globalThis.OffscreenCanvas = class extends Offscreen {
+    constructor(...args) {
+      super(...args);
+      canvases.push(new WeakRef(this));
+    }
+  };
+}
+
 const frames = (n) =>
   new Promise((resolve) => {
     const next = () => (n-- > 0 ? requestAnimationFrame(next) : resolve());
@@ -77,6 +119,27 @@ window.counts = () => {
   const out = { ...counts };
   counts.gl = counts.drawImage = 0;
   return out;
+};
+
+window.breakdown = () => {
+  const canvas = { attached: 0, attachedCount: 0, detached: 0, detachedCount: 0, offscreen: 0, offscreenCount: 0 };
+  for (const ref of canvases) {
+    const c = ref.deref();
+    if (!c || c.width * c.height === 0) continue;
+    const kind = Offscreen && c instanceof Offscreen ? 'offscreen' : c.isConnected ? 'attached' : 'detached';
+    canvas[kind] += c.width * c.height * 4;
+    canvas[`${kind}Count`]++;
+  }
+  return { wasm: memories.map((m) => ({ name: m.name, bytes: m.memory.buffer.byteLength })), canvas };
+};
+window.hide = async (hidden) => {
+  for (const term of window.terms) term.element.parentElement.style.display = hidden ? 'none' : 'inline-block';
+  await frames(10);
+};
+window.dispose = async () => {
+  for (const term of window.terms) term.dispose();
+  window.terms = [];
+  await frames(10);
 };
 
 await init();

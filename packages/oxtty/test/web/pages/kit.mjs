@@ -4,8 +4,9 @@ import { Terminal } from 'oxtty/xterm';
 
 export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** The pixels of a canvas, copied through a 2D canvas (call in the frame that drew it). */
+/** The pixels of a canvas, copied through a 2D canvas (call in the frame that drew it); none while it has no size. */
 export function read(canvas) {
+  if (!canvas.width || !canvas.height) return new Uint8ClampedArray(0);
   const copy = document.createElement('canvas');
   copy.width = canvas.width;
   copy.height = canvas.height;
