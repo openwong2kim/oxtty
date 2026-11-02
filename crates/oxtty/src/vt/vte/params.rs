@@ -76,6 +76,18 @@ impl Params {
         }
     }
 
+    /// The first two parameters, 0 where absent, when there are at most two and neither has sub-parameters
+    /// (oxtty): what [`Params::iter`] would give, without it.
+    #[inline]
+    pub(crate) fn two(&self) -> Option<[u16; 2]> {
+        match self.len {
+            0 => Some([0, 0]),
+            1 if self.subparams[0] == 1 => Some([self.params[0], 0]),
+            2 if self.subparams[0] == 1 && self.subparams[1] == 1 => Some([self.params[0], self.params[1]]),
+            _ => None,
+        }
+    }
+
     /// Parses the parameters of a CSI at `bytes[i..]` into the cleared list, as the parser would one byte at a
     /// time, and returns where the first byte that is not a digit, `:` or `;` is (oxtty). `None` where the bytes end
     /// first or the parameters would fill the list, whose handling the parser keeps.
