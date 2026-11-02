@@ -76,6 +76,36 @@ impl Params {
         }
     }
 
+    /// Parses the parameters of a CSI at `bytes[i..]` into the cleared list, as the parser would one byte at a
+    /// time, and returns where the first byte that is not a digit, `:` or `;` is (oxtty). `None` where the bytes end
+    /// first or the parameters would fill the list, whose handling the parser keeps.
+    #[inline(always)]
+    pub(crate) fn parse(&mut self, bytes: &[u8], mut i: usize) -> Option<usize> {
+        let (mut len, mut current, mut empty) = (0, 0, 0);
+        loop {
+            if len >= MAX_PARAMS - 1 {
+                return None;
+            }
+            let (param, digits) = csi_param(bytes, i);
+            i += digits;
+            let byte = *bytes.get(i)?;
+            if digits == 0 && current > 0 {
+                empty |= 1 << len;
+            }
+            self.subparams[len - current] = current as u8 + 1;
+            self.params[len] = param;
+            len += 1;
+            match byte {
+                b':' => current += 1,
+                b';' => current = 0,
+                _ => break,
+            }
+            i += 1;
+        }
+        (self.len, self.current_subparams, self.empty) = (len, 0, empty);
+        Some(i)
+    }
+
     /// Add an additional parameter.
     #[inline]
     pub(crate) fn push(&mut self, item: u16) {
@@ -160,4 +190,36 @@ impl Debug for Params {
 
         write!(f, "]")
     }
+}
+
+/// oxtty: the CSI parameter of the digits at `bytes[i..]` and how many there are. As the state machine adds one
+/// digit at a time saturating at `u16::MAX`, it is the number up to that. Up to seven digits are read from a word
+/// at once, without a branch for each.
+#[inline(always)]
+pub(super) fn csi_param(bytes: &[u8], i: usize) -> (u16, usize) {
+    const ZEROS: u64 = 0x3030_3030_3030_3030;
+    if let Some(word) = bytes.get(i..i + 8) {
+        let word = u64::from_le_bytes(word.try_into().unwrap());
+        // The high bit of a byte below '0' or above '9'. Carries and borrows only reach the bytes after it.
+        let other = (word.wrapping_add(0x4646_4646_4646_4646) | word.wrapping_sub(ZEROS)) & 0x8080_8080_8080_8080;
+        let len = other.trailing_zeros() as usize / 8;
+        if len == 0 {
+            return (0, 0);
+        }
+        if len < 8 {
+            // The digits as values, the first one the most significant, moved up so the bytes after them drop out
+            // and zeros lead; then pairs, quads and all eight are joined.
+            let digits = word.wrapping_sub(ZEROS) << (8 * (8 - len));
+            let pairs = (digits * 10 + (digits >> 8)) & 0x00FF_00FF_00FF_00FF;
+            let quads = (pairs * 100 + (pairs >> 16)) & 0x0000_FFFF_0000_FFFF;
+            let value = (quads * 10000 + (quads >> 32)) & 0xFFFF_FFFF;
+            return (value.min(u16::MAX as u64) as u16, len);
+        }
+    }
+    let (mut param, mut len) = (0u16, 0);
+    while let Some(&byte @ b'0'..=b'9') = bytes.get(i + len) {
+        param = param.saturating_mul(10).saturating_add((byte - b'0') as u16);
+        len += 1;
+    }
+    (param, len)
 }
