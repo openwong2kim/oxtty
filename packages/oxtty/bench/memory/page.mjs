@@ -161,26 +161,57 @@ window.breakdown = () => {
   }
   return { wasm: memories.map((m) => ({ name: m.name, bytes: m.memory.buffer.byteLength })), canvas };
 };
-// Busy: every terminal gets a few lines of output every `interval` ms, as agents printing; frames are counted
-let busyTimer = null;
+// Busy: every terminal gets a few lines of output every `interval` ms, as agents printing; frames are counted.
+// With `typing`, the first terminal takes focus and gets one echoed character every 100 ms instead, and each echo's
+// latency is measured: from the write to the frame that shows it (its onRender, then the snapshot of a pane that
+// presents through `bitmaprenderer`).
+let busyTimers = [];
 let busyFrames = 0;
-window.startBusy = (interval) => {
+let echoes = [];
+async function shown(term) {
+  for (let n = 0; n < 100; n++) {
+    const debug = term._rendererDebug?.();
+    if (!debug || debug.requested === undefined || debug.presented === debug.requested) return;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+window.startBusy = (interval, typing) => {
   let seed = 1;
   busyFrames = 0;
+  echoes = [];
+  const printing = typing ? window.terms.slice(1) : window.terms;
   const frame = () => {
-    if (busyTimer === null) return;
+    if (!busyTimers.length) return;
     busyFrames++;
     requestAnimationFrame(frame);
   };
-  busyTimer = setInterval(() => {
-    for (const term of window.terms) term.write(chunk(term.cols, seed++).split('\r\n').slice(0, 3).join('\r\n') + '\r\n');
-  }, interval);
+  busyTimers.push(
+    setInterval(() => {
+      for (const term of printing) term.write(chunk(term.cols, seed++).split('\r\n').slice(0, 3).join('\r\n') + '\r\n');
+    }, interval),
+  );
+  if (typing) {
+    const typist = window.terms[0];
+    typist.focus();
+    busyTimers.push(
+      setInterval(() => {
+        const t0 = performance.now();
+        const f0 = busyFrames;
+        const once = typist.onRender(async () => {
+          once.dispose();
+          await shown(typist);
+          echoes.push([performance.now() - t0, busyFrames - f0]);
+        });
+        typist.write('x');
+      }, 100),
+    );
+  }
   requestAnimationFrame(frame);
 };
 window.stopBusy = () => {
-  clearInterval(busyTimer);
-  busyTimer = null;
-  return busyFrames;
+  for (const timer of busyTimers) clearInterval(timer);
+  busyTimers = [];
+  return { frames: busyFrames, echoes };
 };
 window.hide = async (hidden) => {
   for (const term of window.terms) term.element.parentElement.style.display = hidden ? 'none' : 'inline-block';

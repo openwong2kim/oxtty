@@ -127,7 +127,12 @@ other builds), with the renderer process for comparison:
 ```sh
 node bench/memory/busy.mjs [panes] [seconds] [dpr] [interval]   # defaults: 17 12 1 50
 MIXED=1 node bench/memory/busy.mjs                               # sizes from 92×30 to 120×40
+TYPING=1 node bench/memory/busy.mjs                              # the first pane focused, typed in, not printing
 ```
+
+With `TYPING=1` the first terminal takes focus and gets one echoed character
+every 100 ms instead of output, and the echo latency (write to the frame that
+shows it) is reported.
 
 Every terminal gets three lines of output every `interval` ms, as agents
 printing; near the end of the window the GPU process's footprint is read, and
@@ -166,3 +171,35 @@ then, xterm.js about 270 MB). Measured with probes:
   every draw of a pane of another size, kept the frame rate steady with mixed
   sizes but held about 55 MB more while busy (the copy snapshots the whole
   surface), so the surface still takes each pane's size.
+
+Two more ways to present a pane were tried and not kept (2026-11-02, Apple M4,
+17 panes, three runs; patches kept out of the tree):
+
+- **Every pane through `bitmaprenderer` fed by `createImageBitmap`** (a
+  snapshot of the shared `OffscreenCanvas`, shown a task later; no freeze on
+  context loss, the context tests passed five times in a row). Busy: +87, +121
+  and +91 MB over the empty page against xterm.js's +182 to +190. But every
+  frame reaches the screen one frame later (snapshots arrived 0.3–0.6 ms after
+  the draw, after that frame's paint), and hidden panes kept +177 to +194 MB at
+  dpr 2: Chromium frees what a `bitmaprenderer` canvas showed only when the
+  element goes (`transferFromImageBitmap(null)` and a zero size keep it).
+- **Hybrid**: the focused pane copied as before, the others through a second,
+  `bitmaprenderer` canvas, swapped without a blank frame, the bitmap canvas
+  dropped while hidden and once the pane idles. With one pane typed in: busy
+  +151, +169 and +113 MB against xterm.js's +210, +194 and +242; echo median
+  14.3–18.7 ms against 15.8–21.6 ms before. But once snapshots had been used,
+  Chromium kept about 80 MB more in the GPU process for the rest of the page's
+  life (+81 to +94 MB after every terminal was disposed, against +11 to +38
+  without them), so idle panes read +118 to +124 MB at dpr 1 (+90 to +92
+  before) and hidden ones +26 to +62 MB (+17 to +77 before).
+
+## Atlas mipmaps
+
+The atlas pages were uploaded with `generateMipmap`, rebuilt at every upload;
+glyphs are drawn at the atlas's own scale, so the pages now upload with
+`LINEAR` filtering and no mipmaps, as @xterm/addon-webgl 0.20 does. With 20
+panes printing a different truecolor in every cell at agent speed
+(`PANES=20 WORKLOADS=dense-cells MODES=agent npm run bench:speed`, 3 runs):
+oxtty 46 fps, write→frame p95 42 ms before; 58 fps, p95 29 ms after; xterm.js
+59 fps, p95 24 ms. A pane that adds glyphs every frame re-uploads the pages
+it changed; rebuilding the mipmaps of those pages was most of the gap.

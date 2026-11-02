@@ -419,6 +419,10 @@ impl Gpu {
             if *version != atlas.page_version(i) {
                 gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE as i32);
                 gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE as i32);
+                // Glyphs are drawn at the atlas's own scale: no mipmaps to rebuild at every upload (as in
+                // @xterm/addon-webgl 0.20.0-beta.329, `src/GlyphRenderer.ts` lines 410-414)
+                gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::LINEAR as i32);
+                gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::LINEAR as i32);
                 let _ = gl.tex_image_2d_with_u32_and_u32_and_html_canvas_element(
                     Gl::TEXTURE_2D,
                     0,
@@ -427,7 +431,6 @@ impl Gpu {
                     Gl::UNSIGNED_BYTE,
                     canvas,
                 );
-                gl.generate_mipmap(Gl::TEXTURE_2D);
                 *version = atlas.page_version(i);
             }
         }
