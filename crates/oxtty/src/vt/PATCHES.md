@@ -265,3 +265,22 @@ These changes are compatibility policy, not upstream behaviour.
    `crates/oxtty/Cargo.toml`, then run `cargo test -p oxtty` and the wmux checks
    (`scripts/rust-terminal-core-bench.mjs --verify-only`,
    `scripts/rust-snapshot-verify.mjs`).
+
+## Screen model speed
+
+Same results as upstream, in less time:
+
+- `grid/storage.rs`: `Storage::rotate_region` moves the rows of a scroll
+  region that does not start at the top (DECSTBM, IL, DL) in one
+  `slice::rotate` where they lie in order in the ring buffer, instead of one
+  swap per row (`Grid::scroll_up`, `Grid::scroll_down`); a region that wraps
+  around the buffer's end is still swapped row by row. The rows moved out
+  are reset either way, so their order is not kept.
+- `grid/row.rs`: `Row::reset` compares the template with the cell at `occ`
+  (all cells from there on are alike) rather than the last cell, which on a
+  long row is a cache miss of its own.
+- `term/mod.rs`: `input_ascii` checks and writes each cell in one pass;
+  `char_width` is always inlined and also skips the table search for the
+  emoticon (U+1F5FB–U+1F64F) and transport (U+1F680–U+1F6C5) emoji, which
+  the table gives two cells; `scroll_up_relative` and
+  `scroll_down_relative` touch the selection only when there is one.
