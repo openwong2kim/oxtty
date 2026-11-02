@@ -1,7 +1,7 @@
 // oxtty — terminal emulator engine (Rust → WebAssembly).
 // Works in browsers, bundlers (Vite/webpack resolve the .wasm URL) and Node ≥ 18.
 
-const ABI = 12;
+const ABI = 13;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 // Input buffer: smallest allocation, and the largest one kept between writes.
@@ -214,6 +214,7 @@ export class Terminal {
   #colors = null;
   #hooks = new Set();
   #windowsPty = null;
+  #cursorDefault = null;
   // Bytes of a write that stopped at a hook, fed by finishHook.
   #rest = null;
 
@@ -257,6 +258,7 @@ export class Terminal {
     if (this.#colors) this.setColors(this.#colors);
     this.#rest = null;
     if (this.#windowsPty) this.setWindowsPty(this.#windowsPty);
+    if (this.#cursorDefault) this.setCursorDefault(...this.#cursorDefault);
     for (const key of this.#hooks) {
       const [kind, id] = key.split(':');
       wasm.oxtty_set_hook(this.#h, HOOK_KINDS.indexOf(kind), Number(id), 1);
@@ -326,7 +328,7 @@ export class Terminal {
     const params = [];
     for (let i = 0, at = 0; i < count; i++) {
       const n = words[at];
-      params.push(Array.from(words.subarray(at + 1, at + 1 + n)));
+      params.push(Array.from(words.subarray(at + 1, at + 1 + n), (v) => v | 0));
       at += n + 1;
     }
     return { kind: HOOK_KINDS[kind], id, params, data: bytesOut(wasm.oxtty_out_len()) };
@@ -529,6 +531,12 @@ export class Terminal {
   setFocus(focused) {
     this.#focus = focused == null ? null : !!focused;
     wasm.oxtty_set_focus(this.#handle(), this.#focus === null ? -1 : this.#focus ? 1 : 0);
+  }
+
+  /** The host's cursor style (xterm.js `cursorStyle`, `cursorBlink`): `cursor()` reports it until the program sets one, and DECRQSS reports it. */
+  setCursorDefault(shape, blink) {
+    this.#cursorDefault = [shape, !!blink];
+    wasm.oxtty_set_cursor_default(this.#handle(), Math.max(0, CURSOR_SHAPES.indexOf(shape)), blink ? 1 : 0);
   }
 
   /** Viewport changes since the last call: move drawn rows up by `scroll`, then redraw `lines`. */

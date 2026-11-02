@@ -64,13 +64,20 @@ test('CSI, OSC and DCS handlers see what xterm.js handlers see and decide the de
     await write(t, '\x1b]133;A;cl=m\x07\x1b]2;hidden\x1b\\\x1b]2;shown\x07\x1b]7\x07\x1b]133;D;0\x07');
     await write(t, '\x1bP1$qm\x1b\\\x1b[2 q\x1b[3;5HZ\x1b[6n');
   });
-  // xterm.js gives an empty sub-parameter as -1; the engine as 0.
-  const sgr = xt.log.find(([k]) => k === 'sgr');
-  assert.deepEqual(sgr, ['sgr', [1, 38, [2, -1, 10, 20, 30], 4]]);
-  sgr[1][2][1] = 0;
+  // An empty sub-parameter is -1, an empty parameter 0.
+  assert.deepEqual(xt.log.find(([k]) => k === 'sgr'), ['sgr', [1, 38, [2, -1, 10, 20, 30], 4]]);
   assert.deepEqual(ox.log, xt.log);
   assert.deepEqual(ox.text, xt.text);
   assert.deepEqual(ox.cursor, xt.cursor);
+});
+
+test('term.parser is the same object on every read, as in xterm.js, also after dispose', async () => {
+  for (const t of [new m.Terminal(), new xtermHeadless.Terminal({ allowProposedApi: true })]) {
+    const p = t.parser;
+    assert.equal(t.parser, p);
+    t.dispose();
+    assert.equal(t.parser, p);
+  }
 });
 
 test('the newest handler goes first, and a disposed one no longer runs', async () => {
@@ -377,9 +384,27 @@ test('wmux: a DCS handler gets the whole payload, also split across writes', asy
     t.parser.registerDcsHandler({ intermediates: '$', final: 'q' }, (data, params) => { log.push(['decrqss', data, params]); return data === 'r'; });
     for (const chunk of ['\x1bP1$q', 'r\x1b', '\\Z\x1bP$q', 'm\x1b\\']) await write(t, chunk);
   });
-  // The engine does not answer DECRQSS (xterm.js sends `DCS 1 $ r 0 m ST` for the one not taken).
-  const handled = ({ log }) => log.filter(([k]) => k === 'decrqss');
-  assert.deepEqual(handled(ox), handled(xt));
+  assert.deepEqual(ox.log, xt.log);
   assert.deepEqual(ox.text, xt.text);
-  assert.deepEqual(ox.log.slice(0, 2), [['decrqss', 'r', [1]], ['decrqss', 'm', [0]]]);
+  // The one not taken falls through to the engine's answer.
+  assert.deepEqual(ox.log, [['decrqss', 'r', [1]], ['decrqss', 'm', [0]], ['data', '\x1bP1$r0m\x1b\\']]);
+});
+
+test('DECRQSS is answered as xterm.js answers it, the cursor style from the options', async () => {
+  const requests = ['m', 'r', ' q', '"q', '"p', 'x', '', 'mm', '$q'].map((pt) => `\x1bP$q${pt}\x1b\\`).join('');
+  const [ox, xt] = await compare({ cols: 20, rows: 6 }, async (t, log) => {
+    await write(t, requests);
+    log.push('margins, cursor options, DECSCUSR');
+    t.options.cursorStyle = 'underline';
+    t.options.cursorBlink = true;
+    await write(t, '\x1b[2;5r\x1b[1m\x1b[6 q\x1bP$qr\x1b\\\x1bP$q q\x1b\\\x1bP$qm\x1b\\');
+    t.options.cursorStyle = 'bar';
+    t.options.cursorBlink = false;
+    await write(t, '\x1bP$q q\x07\x1bP$q q\x9c\x1bP$q q\x1b[0 q\x1bP$q q\x1b\\');
+    log.push('aborted, then terminated by a 7-bit ST only');
+    await write(t, '\x1bP$qm\x18\x1bP$qr\x1a\x1bP1;2$q"p\x1b\\');
+  });
+  assert.deepEqual(ox.log, xt.log);
+  assert.deepEqual(ox.text, xt.text);
+  assert.deepEqual(ox.log.filter(([k]) => k === 'data').length, 17);
 });

@@ -28,7 +28,7 @@ export interface Cursor {
   /** Set by the program with DECSCUSR (`CSI Ps SP q`). */
   shape: 'block' | 'underline' | 'bar';
   blink: boolean;
-  /** The program chose `shape` and `blink`; when false they are defaults (block, steady) and the host's own style applies. */
+  /** The program chose `shape` and `blink`; when false they are the host's (`setCursorDefault`, block and steady by default). */
   styled: boolean;
 }
 
@@ -75,7 +75,10 @@ export interface Hook {
   kind: 'csi' | 'osc' | 'dcs';
   /** As given to `setHook`. */
   id: number;
-  /** CSI and DCS parameters, each followed by its sub-parameters (an empty parameter is 0, values stop at 65535). */
+  /**
+   * CSI and DCS parameters, each followed by its sub-parameters (an empty parameter is 0 and an empty sub-parameter
+   * -1, as in xterm.js; values stop at 65535).
+   */
   params: number[][];
   /** OSC: everything after the first `;`. DCS: the payload. */
   data: Uint8Array;
@@ -170,6 +173,11 @@ export class Terminal {
    * on focus events (`CSI ? 1004 h`); `null`, the default, sends none. Kept across a crash.
    */
   setFocus(focused: boolean | null): void;
+  /**
+   * The host's cursor style (xterm.js `cursorStyle` and `cursorBlink`; block, steady by default): `cursor()` reports it
+   * until the program sets one, and DECRQSS (`DCS $ q SP q ST`) reports it, as xterm.js does. Kept across a crash.
+   */
+  setCursorDefault(shape: 'block' | 'underline' | 'bar', blink: boolean): void;
   takeDamage(): Damage;
   /** Bytes to write back to the PTY (status reports, …). */
   takeReplies(): Uint8Array;
@@ -233,14 +241,14 @@ export class Terminal {
   /** The logical line row `line` belongs to, as search reads it, for matching the text yourself; null outside the buffer. */
   searchLine(line: number): SearchLine | null;
   /**
-   * Puts a marker on buffer line `line` of the primary screen (0 is the oldest history line, `historyLength` the top
-   * screen row) and returns its id; 0 outside the buffer or while the alternate screen is up. The marker follows its
-   * line as output scrolls it into the history and as scroll regions, IL and DL move it; it is dropped when its line
-   * leaves the scrollback or is cleared whole (ED, a line IL or DL pushed out, RIS). A resize keeps it on its logical
-   * line.
+   * Puts a marker on buffer line `line` of the screen that is up (0 is the oldest history line, `historyLength` the
+   * top screen row) and returns its id; 0 outside the buffer. The marker follows its line as output scrolls it into
+   * the history and as scroll regions, IL and DL move it; it is dropped when its line leaves the scrollback or is
+   * cleared whole (ED, a line IL or DL pushed out, RIS), and with the alternate screen when that is left. A resize
+   * keeps it on its logical line.
    */
   addMarker(line: number): number;
-  /** The marker's buffer line on the primary screen, -1 once it is gone. */
+  /** The marker's buffer line on its screen, -1 once it is gone. */
   markerLine(id: number): number;
   /** Drops a marker; it is not reported by `takeDisposedMarkers`. */
   removeMarker(id: number): void;

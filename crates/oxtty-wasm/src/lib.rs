@@ -110,7 +110,7 @@ fn set_out(bytes: Vec<u8>) -> u32 {
 /// ABI version of these exports; bump on any incompatible change.
 #[no_mangle]
 pub extern "C" fn oxtty_abi() -> u32 {
-    12
+    13
 }
 
 #[no_mangle]
@@ -256,6 +256,18 @@ pub extern "C" fn oxtty_cursor(h: u32) -> u32 {
         let c = t.cursor();
         (c.visible as u32) << 31 | (c.line as u32) << 16 | c.col as u32
     })
+}
+
+/// The host's cursor style (shape 0 block, 1 underline, 2 bar; `blinking` 1), reported until the program sets one
+/// and by DECRQSS.
+#[no_mangle]
+pub extern "C" fn oxtty_set_cursor_default(h: u32, shape: u32, blinking: u32) {
+    let shape = match shape {
+        1 => CursorShape::Underline,
+        2 => CursorShape::Bar,
+        _ => CursorShape::Block,
+    };
+    with(h, (), |t| t.set_cursor_default(shape, blinking != 0));
 }
 
 /// Cursor shape (0 block, 1 underline, 2 bar), with bit 8 set when blinking and bit 9 when the program set the style.
@@ -546,7 +558,7 @@ pub unsafe extern "C" fn oxtty_feed_until_hook(h: u32, ptr: *const u8, len: u32)
 }
 
 /// The pending hook's kind, or -1 if none. OUT32 holds its id, the parameter count, then each parameter as its
-/// length and values (sub-parameters after the first); OUT holds its data.
+/// length and values (sub-parameters after the first, an empty one as -1 in two's complement); OUT holds its data.
 #[no_mangle]
 pub extern "C" fn oxtty_pending_hook(h: u32) -> i32 {
     with(h, -1, |t| {
@@ -559,7 +571,7 @@ pub extern "C" fn oxtty_pending_hook(h: u32) -> i32 {
             out.push(hook.params.len() as u32);
             for param in &hook.params {
                 out.push(param.len() as u32);
-                out.extend(param.iter().map(|&v| u32::from(v)));
+                out.extend(param.iter().map(|&v| v as u32));
             }
         });
         set_out(hook.data);

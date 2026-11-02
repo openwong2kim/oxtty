@@ -89,8 +89,8 @@ pub struct Hook {
     /// `"csi"`, `"osc"` or `"dcs"`.
     pub kind: String,
     pub id: u32,
-    /// Each parameter followed by its sub-parameters.
-    pub params: Vec<Vec<u32>>,
+    /// Each parameter followed by its sub-parameters (an empty sub-parameter is -1).
+    pub params: Vec<Vec<i32>>,
     /// OSC: everything after the first `;`. DCS: the payload.
     pub data: Buffer,
 }
@@ -304,6 +304,18 @@ impl Terminal {
         self.inner.set_focus(focused);
     }
 
+    /// The host's cursor style (`"block"`, `"underline"` or `"bar"`): `cursor()` reports it until the program sets
+    /// one, and DECRQSS reports it.
+    #[napi]
+    pub fn set_cursor_default(&mut self, shape: String, blink: bool) {
+        let shape = match shape.as_str() {
+            "underline" => oxtty::CursorShape::Underline,
+            "bar" => oxtty::CursorShape::Bar,
+            _ => oxtty::CursorShape::Block,
+        };
+        self.inner.set_cursor_default(shape, blink);
+    }
+
     #[napi]
     pub fn take_damage(&mut self) -> Damage {
         match self.inner.take_damage() {
@@ -444,11 +456,7 @@ impl Terminal {
             }
             .into(),
             id: hook.id,
-            params: hook
-                .params
-                .iter()
-                .map(|p| p.iter().map(|&v| v.into()).collect())
-                .collect(),
+            params: hook.params,
             data: hook.data.into(),
         })
     }
@@ -537,14 +545,14 @@ impl Terminal {
         })
     }
 
-    /// Puts a marker on buffer line `line` of the primary screen (0 is the oldest history line); null outside the buffer
-    /// or on the alternate screen.
+    /// Puts a marker on buffer line `line` of the screen that is up (0 is the oldest history line, or the alternate
+    /// screen's top row); null outside the buffer. The alternate screen's markers go when it is left.
     #[napi]
     pub fn add_marker(&mut self, line: i32) -> Option<u32> {
         self.inner.add_marker(line as i64)
     }
 
-    /// The marker's buffer line on the primary screen; null once it is gone.
+    /// The marker's buffer line on its screen; null once it is gone.
     #[napi]
     pub fn marker_line(&self, id: u32) -> Option<i32> {
         self.inner.marker_line(id).map(|line| line as i32)

@@ -83,6 +83,18 @@ single crate.
   turned on by `oxtty::Engine`, answers DA1 with `CSI ? 1 ; 2 c` and DA2 with
   `CSI > 0 ; 276 ; 0 c` as xterm.js does, instead of `CSI ? 6 c` and
   Alacritty's version.
+- `term::Config::decrqss`, off (upstream) by default and turned on by
+  `oxtty::Engine`, answers DECRQSS (`DCS $ q Pt ST`) as xterm.js
+  `requestStatusString` does: `0m` for SGR, the scroll region for DECSTBM,
+  `Config::default_cursor_style` for DECSCUSR (xterm.js reports its
+  `cursorStyle`/`cursorBlink` options; `Term::set_default_cursor_style` sets
+  it), 0 for DECSCA, `61;1` for DECSCL, `DCS 0 $ r ST` for anything else.
+  vte has no DCS actions: the `Performer` collects an unhooked `DCS $ q`
+  payload and stops parsing after the byte that ends it, then the
+  `Processor` calls `Handler::request_status_string`, unless that byte was
+  a CAN or SUB, which abort it (xterm.js does not answer then either). A
+  hooked one is answered by `finish_hook`; a payload past the hook limit is
+  not answered.
 - Private mode 9 (X10 mouse reporting) sets `TermMode::MOUSE_X10`, which is
   part of `TermMode::MOUSE_MODE` so the mouse protocols stay exclusive, and
   DECRQM reports it.
@@ -178,13 +190,18 @@ single crate.
   `env!("CARGO_PKG_VERSION")` pinned to `"0.26.0"` so the secondary device
   attributes reply keeps reporting Alacritty's version instead of oxtty's.
 - The module is `#[rustfmt::skip]` so it stays byte-close to upstream.
-- `vte/ansi.rs` is the `ansi` module of the published `vte` 0.15.0 crate
-  (Apache-2.0 OR MIT), built in so parsing can stop at a sequence the host
-  hooked (`vte/mod.rs` re-exports the crate's `Parser`, `Params` and
-  `Perform`, which stay the published ones). Mechanical changes: the no-std
-  `Processor` and `std` feature gates are gone and `crate::` paths point at
-  `super::`. Parser hooks (marked `oxtty` in the code): `Processor::set_hook`
-  registers CSI and DCS sequences by `hook_id` (intermediates, private marker
+- `vte/` is the published `vte` 0.15.0 crate (Apache-2.0 OR MIT), built in:
+  `vte/mod.rs` is its `lib.rs`, next to its `params.rs` and `ansi.rs`, so
+  parsing can stop at a sequence the host hooked and an empty sub-parameter
+  can be told from 0. Mechanical changes: the no-std code (the fixed-size
+  OSC buffer, `Parser::new_with_size`, its tests) and the `std` and `ansi`
+  feature gates are gone, the no-std `Processor` too, and `crate::` paths
+  point at `super::`. The parser notes an empty sub-parameter
+  (`Parser::param_digits`, `Params::mark_empty`), read with
+  `Params::is_empty_subparam`; its value stays 0, so the default actions
+  (SGR `38:2::r:g:b`) are unchanged, and hooks report it as -1 as xterm.js
+  `Params` does (an empty parameter stays 0, xterm.js's ZDM). Parser hooks
+  (marked `oxtty` in the code): `Processor::set_hook` registers CSI and DCS sequences by `hook_id` (intermediates, private marker
   first, then the final byte) and OSC by number; the `Performer` keeps a
   hooked sequence as `Processor::pending_hook` instead of dispatching it and
   stops `advance_until_terminated` after it (`advance_until_hook`). A DCS
@@ -193,8 +210,8 @@ single crate.
   still applies, as vte does). `finish_hook` runs the default action (a CSI
   is parsed again from its parameters, as vte's `Params` cannot be built) or
   drops it. `advance` runs hook defaults itself, as before hooks existed. One `debug!`
-  argument lost a borrow for a newer clippy. To upgrade, diff this file
-  against the old crate's `src/ansi.rs` and apply that to the new one.
+  argument lost a borrow for a newer clippy. To upgrade, diff `vte/` against
+  the old crate's `src/` and apply that to the new one.
 - xterm.js `windowsPty` behaviour is three options, each upstream by
   default, set together by `Term::set_windows_pty`: `term::Config::reflow`
   (`false`: resizing reflows neither screen), `term::Config::grow_from_history`

@@ -153,7 +153,7 @@ test('the scrollbar next to xterm.js', { timeout: 120000 }, async (t) => {
       assert.deepEqual(back, backXt);
     });
 
-    await t.test('options.scrollbar: width resizes the bar, showScrollbar false unwraps the screen, FitAddon agrees', async () => {
+    await t.test('options.scrollbar: width resizes the bar, showScrollbar false hides it in its wrapper, FitAddon agrees', async () => {
       await setup();
       const r = await page.evaluate(async () => {
         await window.lines(100);
@@ -177,12 +177,13 @@ test('the scrollbar next to xterm.js', { timeout: 120000 }, async (t) => {
         const canvas = ox.element.querySelector('canvas');
         for (const term of window.made) term.options.scrollbar = { showScrollbar: false };
         await window.frames();
-        out.off = {
-          parent: ox.element.querySelector('.xterm-screen').parentElement === ox.element,
-          wrappers: ox.element.querySelectorAll('.xterm-scrollable-element').length,
-          canvas: ox.element.querySelector('.xterm-screen canvas') === canvas,
-          xtermHidden: xt.element.querySelector('.xterm-scrollbar.xterm-vertical').classList.contains('xterm-invisible'),
-        };
+        out.off = window.made.map((term) => ({
+          parent: term.element.querySelector('.xterm-screen').parentElement.className.trim(),
+          wrappers: term.element.querySelectorAll('.xterm-scrollable-element').length,
+          bar: [...term.element.querySelector('.xterm-scrollbar.xterm-vertical').classList].sort(),
+          width: [width(term), sliderWidth(term)],
+        }));
+        out.canvas = ox.element.querySelector('.xterm-screen canvas') === canvas;
         out.proposed.push(fit.proposeDimensions().cols);
         for (const term of window.made) term.options.scrollbar = { showScrollbar: true };
         await window.frames();
@@ -198,12 +199,32 @@ test('the scrollbar next to xterm.js', { timeout: 120000 }, async (t) => {
       assert.equal(r.defaultColor[0], r.defaultColor[1]);
       assert.deepEqual(r.themeColor, ['rgba(255, 128, 0, 0.2)', 'rgba(255, 128, 0, 0.2)'], 'the slider is the foreground at 20%');
       assert.deepEqual(r.sliderColor, ['rgba(0, 255, 0, 0.5)', 'rgba(0, 255, 0, 0.5)'], 'theme.scrollbarSliderBackground');
-      assert.deepEqual(r.off, { parent: true, wrappers: 0, canvas: true, xtermHidden: true });
+      // xterm.js keeps the wrapper and a 0 px bar that never shows (it fades out if it was showing).
+      assert.deepEqual(r.off[0], r.off[1]);
+      assert.equal(r.off[0].wrappers, 1);
+      assert.ok(r.off[0].bar.includes('xterm-invisible'));
+      assert.ok(r.canvas, 'the canvas stays');
       assert.match(r.on.parent, /^xterm-scrollable-element /);
       assert.equal(r.on.width, '14px');
       const cols = (scrollbar) => Math.floor((400 - scrollbar) / r.cell);
       assert.deepEqual(r.proposed, [cols(14), cols(20), cols(0), cols(14)]);
       assert.equal(r.disposed, 0);
+    });
+
+    await t.test('opened with showScrollbar false, the DOM matches xterm.js and the bar stays hidden', async () => {
+      await setup({ ...OPTIONS, scrollbar: { showScrollbar: false } });
+      for (const lines of [0, 300]) {
+        await page.evaluate(async (n) => {
+          if (n) await window.lines(n);
+          for (const term of window.made) term.scrollLines(-5);
+          await window.frames();
+        }, lines);
+        await wait(100);
+        const [ox, xt] = await bars();
+        assert.deepEqual(ox, xt, `${lines} lines`);
+        assert.match(ox.bar[0], /xterm-invisible/);
+        assert.equal(ox.bar[4], '0px');
+      }
     });
 
     await t.test('dragging the slider and pressing the track scroll the same rows as xterm.js', async () => {

@@ -50,7 +50,7 @@ use crate::vt::term::{ClipboardType, Config, Osc52, Term, TermDamage, TermMode};
 use crate::vt::vte::ansi::Hook as VtHook;
 use crate::vt::vte::ansi::Rgb;
 use crate::vt::vte::ansi::{
-    Color, CursorShape as AlacCursorShape, Handler, NamedPrivateMode, Processor,
+    Color, CursorShape as AlacCursorShape, CursorStyle, Handler, NamedPrivateMode, Processor,
 };
 pub use crate::vt::vte::ansi::{HookKind, hook_id};
 
@@ -234,8 +234,9 @@ pub struct Hook {
     pub kind: HookKind,
     /// [`hook_id`] for CSI and DCS, the number before the first `;` for OSC.
     pub id: u32,
-    /// CSI and DCS parameters, each followed by its sub-parameters (an empty parameter is 0, values stop at 65535).
-    pub params: Vec<Vec<u16>>,
+    /// CSI and DCS parameters, each followed by its sub-parameters (an empty parameter is 0 and an empty
+    /// sub-parameter -1, as in xterm.js; values stop at 65535).
+    pub params: Vec<Vec<i32>>,
     /// OSC: everything after the first `;`. DCS: the payload.
     pub data: Vec<u8>,
 }
@@ -464,6 +465,8 @@ impl Engine {
             sgr21_double_underline: true,
             // Like xterm.js, device attributes report a VT100 with advanced video (DA1) and xterm 276 (DA2).
             xterm_device_attributes: true,
+            // Like xterm.js, DECRQSS is answered.
+            decrqss: true,
             // Like xterm.js, resetting any mouse tracking mode turns tracking off, and resetting an SGR encoding
             // returns to the default one.
             xterm_mouse_modes: true,
@@ -710,6 +713,19 @@ impl Engine {
         self.term.set_focus_report(focused);
     }
 
+    /// The host's cursor style (xterm.js `cursorStyle` and `cursorBlink` options; block, not blinking by default):
+    /// what [`Engine::cursor`] reports until the program chooses one, and what DECRQSS reports for DECSCUSR, as
+    /// xterm.js does even after the program chose one.
+    pub fn set_cursor_default(&mut self, shape: CursorShape, blinking: bool) {
+        let shape = match shape {
+            CursorShape::Block => AlacCursorShape::Block,
+            CursorShape::Underline => AlacCursorShape::Underline,
+            CursorShape::Bar => AlacCursorShape::Beam,
+        };
+        self.term
+            .set_default_cursor_style(CursorStyle { shape, blinking });
+    }
+
     /// Behaves as xterm.js 6.1 does with `windowsPty` set to `pty` (the default is none): with a backend or build,
     /// more rows are added blank at the bottom instead of bringing scrollback back; with a build that is not
     /// conpty 21376 or later, resizing does not reflow; with conpty before 21376, a line feed or `CSI H` marks the
@@ -735,6 +751,7 @@ impl Engine {
         let old_cols = self.term.columns();
         let reflow = size(cols, rows).cols != old_cols;
         let anchors = self.anchor_markers(reflow);
+        let alt_anchors = self.anchor_alt_markers();
         match &self.history {
             Some(history) => {
                 self.offset = history.reflow(&mut self.term, size(cols, rows), self.offset);
@@ -746,6 +763,7 @@ impl Engine {
         self.entered_seen = self.primary().history_entered();
         self.history_seen = self.primary_history_len();
         self.place_markers(anchors, reflow);
+        self.place_alt_markers(alt_anchors);
         self.extend_images(old_cols);
     }
 
