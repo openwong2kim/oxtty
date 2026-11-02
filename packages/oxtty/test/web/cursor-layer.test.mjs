@@ -64,6 +64,8 @@ test('an idle blink draws nothing: no WebGL draw, no drawImage, no redraw reques
     await p.write('abc');
     p.focus(true);
     await p.layered();
+    // Past the one redraw that compacts the canvas of a pane that stopped drawing
+    await T.sleep(1200);
     const layer = p.debug.cursorLayer;
     const counts = { gl: 0, drawImage: 0 };
     const wrap = (proto, names, key) => {
@@ -215,6 +217,8 @@ test('blur, hiding and dispose remove the layer; a translucent background keeps 
     for (let n = 0; n < 50 && second.isConnected; n++) await T.sleep(20);
     out.hidden = second.isConnected;
     p.container.style.display = '';
+    // The canvas has its pixels back once layout ran (a hidden pane has none), after this frame's callbacks
+    await new Promise((resolve) => requestAnimationFrame(resolve));
     for (let n = 0; n < 50 && !p.debug.cursorLayer; n++) await p.layered();
     const third = p.debug.cursorLayer;
     out.shownAgain = !!third;

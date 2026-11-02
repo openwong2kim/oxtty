@@ -14,6 +14,10 @@
 //! (`display: none`, zero size, scrolled away): it redraws everything when it comes back. A blinking cursor
 //! draws nothing either: it is a small layer over the canvas whose opacity the blink flips ([`CursorLayer`]).
 //!
+//! The canvas's pixels live in the GPU process, where Chromium keeps several buffers of the canvas's size behind a
+//! 2D canvas that keeps drawing. A pane that stopped drawing gets back down to one ([`Inner::compact_canvas`]), and
+//! a pane that takes no room on the page (`display: none`) has none ([`collapse_observer`]).
+//!
 //! # Re-entrancy
 //!
 //! State is behind one `RefCell` per pane. DOM listeners, timers and observers borrow it with `try_borrow_mut`
@@ -28,7 +32,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
     Document, Event, FocusEvent, HtmlCanvasElement, HtmlElement, IntersectionObserver,
-    IntersectionObserverEntry, OffscreenCanvasRenderingContext2d,
+    IntersectionObserverEntry, OffscreenCanvasRenderingContext2d, ResizeObserver,
 };
 
 use super::atlas::{self, AtlasConfig, TextureAtlas};
@@ -50,10 +54,12 @@ use super::{
     RendererRequest, SelectionRange,
 };
 use crate::engine::{attr, CursorShape, Viewport};
-use crate::timer;
+use crate::timer::{self, Timeout};
 
 /// Requests kept for [`Renderer::debug`].
 const LOG_LIMIT: usize = 256;
+/// How long a pane's canvas goes without a draw before it is compacted (see [`Inner::compact_canvas`]).
+const COMPACT_AFTER_MS: f64 = 1000.0;
 
 thread_local! {
     /// Live panes in creation order.
@@ -64,6 +70,8 @@ thread_local! {
     static METRICS: Option<OffscreenCanvasRenderingContext2d> = metrics_context();
     /// One observer tells every pane whether it is in view.
     static VISIBILITY: Option<IntersectionObserver> = visibility_observer();
+    /// One observer tells every pane when it takes no room on the page and when it does again.
+    static COLLAPSE: Option<ResizeObserver> = collapse_observer();
     /// Whether the page-wide font and window listeners are registered.
     static LISTENING: Cell<bool> = const { Cell::new(false) };
 }
@@ -149,6 +157,30 @@ fn visibility_observer() -> Option<IntersectionObserver> {
     IntersectionObserver::new(&callback).ok()
 }
 
+/// Panes whose container takes no room (`display: none` on it or a parent) give up their canvas's pixels, and
+/// get them back when it does again. Unlike the visibility observer, whose callback runs after the page painted,
+/// this one runs between layout and paint, so a pane shown again has its last frame back in the frame that shows it.
+fn collapse_observer() -> Option<ResizeObserver> {
+    let callback = Closure::<dyn FnMut(Array)>::new(|entries: Array| {
+        for entry in entries.iter() {
+            let Ok(target) = Reflect::get(&entry, &"target".into()) else {
+                continue;
+            };
+            for pane in panes() {
+                let is_target = pane
+                    .try_borrow()
+                    .is_ok_and(|p| AsRef::<JsValue>::as_ref(&p.container) == &target);
+                if is_target {
+                    with_inner(&Rc::downgrade(&pane), Inner::handle_container_size);
+                }
+            }
+        }
+    });
+    // Lives as long as the page; the GC owns the closure
+    let callback: Function = callback.into_js_value().unchecked_into();
+    ResizeObserver::new(&callback).ok()
+}
+
 /// The font and window listeners every pane shares, registered with the first pane for the page's lifetime.
 fn listen_page(window: &web_sys::Window, document: &Document) {
     if LISTENING.with(|l| l.replace(true)) {
@@ -225,6 +257,14 @@ struct Inner {
     last_bg: u32,
     full_redraw: bool,
     dirty: BTreeSet<u32>,
+    /// The container takes no room: the canvas has no pixels (see [`collapse_observer`]).
+    collapsed: bool,
+    /// Whether the canvas's last frame was drawn with the cursor, when (`timer::now`), and the timer that
+    /// compacts the canvas once it idles.
+    last_cursor: bool,
+    last_draw_at: f64,
+    compact: Option<Timeout>,
+    compactions: u32,
     visible: bool,
     disposed: bool,
     draws: u32,
@@ -300,6 +340,11 @@ impl WebglRenderer {
             last_bg: 0,
             full_redraw: true,
             dirty: BTreeSet::new(),
+            collapsed: false,
+            last_cursor: false,
+            last_draw_at: 0.0,
+            compact: None,
+            compactions: 0,
             visible: true,
             disposed: false,
             draws: 0,
@@ -314,6 +359,11 @@ impl WebglRenderer {
         VISIBILITY.with(|v| {
             if let Some(v) = v {
                 v.observe(container);
+            }
+        });
+        COLLAPSE.with(|c| {
+            if let Some(c) = c {
+                c.observe(container);
             }
         });
         {
@@ -404,13 +454,41 @@ impl Inner {
         }
     }
 
+    /// The container took no room or takes some again (see [`collapse_observer`]).
+    fn handle_container_size(&mut self) {
+        let collapsed = self.container.client_width() == 0 || self.container.client_height() == 0;
+        if collapsed == self.collapsed {
+            return;
+        }
+        self.collapsed = collapsed;
+        if collapsed {
+            self.compact = None;
+            self.canvas.set_width(0);
+            self.canvas.set_height(0);
+            return;
+        }
+        self.set_canvas_size();
+        // The last frame again until the visibility observer's redraw; when it cannot be drawn, that redraw
+        // comes as soon as possible
+        if !self.can_redraw_last_frame() || !self.draw(self.last_cursor, None) {
+            self.request_redraw_all();
+        }
+    }
+
+    fn set_canvas_size(&self) {
+        let d = self.dims;
+        self.canvas.set_width(d.device_canvas.width as u32);
+        self.canvas.set_height(d.device_canvas.height as u32);
+    }
+
     fn handle_resize(&mut self) {
         self.update_dimensions();
         self.highlights_stale = true;
         self.model.resize(self.cols, self.rows);
         let d = self.dims;
-        self.canvas.set_width(d.device_canvas.width as u32);
-        self.canvas.set_height(d.device_canvas.height as u32);
+        if !self.collapsed {
+            self.set_canvas_size();
+        }
         let style = self.canvas.style();
         let _ = style.set_property("width", &format!("{}px", d.css_canvas.width));
         let _ = style.set_property("height", &format!("{}px", d.css_canvas.height));
@@ -428,10 +506,16 @@ impl Inner {
         self.disposed = true;
         self.blink = None;
         self.cursor_layer = None;
+        self.compact = None;
         self.listeners.clear();
         VISIBILITY.with(|v| {
             if let Some(v) = v {
                 v.unobserve(&self.container);
+            }
+        });
+        COLLAPSE.with(|c| {
+            if let Some(c) = c {
+                c.unobserve(&self.container);
             }
         });
         atlas::release(self.id);
@@ -701,7 +785,8 @@ impl Inner {
             return;
         }
         // Out of view, or no context: nothing is drawn, everything is when it can be again
-        if !self.visible || !gpu::is_live() || self.dims.device_canvas.width < 1.0 {
+        if !self.visible || self.collapsed || !gpu::is_live() || self.dims.device_canvas.width < 1.0
+        {
             self.full_redraw = true;
             return;
         }
@@ -794,14 +879,62 @@ impl Inner {
             }
             _ => self.update_model(viewport, &lines, layer.is_none() && blink_shown),
         }
-        if self.draw(layer.is_none() && blink_shown, None) {
+        let cursor_drawn = layer.is_none() && blink_shown;
+        if self.draw(cursor_drawn, None) {
             self.draws = self.draws.wrapping_add(1);
+            self.last_cursor = cursor_drawn;
+            self.schedule_compact();
         } else {
             self.full_redraw = true;
         }
         if let Some(layer) = &mut self.cursor_layer {
             layer.show(blink_shown);
         }
+    }
+    /// Compacts the canvas once it has not drawn for [`COMPACT_AFTER_MS`].
+    fn schedule_compact(&mut self) {
+        self.last_draw_at = timer::now();
+        if self.compact.is_none() {
+            self.arm_compact(COMPACT_AFTER_MS);
+        }
+    }
+    fn arm_compact(&mut self, ms: f64) {
+        let weak = self.me.clone();
+        self.compact = Some(Timeout::new(ms.ceil() as i32, move || {
+            with_inner(&weak, Inner::handle_compact)
+        }));
+    }
+    fn handle_compact(&mut self) {
+        self.compact = None;
+        let wait = self.last_draw_at + COMPACT_AFTER_MS - timer::now();
+        if wait > 0.0 {
+            self.arm_compact(wait);
+            return;
+        }
+        self.compact_canvas();
+    }
+    /// Chromium keeps up to four GPU buffers of the canvas's size behind a 2D canvas that drew in consecutive
+    /// frames (the one shown, those the compositor still held, recycled ones), and keeps them while it idles:
+    /// 17 panes of 120×40 at devicePixelRatio 2 held about 400 MB of the GPU process for 120 MB of pixels.
+    /// Resizing the canvas drops them all; the same frame is drawn again at once, in the same task, so the page
+    /// never paints the empty canvas and the pane keeps one buffer.
+    fn compact_canvas(&mut self) {
+        let width = self.canvas.width();
+        if !self.visible || self.collapsed || width == 0 || !self.can_redraw_last_frame() {
+            return;
+        }
+        self.canvas.set_width(0);
+        self.canvas.set_width(width);
+        if self.draw(self.last_cursor, None) {
+            self.compactions = self.compactions.wrapping_add(1);
+        } else {
+            self.request_redraw_all();
+        }
+    }
+    /// Whether the model, vertices and context can draw the canvas's last frame again: not when a frame is pending
+    /// that redraws everything (the model may be cleared), or the atlas moved glyphs the vertices point at.
+    fn can_redraw_last_frame(&self) -> bool {
+        !self.full_redraw && gpu::is_live() && !self.glyphs.begin_frame()
     }
     /// Draws the model into the pane's canvas, or `region` of it into the cursor layer.
     fn draw(&self, cursor: bool, region: Option<Region>) -> bool {
@@ -1035,6 +1168,8 @@ impl Inner {
         set("visible", self.visible.into());
         set("draws", self.draws.into());
         set("layerDraws", self.layer_draws.into());
+        set("compactions", self.compactions.into());
+        set("collapsed", self.collapsed.into());
         let layer = self.cursor_layer.as_ref();
         set(
             "cursorLayer",

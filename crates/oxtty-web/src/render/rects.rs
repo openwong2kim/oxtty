@@ -149,6 +149,9 @@ impl RectProgram {
     }
 
     fn draw(&self, gl: &Gl, vertices: &Vertices) {
+        if vertices.count == 0 {
+            return;
+        }
         gl.use_program(Some(&self.program));
         gl.bind_vertex_array(Some(&self.vao));
         gl.uniform_matrix4fv_with_f32_array(
