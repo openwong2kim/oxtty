@@ -653,7 +653,25 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         if bytes.first() != Some(&b'[') {
             return None;
         }
-        self.reset_params();
+        // Only what the dispatch reads: `Params::parse` sets the whole list, and on `None` the state machine
+        // resets everything.
+        self.intermediate_idx = 0;
+        // The commonest, such as `CSI m`, `CSI 0 m` and `CSI 31 m`: one parameter of at most two digits.
+        if let Some(&[b1, b2, b3]) = bytes.get(1..4) {
+            let digit = |byte: u8| byte.wrapping_sub(b'0') < 10;
+            let last = |byte: u8| (0x40..=0x7E).contains(&byte);
+            let (param, end) = match (b1, b2, b3) {
+                (b1, ..) if last(b1) => (0, 1),
+                (b1, b2, _) if digit(b1) && last(b2) => ((b1 - b'0') as u16, 2),
+                (b1, b2, b3) if digit(b1) && digit(b2) && last(b3) => ((b1 - b'0') as u16 * 10 + (b2 - b'0') as u16, 3),
+                _ => (0, 0),
+            };
+            if end > 0 {
+                self.params.set_one(param);
+                performer.csi_dispatch(self.params(), self.intermediates(), false, bytes[end] as char);
+                return Some(end + 1);
+            }
+        }
         let mut i = 1;
         if let Some(&byte @ 0x3C..=0x3F) = bytes.get(i) {
             self.action_collect(byte);
@@ -1634,7 +1652,8 @@ mod tests {
             *seed ^= *seed << 17;
             *seed
         };
-        let pieces: [&[u8]; 39] = [
+        let pieces: [&[u8]; 42] = [
+            b"\x1b[m", b"\x1b[31m", b"\x1b[2J",
             b"a", b"hello world ", b"0123456789abcdef", "가".as_bytes(), "漢字".as_bytes(), "é".as_bytes(),
             "😀".as_bytes(), "\u{a0}".as_bytes(), "\u{fffd}".as_bytes(), b"\xc2\x9b", b"\x80", b"\xe4\xb8",
             b"\xf0\x9f", b"\xed\xa0\x80", b"\xff", b"\xc0\xaf", b"\r\n", b"\t", b"\x07", b"\x18", b"\x7f",

@@ -304,7 +304,9 @@ same input one byte at a time, `vte/mod.rs` `chunked_input_matches_byte_by_byte`
   them, use the scalar path.
 - A whole CSI after ESC (private marker, parameters, intermediates, final byte,
   all within the bytes given) is dispatched by `csi_fast` without leaving
-  ground; `Params::parse` (`vte/params.rs`) finds the separators of a list
+  ground. A CSI of one parameter of at most two digits, or none (`CSI m`,
+  `CSI 0 m`, `CSI 31 m`, `CSI 2 J`), is read from its next three bytes
+  (`Params::set_one`). Otherwise `Params::parse` (`vte/params.rs`) finds the separators of a list
   longer than eight bytes a word at a time (`classify`), then reads each
   parameter's digits from a word at once (`word_value`). Anything else — a
   control or DEL inside, a cut-off sequence, a full parameter list, too many
@@ -315,6 +317,7 @@ same input one byte at a time, `vte/mod.rs` `chunked_input_matches_byte_by_byte`
   within four bytes); it now takes only the first character's bytes.
 - `vte/ansi.rs`: `parse_sgr_color` is generic over its iterator instead of
   `dyn`, and while no hook is set `csi_dispatch` neither builds the hook id
-  nor looks it up. CUP (`H`, `f`) and DECSTBM (`r`) with at most two plain
-  parameters are handled before the general match, from `Params::two`
-  instead of the parameter iterator.
+  nor looks it up. CUP (`H`, `f`), DECSTBM (`r`) and SGR (`m`, without the
+  colors 38, 48 and 58) with at most two plain parameters are handled before
+  the general match, from `Params::two` instead of the parameter iterator;
+  `sgr_attr` maps a plain SGR parameter for both paths.
