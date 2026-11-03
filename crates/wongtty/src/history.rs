@@ -330,8 +330,50 @@ impl HistorySink<Cell> for History {
     }
 
     fn clear(&mut self) {
+        let freed = !self.blocks.is_empty();
         self.drop_all();
+        // The next row gets a block when it comes: none is kept for it.
+        self.spare = None;
         self.cleared = true;
+        if freed {
+            release_freed();
+        }
+    }
+}
+
+impl Drop for History {
+    fn drop(&mut self) {
+        if !self.blocks.is_empty() {
+            self.blocks.clear();
+            self.spare = None;
+            release_freed();
+        }
+    }
+}
+
+/// Has the system allocator hand back the memory of the blocks just freed
+/// (native builds): the macOS allocator keeps freed blocks of `BLOCK_BYTES` in
+/// the footprint otherwise, which then stays as large as the history was.
+fn release_freed() {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: no zone (all of them) and no goal (as much as can be freed) are valid arguments.
+        unsafe {
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        // SAFETY: glibc's malloc_trim takes any pad.
+        unsafe {
+            malloc_trim(0);
+        }
     }
 }
 
@@ -829,6 +871,9 @@ impl TermHistory {
             rows.pop_oldest();
         }
         *stored = rows;
+        drop(stored);
+        // The rows the grid took back and reflowed were freed again.
+        release_freed();
         offset
     }
 
