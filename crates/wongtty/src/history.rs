@@ -170,6 +170,25 @@ impl History {
         shape(self.bytes(i))
     }
 
+    /// Appends row `i`'s text as `Engine::row_string` gives it, read straight from its bytes. False, with nothing
+    /// appended, when the row has extras or bytes `decode` would not read: the caller decodes it instead.
+    pub(crate) fn row_text_into(&self, i: usize, trim_right: bool, out: &mut String) -> bool {
+        let abs = self.first + i as u64;
+        if self
+            .extras
+            .binary_search_by_key(&abs, |(at, _)| *at)
+            .is_ok()
+        {
+            return false;
+        }
+        let start = out.len();
+        let read = text_into(self.bytes(i), self.cols, trim_right, out).is_some();
+        if !read {
+            out.truncate(start);
+        }
+        read
+    }
+
     /// Removes every row, oldest first.
     #[cfg(test)]
     fn take_all(&mut self) -> Vec<Row<Cell>> {
@@ -1773,6 +1792,119 @@ fn decode_cells(
     Some(Row::from_vec(cells, width))
 }
 
+/// `Engine::row_string` of what `decode` gives at `width` cells (0: as stored), without the cells, appended to `out`:
+/// wide characters once, with the zerowidth characters that follow their unit, blanks as spaces, and with
+/// `trim_right` the empty cells that end the row dropped. For a row without extras; `None` (with part of the text
+/// appended) for bytes `decode` would not read.
+fn text_into(mut bytes: &[u8], width: usize, trim_right: bool, out: &mut String) -> Option<()> {
+    let cols = take_varint(&mut bytes).filter(|n| (1..=u16::MAX as usize).contains(n))?;
+    let width = if width == 0 { cols } else { width };
+    // Cells read so far, and the length of the text up to the last content.
+    let (mut cells, mut content) = (0, out.len());
+    // A run with the right half's flag (one that is not a wide character's pair) is left out, as `row_string` skips
+    // those cells.
+    let mut spacer = false;
+    while cells < cols && !bytes.is_empty() {
+        let head = take(&mut bytes, 3)?;
+        let (tag, n) = (head[0], u16::from_le_bytes([head[1], head[2]]) as usize);
+        if tag & FG != 0 {
+            skip_color(&mut bytes)?;
+        }
+        if tag & BG != 0 {
+            skip_color(&mut bytes)?;
+        }
+        if tag & FLAGS != 0 {
+            let b = take(&mut bytes, 2)?;
+            spacer = u16::from_le_bytes([b[0], b[1]]) as u32 & Flags::WIDE_CHAR_SPACER.bits() != 0;
+        }
+        // The read stops at `width`.
+        let end = if spacer { 0 } else { width };
+        if tag & BLANK != 0 {
+            if cells + n > cols {
+                return None;
+            }
+            // Erased blanks, which runs keep without TYPED_SPACE: spaces, none of them content.
+            out.extend(std::iter::repeat_n(' ', n.min(end.saturating_sub(cells))));
+            cells += n;
+            continue;
+        }
+        let mut left = n;
+        while left > 0 {
+            let (&b, rest) = bytes.split_first()?;
+            let mut unit_at = cells;
+            if b >= UNIT_2 {
+                let c = if b < UNIT_3 {
+                    let (&low, rest) = rest.split_first()?;
+                    bytes = rest;
+                    ((b & 0x1f) as u32) << 8 | low as u32
+                } else {
+                    let ([mid, low], rest) = rest.split_first_chunk()?;
+                    bytes = rest;
+                    ((b & 0x1f) as u32) << 16 | (*mid as u32) << 8 | *low as u32
+                };
+                let c = char::from_u32(c)?;
+                if cells < end {
+                    out.push(c);
+                    if c != ' ' {
+                        content = out.len();
+                    }
+                }
+                cells += 1 + (b & WIDE != 0) as usize;
+                left -= 1;
+            } else if b >= 0x20 {
+                // A stretch of printable ASCII (typed spaces too, all content) goes in one copy.
+                let stretch = 1 + rest[..(left - 1).min(rest.len())]
+                    .iter()
+                    .take_while(|&&b| (0x20..0x80).contains(&b))
+                    .count();
+                match stretch.min(end.saturating_sub(cells)) {
+                    0 => {}
+                    1 => out.push(b as char),
+                    shown => out.push_str(std::str::from_utf8(&bytes[..shown]).ok()?),
+                }
+                if cells < end {
+                    content = out.len();
+                }
+                bytes = &bytes[stretch..];
+                unit_at = cells + stretch - 1;
+                cells += stretch;
+                left -= stretch;
+            } else {
+                // 0 an erased blank, the rest controls (a tab reads as a space but is content).
+                if cells < end {
+                    out.push(if b == 0 || b == b'\t' { ' ' } else { b as char });
+                    if b != 0 {
+                        content = out.len();
+                    }
+                }
+                bytes = rest;
+                cells += 1;
+                left -= 1;
+            }
+            // The zerowidth characters of the last unit, which `decode` puts on its (first) cell.
+            if bytes.first().is_some_and(|&b| b > MARKS) {
+                let (&b, rest) = bytes.split_first()?;
+                let (marks, rest) = rest.split_at_checked((b - MARKS) as usize)?;
+                let marks = std::str::from_utf8(marks).ok()?;
+                if unit_at < end {
+                    out.push_str(marks);
+                    content = out.len();
+                }
+                bytes = rest;
+            }
+        }
+        if cells > cols {
+            return None;
+        }
+    }
+    if trim_right {
+        out.truncate(content);
+    } else {
+        out.extend(std::iter::repeat_n(' ', width - cells.min(width)));
+    }
+    Some(())
+}
+
 /// Takes the zerowidth characters that follow a unit (`MARKS`) onto `cell`,
 /// and returns the bytes after them.
 #[inline(never)]
@@ -1784,6 +1916,23 @@ fn take_marks<'a>(bytes: &'a [u8], cell: &mut Cell) -> Option<&'a [u8]> {
         .chars()
         .for_each(|m| cell.push_zerowidth(m));
     Some(rest)
+}
+
+/// `take_color` without the colour.
+#[inline(always)]
+fn skip_color(bytes: &mut &[u8]) -> Option<()> {
+    let (&kind, rest) = bytes.split_first()?;
+    let len = match kind {
+        0 => {
+            let [lo, hi] = *rest.first_chunk()?;
+            named(u16::from_le_bytes([lo, hi]))?;
+            2
+        }
+        1 => 1,
+        _ => 3,
+    };
+    *bytes = rest.get(len..)?;
+    Some(())
 }
 
 fn take_color(bytes: &mut &[u8]) -> Option<Color> {
@@ -1915,6 +2064,28 @@ mod tests {
         let end = encode(row, scan, &mut out, 0, &mut Vec::new());
         out.truncate(end);
         out
+    }
+
+    /// The text read from row `i`'s bytes is that of the decoded row (`row`), at any width it is read at.
+    fn assert_text(history: &History, i: usize, row: &Row<Cell>) {
+        let plain = history.extras.iter().all(|(at, _)| *at != history.id(i));
+        for trim in [false, true] {
+            let mut text = String::new();
+            assert_eq!(history.row_text_into(i, trim, &mut text), plain, "row {i}");
+            let mut want = String::new();
+            if plain {
+                crate::push_row_string(row, trim, &mut want);
+                assert_eq!(text, want, "row {i}");
+            }
+            for width in [1, row.len().saturating_sub(3).max(1), row.len() + 5] {
+                if plain {
+                    let (mut text, mut want) = (String::new(), String::new());
+                    text_into(history.bytes(i), width, trim, &mut text).unwrap();
+                    crate::push_row_string(&decode(history.bytes(i), None, width), trim, &mut want);
+                    assert_eq!(text, want, "row {i} at {width}");
+                }
+            }
+        }
     }
 
     fn cell(c: char, fg: Color, bg: Color, flags: Flags) -> Cell {
@@ -2105,6 +2276,7 @@ mod tests {
             let scan = scan_len(row);
             let wrapped = scan > 0 && row[Column(scan - 1)].flags.contains(Flags::WRAPLINE);
             assert_eq!(history.shape(i), Some((scan, wrapped)), "row {i}");
+            assert_text(&history, i, row);
         }
     }
 
@@ -2189,6 +2361,7 @@ mod tests {
             let scan = scan_len(row);
             let wrapped = scan > 0 && row[Column(scan - 1)].flags.contains(Flags::WRAPLINE);
             assert_eq!(history.shape(i), Some((scan, wrapped)), "row {i}");
+            assert_text(&history, i, row);
         }
     }
 
@@ -2959,6 +3132,39 @@ mod oracle {
             // Every row stored again has a new id, so cached rows cannot come back.
             assert!(a.history.lock().id(0) >= next, "{what}: row ids");
             offset = got;
+        }
+    }
+
+    /// `Engine::text_rows` reads history rows from their bytes as `row_string` reads them decoded: after any output
+    /// and resize (rows read at another width than they were stored at), past either end of the buffer.
+    #[test]
+    fn text_rows_match_row_strings() {
+        for seed in 1..=200u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let (cols, rows) = (rng.below(38) as u16 + 2, rng.below(8) as u16 + 1);
+            let scrollback = [17, 24, 60, 150, 400][rng.below(5) as usize];
+            let mut t = crate::Engine::new(cols, rows, scrollback);
+            for step in 0..6 {
+                let n = rng.below(400);
+                let bytes = if seed % 3 == 0 {
+                    log_chunk(&mut rng, n)
+                } else {
+                    chunk(&mut rng, n)
+                };
+                t.feed(bytes.as_bytes());
+                if rng.below(3) == 0 {
+                    t.resize(rng.below(38) as u16 + 2, rng.below(8) as u16 + 1);
+                }
+                let (top, bottom) = (-(t.history_len() as i32), t.rows() as i32);
+                for trim in [false, true] {
+                    let want: String = (top..bottom)
+                        .map(|l| t.row_string(l, trim).unwrap() + "\n")
+                        .collect();
+                    let mut got = String::new();
+                    t.text_rows(top - 3, bottom + 3, trim, &mut got);
+                    assert_eq!(got, want, "seed {seed} step {step} trim {trim}");
+                }
+            }
         }
     }
 

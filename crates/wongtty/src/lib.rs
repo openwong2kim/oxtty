@@ -878,23 +878,36 @@ impl Engine {
     pub fn row_string(&self, line: i32, trim_right: bool) -> Option<String> {
         self.with_row(line, |row| {
             let mut text = String::with_capacity(row.len());
-            let mut content = 0;
-            for cell in &row[..] {
-                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    continue;
-                }
-                text.push(if cell.c == '\t' { ' ' } else { cell.c });
-                let marks = cell.zerowidth().unwrap_or_default();
-                text.extend(marks);
-                if cell.c != ' ' || cell.flags.contains(Flags::TYPED_SPACE) || !marks.is_empty() {
-                    content = text.len();
-                }
-            }
-            if trim_right {
-                text.truncate(content);
-            }
+            push_row_string(row, trim_right, &mut text);
             text
         })
+    }
+
+    /// [`Engine::row_string`] of rows `first..=last` (clamped to the buffer), each followed by `\n`, appended to
+    /// `out` in one call. History rows are read straight from their compressed bytes, without a decode (but for
+    /// rows with extras) or the row cache.
+    pub fn text_rows(&self, first: i32, last: i32, trim_right: bool, out: &mut String) {
+        let grid = self.term.grid();
+        let recent = grid.history_size() as i32;
+        let last = last.min(self.rows() as i32 - 1);
+        let mut line = first.max(-recent);
+        if let Some(stored) = self.stored() {
+            let older = stored.len() as i32;
+            line = first.max(-(recent + older));
+            while line < -recent && line <= last {
+                let i = (older + recent + line) as usize;
+                if !stored.row_text_into(i, trim_right, out) {
+                    push_row_string(&stored.row(i), trim_right, out);
+                }
+                out.push('\n');
+                line += 1;
+            }
+        }
+        while line <= last {
+            push_row_string(&grid[Line(line)], trim_right, out);
+            out.push('\n');
+            line += 1;
+        }
     }
 
     /// Whether `line` continues on the next line (soft wrap).
@@ -1366,6 +1379,25 @@ impl DecstrScan {
             _ => DecstrScan::Ground,
         };
         false
+    }
+}
+
+/// [`Engine::row_string`] of `row`, appended to `text`.
+fn push_row_string(row: &Row<AlacCell>, trim_right: bool, text: &mut String) {
+    let mut content = text.len();
+    for cell in &row[..] {
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        text.push(if cell.c == '\t' { ' ' } else { cell.c });
+        let marks = cell.zerowidth().unwrap_or_default();
+        text.extend(marks);
+        if cell.c != ' ' || cell.flags.contains(Flags::TYPED_SPACE) || !marks.is_empty() {
+            content = text.len();
+        }
+    }
+    if trim_right {
+        text.truncate(content);
     }
 }
 

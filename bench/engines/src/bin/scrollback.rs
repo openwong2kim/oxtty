@@ -127,9 +127,17 @@ impl Engine for Wongtty {
     }
     fn text(&mut self) -> usize {
         let mut s = String::new();
-        for line in -(self.t.history_len() as i32)..self.t.rows() as i32 {
-            s.push_str(&self.t.row_string(line, true).unwrap_or_default());
-            s.push('\n');
+        let top = -(self.t.history_len() as i32);
+        self.t.text_rows(top, self.t.rows() as i32 - 1, true, &mut s);
+        // TEXT_CHECK=1: the one call gives what a row_string per line gives.
+        if std::env::var_os("TEXT_CHECK").is_some() {
+            let mut lines = String::new();
+            for line in top..self.t.rows() as i32 {
+                lines.push_str(&self.t.row_string(line, true).unwrap_or_default());
+                lines.push('\n');
+            }
+            assert_eq!(s, lines, "text_rows differs from row_string");
+            eprintln!("text check ok: {} bytes", s.len());
         }
         s.len()
     }
