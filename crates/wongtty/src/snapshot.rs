@@ -645,6 +645,10 @@ fn screen(out: &mut String, grid: &Grid<Cell>, older: Option<&History>, skip: us
             next.as_ref().map(|r| &r[Column(0)]),
             i + 1 == total,
         );
+        // The snapshot is refused: write no more rows only to drop them
+        if rows.split {
+            return true;
+        }
     }
     if rows.previous_link.is_some() {
         link(out, None);
@@ -817,7 +821,35 @@ fn serialize<T: EventListener>(
 
 #[cfg(test)]
 mod tests {
-    use super::{ROW_ROOM, reserve};
+    use super::{ROW_ROOM, reserve, screen};
+    use crate::history::History;
+    use crate::vt::grid::{Grid, HistorySink, Row};
+    use crate::vt::index::Column;
+    use crate::vt::term::cell::{Cell, Flags};
+
+    #[test]
+    fn a_split_history_row_stops_the_rows_after_it() {
+        let cols = 40;
+        let mut older = History::new(5000);
+        // A left half with no right half after it
+        let mut split = Row::<Cell>::new(cols);
+        split[Column(0)].c = '漢';
+        split[Column(0)].flags = Flags::WIDE_CHAR;
+        older.push(&split);
+        let mut text = Row::<Cell>::new(cols);
+        for col in 0..cols {
+            text[Column(col)].c = 'x';
+        }
+        for _ in 0..2000 {
+            older.push(&text);
+        }
+        let grid = Grid::<Cell>::new(4, cols, 0);
+        let mut out = String::new();
+        assert!(screen(&mut out, &grid, Some(&older), 0));
+        // The split row and the one after it are read; nothing of the rest is written
+        assert!(out.len() < 2 * cols, "{} bytes", out.len());
+        assert!(!screen(&mut String::new(), &grid, Some(&older), 1));
+    }
 
     #[test]
     fn reserve_stays_close_to_what_the_rows_need() {
