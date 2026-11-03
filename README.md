@@ -10,7 +10,7 @@ Or use `wongtty/xterm`, the xterm.js API with a WebGL2 renderer, also in Rust.
 [![ci](https://github.com/openwong2kim/wongtty/actions/workflows/ci.yml/badge.svg)](https://github.com/openwong2kim/wongtty/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE-APACHE)
 ![rust](https://img.shields.io/badge/rust-1.85%2B-orange)
-![wasm](https://img.shields.io/badge/engine%20wasm-335%20KiB%20%C2%B7%20125%20KiB%20gzip-654ff0)
+![wasm](https://img.shields.io/badge/engine%20wasm-348%20KiB%20%C2%B7%20131%20KiB%20gzip-654ff0)
 ![status](https://img.shields.io/badge/status-0.0.1%20experimental-lightgrey)
 
 [Measurements](#measurements) · [Quick start](#quick-start) · [xterm.js API](#wongttyxterm-the-xtermjs-api) · [The model](#the-model) · [xterm.js parity](#xtermjs-parity) · [Roadmap](#roadmap)
@@ -158,8 +158,8 @@ does, 17 terminals take 5.1 MiB of engine memory instead of 41.1 MiB
 
 | Module | Bytes | gzip | Budget |
 | --- | ---: | ---: | --- |
-| Engine `wongtty.wasm` | 355,767 | 133,637 | 360 KiB raw, 135 KiB gzip |
-| Front end `xterm_web_bg.wasm` (`wongtty/xterm` only) | 785,800 | 297,852 | 800 KiB raw, 300 KiB gzip |
+| Engine `wongtty.wasm` | 355,919 | 133,711 | 360 KiB raw, 135 KiB gzip |
+| Front end `xterm_web_bg.wasm` (`wongtty/xterm` only) | 785,805 | 297,845 | 800 KiB raw, 300 KiB gzip |
 
 One instance of each serves every terminal on a page, so the code is paid
 once, not per pane. `scripts/build-web.sh` and `test/web/size.test.mjs` fail
@@ -417,18 +417,19 @@ operation calls `rowText` once per line, for xterm.js `translateToString`.
 The xterm.js search is the bench's own copy of what `@xterm/addon-search`
 0.17 does per logical line (wrapped rows joined, lowercased, `indexOf`), not
 the addon itself; it finds the same matches as wongtty's `searchRows`. The
-wasm search cells were measured again on 2026-11-03 (load 6–7), after the
-engine took over plain ASCII queries in the wasm build; the Hangul common
-match (`漢`) is still matched per line in JS.
+search rows were measured again on 2026-11-03, all three engines in the same
+run (median of 3 processes, load 30–33), after the engine took over plain
+ASCII queries in the wasm build; the Hangul common match (`漢`) is still
+matched per line in JS.
 
 | Operation | Output | wongtty wasm | wongtty N-API | xterm.js |
 | --- | --- | ---: | ---: | ---: |
 | Resize 120 → 100 columns | Log lines | **0.07** | 0.09 | 1.60 |
 | | Hangul | **0.09** | 0.12 | 1.46 |
-| Search, no match | Log lines | 1.49 | **0.43** | 1.52 |
-| | Hangul | 2.11 | **1.30** | 2.98 |
-| Search, common match | Log lines | 4.41 | 2.15 | **1.51** |
-| | Hangul | 28.9 | 23.7 | **4.15** |
+| Search, no match | Log lines | 1.46 | **0.42** | 1.51 |
+| | Hangul | 2.10 | **1.40** | 2.98 |
+| Search, common match | Log lines | 4.43 | 2.23 | **1.47** |
+| | Hangul | 28.9 | 24.0 | **4.18** |
 | Whole-buffer text | Log lines | 6.65 | 6.92 | **1.20** |
 | | Hangul | 15.1 | 14.9 | **0.58** |
 | Serialize | Log lines | 7.06 | **4.46** | 31.3 |
@@ -437,8 +438,8 @@ match (`漢`) is still matched per line in JS.
 In Node, wongtty resizes and serializes faster than xterm.js. xterm.js is
 faster at whole-buffer text a line at a time (5–26×) and at searching for a
 common match. Searching for a string that is not there is fastest from
-N-API; from WebAssembly it is about as fast as that xterm.js search, or
-faster.
+N-API; from WebAssembly it is about as fast as that xterm.js search on log
+lines (1.46 against 1.51 ms) and faster on Hangul (2.10 against 2.98 ms).
 
 **Setup.** Apple M4 (4 performance and 6 efficiency cores, 16 GB), macOS 15.6,
 rustc 1.99.1, 2026-11-03. Every engine is built in release mode with LTO. Node
@@ -566,6 +567,13 @@ function draw() {
   }
 }
 ```
+
+`searchRows` of a plain ASCII query is matched in the engine, which ignores
+case the way the N-API binding does: U+212A KELVIN SIGN reads as `k` and
+U+0130 (İ) as `i` + U+0307. `searchNext`, `searchPrevious` and regular
+expressions use the RegExp `i` flag, which folds neither to ASCII, so a host
+that highlights with `searchRows` and steps with `searchNext` can highlight a
+match on those characters that stepping skips.
 
 ### Rust
 

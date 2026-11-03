@@ -241,6 +241,8 @@ export class Terminal {
   /**
    * The first match of `query` starting at or after cell (`line`, `col`), down to the bottom of the screen (no
    * wrap-around). Defaults to the top of the history. Matches never span logical lines (rows joined by soft wraps).
+   * Ignoring case, it folds as the RegExp `i` flag does, not as `searchRows` of a plain ASCII query: a match on
+   * U+212A or U+0130 that `searchRows` finds is skipped here (`SearchOptions.caseSensitive`).
    */
   searchNext(query: string, options?: SearchOptions, line?: number, col?: number): SearchMatch | null;
   /** The last match ending at or before cell (`line`, `col`), up to the top of the history. Defaults to the end of the screen. */
