@@ -72,10 +72,30 @@ impl Text {
             }
     }
 
-    fn fold(self) -> Self {
-        let mut chars = Vec::with_capacity(self.chars.len());
-        let mut cells = Vec::with_capacity(self.cells.len());
-        for (c, at) in self.chars.iter().zip(&self.cells) {
+    fn fold(mut self) -> Self {
+        // In place while each character lowercases to one; the first that lowercases to several rebuilds the rest
+        for i in 0..self.chars.len() {
+            let c = &mut self.chars[i];
+            if c.is_ascii() {
+                c.make_ascii_lowercase();
+                continue;
+            }
+            let mut lower = c.to_lowercase();
+            match (lower.next(), lower.next()) {
+                (Some(l), None) => *c = l,
+                _ => return self.fold_from(i),
+            }
+        }
+        self
+    }
+
+    /// Lowercases characters `i..` into new buffers (some lowercase to several characters).
+    fn fold_from(self, i: usize) -> Self {
+        let mut chars = Vec::with_capacity(self.chars.len() + 1);
+        let mut cells = Vec::with_capacity(self.cells.len() + 1);
+        chars.extend_from_slice(&self.chars[..i]);
+        cells.extend_from_slice(&self.cells[..i]);
+        for (c, at) in self.chars[i..].iter().zip(&self.cells[i..]) {
             for l in c.to_lowercase() {
                 chars.push(l);
                 cells.push(*at);
@@ -98,10 +118,19 @@ impl Text {
                     && (e == self.chars.len() || separator(self.chars[e]))))
     }
 
-    /// The first match starting at character `from` or later.
+    /// The first match starting at character `from` or later (`query` is not empty).
     fn next(&self, query: &[char], from: usize, whole_word: bool) -> Option<usize> {
         let last = self.chars.len().checked_sub(query.len())?;
-        (from..=last).find(|&s| self.is_match(query, s, whole_word))
+        let mut s = from;
+        // Only where the first character matches
+        while s <= last {
+            s += self.chars[s..=last].iter().position(|&c| c == query[0])?;
+            if self.is_match(query, s, whole_word) {
+                return Some(s);
+            }
+            s += 1;
+        }
+        None
     }
 
     /// The last match ending at character `before` or earlier.
@@ -130,10 +159,25 @@ fn is_empty(cell: &AlacCell) -> bool {
         && cell.zerowidth().is_none_or(|marks| marks.is_empty())
 }
 
-/// Appends a row's characters; returns the length the text keeps if the logical line ends here.
-fn push_row(row: &Row<AlacCell>, base: u32, chars: &mut Vec<char>, cells: &mut Vec<u32>) -> usize {
+/// Appends a row's characters; returns the length the text keeps if the logical line ends here. A row that `ends` the
+/// line stops at its last cell that is not empty.
+fn push_row(
+    row: &Row<AlacCell>,
+    base: u32,
+    ends: bool,
+    chars: &mut Vec<char>,
+    cells: &mut Vec<u32>,
+) -> usize {
     let mut content = chars.len();
-    for (col, cell) in row[..].iter().enumerate() {
+    let cells_in = if ends {
+        row[..]
+            .iter()
+            .rposition(|c| !is_empty(c))
+            .map_or(0, |i| i + 1)
+    } else {
+        row.len()
+    };
+    for (col, cell) in row[..][..cells_in].iter().enumerate() {
         if cell
             .flags
             .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
@@ -175,18 +219,37 @@ impl Engine {
 
     /// The logical line starting at row `first`.
     fn read_line(&self, first: i32) -> Option<Text> {
+        let (mut chars, mut cells) = (Vec::new(), Vec::new());
+        let rows = self.read_line_into(first, &mut chars, &mut cells)?;
+        Some(Text {
+            first,
+            rows,
+            chars,
+            cells,
+        })
+    }
+
+    /// Reads the logical line starting at row `first` into reused buffers; returns its row count.
+    fn read_line_into(
+        &self,
+        first: i32,
+        chars: &mut Vec<char>,
+        cells: &mut Vec<u32>,
+    ) -> Option<i32> {
+        chars.clear();
+        cells.clear();
         let cols = self.cols() as u32;
         let bottom = self.rows() as i32 - 1;
-        let (mut chars, mut cells) = (Vec::new(), Vec::new());
         let mut rows = 0;
         let mut keep;
         loop {
             let line = first + rows;
             let (content, wrapped) = self.with_row(line, |row| {
-                let content = push_row(row, rows as u32 * cols, &mut chars, &mut cells);
                 let wrapped = row
                     .last()
                     .is_some_and(|c| c.flags.contains(Flags::WRAPLINE));
+                let ends = !wrapped || line >= bottom;
+                let content = push_row(row, rows as u32 * cols, ends, chars, cells);
                 (content, wrapped)
             })?;
             keep = content;
@@ -197,12 +260,7 @@ impl Engine {
         }
         chars.truncate(keep);
         cells.truncate(keep);
-        Some(Text {
-            first,
-            rows,
-            chars,
-            cells,
-        })
+        Some(rows)
     }
 
     fn read_folded(&self, first: i32, options: SearchOptions) -> Option<Text> {
@@ -334,10 +392,20 @@ impl Engine {
         }
         let cols = self.cols() as u32;
         let mut line = self.line_start(first.max(self.top_line()));
+        let (mut chars, mut cells) = (Vec::new(), Vec::new());
         while line <= last {
-            let Some(text) = self.read_folded(line, options) else {
+            let Some(rows) = self.read_line_into(line, &mut chars, &mut cells) else {
                 return;
             };
+            let mut text = Text {
+                first: line,
+                rows,
+                chars: std::mem::take(&mut chars),
+                cells: std::mem::take(&mut cells),
+            };
+            if !options.case_sensitive {
+                text = text.fold();
+            }
             let mut at = 0;
             while let Some(s) = text.next(&needle, at, options.whole_word) {
                 let found = text.found(s, needle.len(), cols);
@@ -347,6 +415,7 @@ impl Engine {
                 at = s + needle.len();
             }
             line += text.rows;
+            (chars, cells) = (text.chars, text.cells);
         }
     }
 
@@ -494,5 +563,17 @@ mod tests {
         assert_eq!(found(&t, "abc", o, 2, 0), None);
         assert!(t.search_line(2).is_none());
         assert!(t.search_line(-1).is_none());
+    }
+
+    #[test]
+    fn a_character_that_lowercases_to_two_keeps_the_cells_after_it() {
+        let mut t = Engine::new(20, 2, 100);
+        // U+0130 lowercases to "i\u{307}": the characters after it still map to their own cells
+        t.feed("aB \u{130}x Ab".as_bytes());
+        let o = SearchOptions::default();
+        assert_eq!(found(&t, "ab", o, 0, 0), Some((0, 0, 0, 2)));
+        assert_eq!(found(&t, "ab", o, 0, 1), Some((0, 6, 0, 8)));
+        assert_eq!(found(&t, "x", o, 0, 0), Some((0, 4, 0, 5)));
+        assert_eq!(found(&t, "\u{130}", o, 0, 0), Some((0, 3, 0, 4)));
     }
 }
