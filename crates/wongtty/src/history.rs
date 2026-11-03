@@ -1240,7 +1240,7 @@ fn unit(c: char, wide: bool) -> (u32, usize) {
     )
 }
 
-/// `ascii` with the default attributes, for `encode` and `plain`.
+/// `ascii` with the default attributes, for `plain` (the text between clusters).
 #[inline(never)]
 fn default_ascii(cells: &[Cell], out: &mut Out) -> usize {
     ascii(cells, out, Flags::empty(), |c| {
@@ -1400,7 +1400,9 @@ fn encode(
     // Most rows are narrow ASCII text with the default attributes, then default blanks: one run, written here.
     let head = out.at;
     out.at += 3;
-    let n = default_ascii(cells, &mut out);
+    let n = ascii(cells, &mut out, Flags::empty(), |c| {
+        matches!(c.fg, DEFAULT_FG) & matches!(c.bg, DEFAULT_BG)
+    });
     // Then most others are text of any width with the default attributes: the run goes on through them.
     let (end, units) = if n == scan {
         (n, n)

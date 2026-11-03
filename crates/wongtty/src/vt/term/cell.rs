@@ -153,8 +153,8 @@ const MAX_INTERNED: usize = 512;
 thread_local! {
     /// wongtty: the interned clusters, `CellExtra`s with zerowidth characters only, shared by every cell (of any
     /// terminal) that has those characters: a cell with combining marks, a variation selector or a joiner then
-    /// takes no allocation of its own. A few distinct clusters make up most text, so a list searched from the front,
-    /// where a hit moves halfway up. Entries are never dropped.
+    /// takes no allocation of its own. A few distinct clusters make up most text, so a list searched from the
+    /// front, the first seen first. Entries are never dropped.
     static INTERNED: RefCell<Vec<Arc<CellExtra>>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -164,9 +164,8 @@ pub fn intern(marks: &[char]) -> Option<Arc<CellExtra>> {
         return None;
     }
     INTERNED.with_borrow_mut(|table| {
-        if let Some(at) = table.iter().position(|extra| extra.zerowidth == marks) {
-            table.swap(at, at / 2);
-            return Some(table[at / 2].clone());
+        if let Some(extra) = table.iter().find(|extra| extra.zerowidth == marks) {
+            return Some(extra.clone());
         }
         if table.len() == MAX_INTERNED {
             return None;

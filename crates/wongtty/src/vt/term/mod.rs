@@ -1510,8 +1510,7 @@ impl<T> Term<T> {
             // of ASCII text (words after an emoji), left to `input_ascii`.
             match zerowidth {
                 Some(c) if col > point.column.0 && extra.is_none() => {
-                    let last = col - 1 - cells[col - 1].flags.contains(Flags::WIDE_CHAR_SPACER) as usize;
-                    cells[last].push_zerowidth(c);
+                    put_mark(&mut cells[..col], c);
                     marked = true;
                     used = text.len() - chars.as_str().len();
                     if ascii8(chars.as_str().as_bytes()) {
@@ -1566,6 +1565,13 @@ impl<T> Term<T> {
 #[inline(always)]
 fn ascii8(text: &[u8]) -> bool {
     text.first_chunk::<8>().is_some_and(|b| u64::from_le_bytes(*b) & 0x8080_8080_8080_8080 == 0)
+}
+
+/// wongtty: puts zerowidth character `c` on the last of `cells` (a wide character's left half), as `input` does.
+#[inline(never)]
+fn put_mark(cells: &mut [Cell], c: char) {
+    let last = cells.len() - 1;
+    cells[last - cells[last].flags.contains(Flags::WIDE_CHAR_SPACER) as usize].push_zerowidth(c);
 }
 
 /// wongtty: the cells `c` takes (`wmux_unicode11::width`), without the table search for Latin text, CJK
