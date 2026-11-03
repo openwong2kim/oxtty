@@ -142,9 +142,10 @@ test('plain ASCII terms, matched in the engine, find and count what @xterm/addon
         steps.push(['findNext', term, options]);
       }
     }
-    // Starts inside wrapped lines (on their first and later rows) and at the top and bottom, with another term
+    // Starts inside wrapped lines (on their first and later rows) and at the top and bottom, with another term; terms
+    // whose previous match is hundreds of rows up, or near the top
     for (const [col, row] of [[0, 0], [3, 40], [5, 41], [29, 77], [0, 900], [10, 1200], [0, 1599], [20, 1601], [0, 1605]]) {
-      for (const [method, term] of [['findNext', 'foo'], ['findPrevious', 'foo'], ['findPrevious', 'aa'], ['findNext', 'k'], ['findPrevious', 'i']]) {
+      for (const [method, term] of [['findNext', 'foo'], ['findPrevious', 'foo'], ['findPrevious', 'aa'], ['findNext', 'k'], ['findPrevious', 'i'], ['findPrevious', 'kelvin'], ['findPrevious', 'row 1 foo']]) {
         steps.push(['select', col, row, 2], [method, term, {}], [method, term, {}]);
       }
     }

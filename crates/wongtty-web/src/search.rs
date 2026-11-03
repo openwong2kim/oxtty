@@ -347,16 +347,17 @@ impl<'a> Search<'a> {
     }
 
     /// The last buffer row in `lo..=hi` a match touches, `Some(None)` for none: single-match engine searches over
-    /// ranges ending at `hi`, doubling until one finds a match, then halving. `None` where the engine does not
-    /// match the term.
+    /// ranges ending at `hi`, doubling until one finds a match, then halving. Each search stops above the rows
+    /// already known to have none (a match touching them would have been found there), so each row is read about
+    /// once. `None` where the engine does not match the term.
     fn last_touched_row(&self, lo: i32, hi: i32) -> Option<Option<i32>> {
-        let touched = |from: i32| Some(!self.engine_matches(from, hi, 1)?.is_empty());
+        let touched = |from: i32, to: i32| Some(!self.engine_matches(from, to, 1)?.is_empty());
         // `yes` has a match in `yes..=hi`, `no` none in `no..=hi`
         let (mut yes, mut no) = (None, hi + 1);
         let mut span = 1;
         while yes.is_none() && no > lo {
             let from = hi.saturating_sub(span - 1).max(lo);
-            if touched(from)? {
+            if touched(from, no - 1)? {
                 yes = Some(from);
             } else {
                 no = from;
@@ -368,7 +369,7 @@ impl<'a> Search<'a> {
         };
         while no - yes > 1 {
             let mid = yes + (no - yes) / 2;
-            if touched(mid)? {
+            if touched(mid, no - 1)? {
                 yes = mid;
             } else {
                 no = mid;
