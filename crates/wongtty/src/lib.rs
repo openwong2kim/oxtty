@@ -383,7 +383,7 @@ fn push_bounded<T>(queue: &mut VecDeque<T>, item: T) {
 struct Listener(Arc<Mutex<Inbox>>);
 
 impl Listener {
-    // A poisoned lock (a panic elsewhere) keeps its contents usable, as TermHistory::lock does.
+    // A poisoned lock (a panic elsewhere) keeps its contents usable.
     fn inbox(&self) -> MutexGuard<'_, Inbox> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }

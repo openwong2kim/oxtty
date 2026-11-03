@@ -940,6 +940,9 @@ fn shrink_row(
 /// column change records the width rows are read at, which has to stay the
 /// primary grid's width, so a [`Term::resize`] past this would have rows
 /// stored at the new width read back at the old one.
+///
+/// The rows live in the primary grid, as its history sink, so the methods
+/// that take a term must get the one this was attached to.
 #[derive(Clone)]
 pub struct TermHistory {
     scrollback: usize,
@@ -979,6 +982,12 @@ impl TermHistory {
     }
 
     /// Rows held here, above the grid's history.
+    ///
+    /// # Panics
+    ///
+    /// If `term`'s primary grid does not hold a history from
+    /// [`TermHistory::attach`] (another term, or a history sink replaced
+    /// since). The same holds for every method that takes a term.
     pub fn len<T>(&self, term: &Term<T>) -> usize {
         self.stored(term).len()
     }
