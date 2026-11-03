@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use crate::vt::event::EventListener;
 use crate::vt::grid::{Dimensions, HistoryAbove, HistorySink, Row};
 use crate::vt::index::{Column, Line};
-use crate::vt::term::cell::{Cell, Extra, Flags};
+use crate::vt::term::cell::{Cell, CellExtra, Flags};
 use crate::vt::term::{Term, TermMode};
 use crate::vt::vte::ansi::{Color, NamedColor, Rgb};
 
@@ -82,7 +82,7 @@ impl Block {
     }
 }
 
-type Extras = Box<[(u16, Extra)]>;
+type Extras = Box<[(u16, Arc<CellExtra>)]>;
 
 pub(crate) struct History {
     limit: usize,
@@ -1378,7 +1378,7 @@ fn encode(
     scan: usize,
     buf: &mut [u8],
     at: usize,
-    extras: &mut Vec<(u16, Extra)>,
+    extras: &mut Vec<(u16, Arc<CellExtra>)>,
 ) -> usize {
     let cells = &row[..];
     let mut out = Out { buf, at };
@@ -1422,7 +1422,7 @@ fn encode_take(
     scan: usize,
     buf: &mut [u8],
     at: usize,
-    extras: &mut Vec<(u16, Extra)>,
+    extras: &mut Vec<(u16, Arc<CellExtra>)>,
 ) -> usize {
     if !row.plain {
         return encode(row, scan, buf, at, extras);
@@ -1551,18 +1551,24 @@ fn plain(cells: &[Cell], mut at: usize, out: &mut Out) -> (usize, usize) {
     (end, end_units)
 }
 
-/// The zerowidth characters `plain` writes after a unit: an interned cluster
-/// (no other extra) of up to `INLINE_MARKS`, which keeps a cell in `max_len`.
+/// The zerowidth characters `plain` writes after a unit: those of an extra
+/// with nothing else (an interned cluster), 1 to `INLINE_MARKS` of them, which
+/// keeps a cell in `max_len`.
 #[inline]
-fn inline_marks(extra: &Extra) -> Option<&[char]> {
-    let marks = extra.zerowidth();
-    (extra.get().is_none() & (marks.len() <= INLINE_MARKS)).then_some(marks)
+fn inline_marks(extra: &CellExtra) -> Option<&[char]> {
+    let marks = &extra.zerowidth[..];
+    (extra.marks_only() & (1..=INLINE_MARKS).contains(&marks.len())).then_some(marks)
 }
 
 /// `encode` for the other rows: the runs of `cells` from cell `start` on,
 /// written from `out.at` on.
 #[inline(never)]
-fn runs(cells: &[Cell], mut start: usize, mut out: Out, extras: &mut Vec<(u16, Extra)>) -> usize {
+fn runs(
+    cells: &[Cell],
+    mut start: usize,
+    mut out: Out,
+    extras: &mut Vec<(u16, Arc<CellExtra>)>,
+) -> usize {
     let scan = cells.len();
     let mut prev = (DEFAULT_FG, DEFAULT_BG, Flags::empty());
     while start < scan {
@@ -1892,7 +1898,7 @@ fn shape(mut bytes: &[u8]) -> Option<(usize, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vt::term::cell::{CellExtra, Hyperlink};
+    use crate::vt::term::cell::Hyperlink;
 
     fn encoded(row: &Row<Cell>) -> Vec<u8> {
         let scan = scan_len(row);
@@ -2019,7 +2025,7 @@ mod tests {
             '\0',
             '\u{7f}',
         ];
-        let link = Extra::from(Arc::new(CellExtra::default()));
+        let link = Arc::new(CellExtra::default());
         let mut history = History::new(usize::MAX);
         let mut rows = Vec::new();
         for _ in 0..3000 {
@@ -2281,8 +2287,7 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        let extras: Extras =
-            vec![(9999, Extra::from(Arc::new(CellExtra::default())))].into_boxed_slice();
+        let extras: Extras = vec![(9999, Arc::new(CellExtra::default()))].into_boxed_slice();
         for _ in 0..20_000 {
             let mut bytes = rows[next() as usize % rows.len()].clone();
             match next() % 3 {
