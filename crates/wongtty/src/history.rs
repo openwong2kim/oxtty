@@ -1024,16 +1024,26 @@ fn encode(
     let n = ascii(cells, &mut out, Flags::empty(), |c| {
         matches!(c.fg, DEFAULT_FG) & matches!(c.bg, DEFAULT_BG)
     });
-    if n == scan {
-        if n == 0 {
-            return head;
-        }
-        let [lo, hi] = (n as u16).to_le_bytes();
-        out.buf[head..head + 3].copy_from_slice(&[0, lo, hi]);
+    // Then most others are text of any width with the default attributes: the run goes on through them.
+    let (end, units) = if n == scan {
+        (n, n)
+    } else {
+        plain(cells, n, &mut out)
+    };
+    if units == 0 {
+        out.at = head;
+        return if end == scan {
+            head
+        } else {
+            runs(cells, 0, out, extras)
+        };
+    }
+    let [lo, hi] = (units as u16).to_le_bytes();
+    out.buf[head..head + 3].copy_from_slice(&[0, lo, hi]);
+    if end == scan {
         return out.at;
     }
-    out.at = head;
-    runs(cells, out, extras)
+    runs(cells, end, out, extras)
 }
 
 /// `encode` for a row that leaves the grid. A plain row (`Row::plain`: default
@@ -1076,12 +1086,64 @@ fn encode_take(
     body + n
 }
 
-/// `encode` for the other rows: the runs of `cells` from `out.at` on.
+/// Goes on with the first run of `encode` from cell `at`, which narrow ASCII
+/// text with the default attributes ends: takes the cells with the default
+/// colours and no extras that are narrow characters (typed spaces too),
+/// erased blanks, or wide characters with their right half (`is_pair`), and
+/// writes each as a unit. Returns the cell and the unit count after the last
+/// unit that is not an erased blank, and leaves `out` there: the cells after
+/// it are for `runs`. A unit at a time, a wide character and its right half
+/// in one step.
+#[inline(always)]
+fn plain(cells: &[Cell], mut at: usize, out: &mut Out) -> (usize, usize) {
+    let (wide, right, typed) = (
+        Flags::WIDE_CHAR.bits(),
+        Flags::WIDE_CHAR_SPACER.bits(),
+        Flags::TYPED_SPACE.bits(),
+    );
+    let attrs =
+        |c: &Cell| matches!(c.fg, DEFAULT_FG) & matches!(c.bg, DEFAULT_BG) & c.extra.is_none();
+    let scan = cells.len();
+    let mut units = at;
+    let (mut end, mut end_units, mut end_out) = (at, at, out.at);
+    while at < scan {
+        let cell = &cells[at];
+        // The cell after it, which a wide character's right half has to be. Past the end the cell itself, which
+        // then is no right half.
+        let next = &cells[min(at + 1, scan - 1)];
+        let (c, flags) = (cell.c, cell.flags.bits());
+        let pair = flags == wide;
+        let half = (next.c == ' ') & (next.flags.bits() == right) & attrs(next);
+        let ok = attrs(cell) & ((pair & half & (c != ' ')) | (flags & !typed == 0));
+        if !ok {
+            break;
+        }
+        let erased = (c == ' ') & (flags == 0);
+        let (word, len) = unit(c, pair);
+        out.word(word & (erased as u32).wrapping_sub(1), len);
+        at += 1 + pair as usize;
+        units += 1;
+        // Erased blanks that end the run are left to `runs`.
+        let text = !erased;
+        end = if text { at } else { end };
+        end_units = if text { units } else { end_units };
+        end_out = if text { out.at } else { end_out };
+    }
+    out.at = end_out;
+    (end, end_units)
+}
+
+/// `encode` for the other rows: the runs of `cells` from cell `start` on,
+/// written from `out.at` on.
 #[inline(never)]
-fn runs(cells: &[Cell], mut out: Out, extras: &mut Vec<(u16, Arc<CellExtra>)>) -> usize {
+fn runs(
+    cells: &[Cell],
+    mut start: usize,
+    mut out: Out,
+    extras: &mut Vec<(u16, Arc<CellExtra>)>,
+) -> usize {
     let scan = cells.len();
     let mut prev = (DEFAULT_FG, DEFAULT_BG, Flags::empty());
-    let mut start = 0;
     while start < scan {
         let first = &cells[start];
         let (fg, bg) = (first.fg, first.bg);
@@ -1641,6 +1703,66 @@ mod tests {
             decode(&bytes, Some(&extras));
         }
         assert_eq!(&decode(&[0xff; 12], None)[..], &Row::<Cell>::new(1)[..]);
+    }
+
+    /// The default-attribute first run of `encode` (`plain`) writes the bytes `runs` writes for the whole row, on
+    /// random rows of narrow, wide and broken wide characters, typed spaces, bold and coloured cells.
+    #[test]
+    fn plain_wide_matches_runs() {
+        let mut rng = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let chars = ['a', ' ', 'é', '가', '字', '😀', '~'];
+        for _ in 0..20000 {
+            let cols = 1 + (next() % 24) as usize;
+            let mut row = Row::<Cell>::new(cols);
+            let mut col = 0;
+            while col < cols {
+                let r = next();
+                let c = chars[(r % 7) as usize];
+                let wide = matches!(c, '가' | '字' | '😀');
+                let mut flags = if c == ' ' && r & 8 != 0 {
+                    Flags::TYPED_SPACE
+                } else {
+                    Flags::empty()
+                };
+                if r & 0x300 == 0 {
+                    flags |= Flags::BOLD;
+                }
+                if wide && col + 1 < cols {
+                    row[Column(col)] = cell(c, DEFAULT_FG, DEFAULT_BG, flags | Flags::WIDE_CHAR);
+                    let spacer = if r & 0x7000 == 0 {
+                        Flags::empty()
+                    } else {
+                        Flags::WIDE_CHAR_SPACER
+                    };
+                    row[Column(col + 1)] = cell(' ', DEFAULT_FG, DEFAULT_BG, flags | spacer);
+                    col += 2;
+                } else if !wide {
+                    let fg = if r & 0xf0000 == 0 {
+                        Color::Named(NamedColor::Red)
+                    } else {
+                        DEFAULT_FG
+                    };
+                    row[Column(col)] = cell(c, fg, DEFAULT_BG, flags);
+                    col += 1;
+                } else {
+                    col += 1;
+                }
+            }
+            let scan = scan_len(&row);
+            let a = encoded(&row);
+            let mut b = vec![0; max_len(scan)];
+            let mut out = Out { buf: &mut b, at: 0 };
+            out.varint(row.len());
+            let end = runs(&row[..][..scan], 0, out, &mut Vec::new());
+            assert_eq!(a, &b[..end], "{row:?}");
+            assert_eq!(decode(&a, None), row);
+        }
     }
 }
 
