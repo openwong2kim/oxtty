@@ -16,8 +16,6 @@ use crate::parser::Parsed;
 use crate::render::{Dirty, Renderer};
 use crate::timer;
 
-/// Feed the engine at most this long per task, then yield to the next task (xterm.js WriteBuffer).
-const TIME_BUDGET_MS: f64 = 12.0;
 /// Bytes or UTF-16 units fed per engine call.
 const SLICE: u32 = 16 * 1024;
 /// Options that only the constructor takes, like xterm.js.
@@ -128,7 +126,8 @@ pub(crate) struct Shared {
     state: Cell<State>,
     /// Serialises OSC 52 reads so each answers the oldest pending read.
     clipboard_reads: RefCell<Promise>,
-    drain_timer: RefCell<Option<timer::Timeout>>,
+    /// Waiting for a turn of the write scheduler, or in one.
+    drain_queued: Cell<bool>,
     frame: RefCell<Option<timer::AnimationFrame>>,
     options_proxy: RefCell<Option<(Proxy, ProxySetTrap)>>,
     /// `onCrash` and `onSyncFlush` the engine holds; they live as long as the terminal.
@@ -209,7 +208,7 @@ impl Terminal {
             images: RefCell::new(None),
             state: Cell::new(State::default()),
             clipboard_reads: RefCell::new(Promise::resolve(&JsValue::UNDEFINED)),
-            drain_timer: RefCell::new(None),
+            drain_queued: Cell::new(false),
             frame: RefCell::new(None),
             options_proxy: RefCell::new(None),
             engine_callbacks: (on_crash, on_sync_flush),
@@ -425,7 +424,6 @@ impl Terminal {
         crate::markers::drop_all(&self.shared);
         crate::parser::dispose(&self.shared);
         crate::image::dispose(&self.shared);
-        self.shared.drain_timer.borrow_mut().take();
         self.shared.frame.borrow_mut().take();
         self.shared.options_proxy.borrow_mut().take();
         let e = &self.shared.events;
@@ -451,16 +449,19 @@ impl Terminal {
 
 impl Shared {
     pub(crate) fn schedule_drain(self: &Rc<Self>) {
-        if self.drain_timer.borrow().is_some() {
+        if self.drain_queued.replace(true) {
             return;
         }
-        let weak = Rc::downgrade(self);
-        *self.drain_timer.borrow_mut() = Some(timer::Timeout::new(0, move || {
-            if let Some(shared) = weak.upgrade() {
-                shared.drain_timer.borrow_mut().take();
-                shared.drain();
-            }
-        }));
+        timer::schedule(Rc::downgrade(self));
+    }
+
+    /// A turn of the write scheduler ([`timer::schedule`]): parses until `until`; returns whether writes are left.
+    pub(crate) fn drain_turn(self: Rc<Self>, until: f64) -> bool {
+        self.drain(until);
+        // A paused parser queues the terminal again when it resumes; a disposed one keeps nothing queued.
+        let more = !crate::parser::paused(&self) && self.writes_queued();
+        self.drain_queued.set(more);
+        more
     }
 
     /// Whether writes wait in the queue.
@@ -468,13 +469,13 @@ impl Shared {
         !self.core.borrow().queue.is_empty()
     }
 
-    /// Feeds queued writes for up to [`TIME_BUDGET_MS`]. A crashed engine drops the chunk it was fed. An async
-    /// parser handler holds the queue: the chunk it stopped in stays first, its callback waits.
-    fn drain(self: &Rc<Self>) {
+    /// Feeds queued writes until `until` (a [`timer::now`] time), at least one slice. A crashed engine drops the
+    /// chunk it was fed. An async parser handler holds the queue: the chunk it stopped in stays first, its
+    /// callback waits.
+    fn drain(self: &Rc<Self>, until: f64) {
         if crate::parser::paused(self) {
             return;
         }
-        let start = timer::now();
         let mut paused = false;
         loop {
             let (slice, rest) = {
@@ -521,12 +522,9 @@ impl Shared {
                     }
                 }
             }
-            if timer::now() - start >= TIME_BUDGET_MS {
+            if timer::now() >= until {
                 break;
             }
-        }
-        if !paused && self.writes_queued() {
-            self.schedule_drain();
         }
         {
             let mut core = self.core.borrow_mut();
@@ -767,6 +765,15 @@ impl Shared {
     }
 
     fn render_frame(self: &Rc<Self>) {
+        // Writes that came since the last frame show in this one, within the scheduler's frame budget.
+        let deadline = timer::frame_started(self.writes_queued());
+        if let Some(until) = deadline {
+            self.drain(until);
+        }
+        // The drain asked for the frame being drawn now.
+        if deadline.is_some() {
+            self.frame.borrow_mut().take();
+        }
         self.handle_renderer_requests();
         self.apply_scroll_requests();
         let (rows, content, switched) = {
