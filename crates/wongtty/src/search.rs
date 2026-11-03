@@ -72,10 +72,30 @@ impl Text {
             }
     }
 
-    fn fold(self) -> Self {
-        let mut chars = Vec::with_capacity(self.chars.len());
-        let mut cells = Vec::with_capacity(self.cells.len());
-        for (c, at) in self.chars.iter().zip(&self.cells) {
+    fn fold(mut self) -> Self {
+        // In place while each character lowercases to one; the first that lowercases to several rebuilds the rest
+        for i in 0..self.chars.len() {
+            let c = &mut self.chars[i];
+            if c.is_ascii() {
+                c.make_ascii_lowercase();
+                continue;
+            }
+            let mut lower = c.to_lowercase();
+            match (lower.next(), lower.next()) {
+                (Some(l), None) => *c = l,
+                _ => return self.fold_from(i),
+            }
+        }
+        self
+    }
+
+    /// Lowercases characters `i..` into new buffers (some lowercase to several characters).
+    fn fold_from(self, i: usize) -> Self {
+        let mut chars = Vec::with_capacity(self.chars.len() + 1);
+        let mut cells = Vec::with_capacity(self.cells.len() + 1);
+        chars.extend_from_slice(&self.chars[..i]);
+        cells.extend_from_slice(&self.cells[..i]);
+        for (c, at) in self.chars[i..].iter().zip(&self.cells[i..]) {
             for l in c.to_lowercase() {
                 chars.push(l);
                 cells.push(*at);
@@ -98,10 +118,19 @@ impl Text {
                     && (e == self.chars.len() || separator(self.chars[e]))))
     }
 
-    /// The first match starting at character `from` or later.
+    /// The first match starting at character `from` or later (`query` is not empty).
     fn next(&self, query: &[char], from: usize, whole_word: bool) -> Option<usize> {
         let last = self.chars.len().checked_sub(query.len())?;
-        (from..=last).find(|&s| self.is_match(query, s, whole_word))
+        let mut s = from;
+        // Only where the first character matches
+        while s <= last {
+            s += self.chars[s..=last].iter().position(|&c| c == query[0])?;
+            if self.is_match(query, s, whole_word) {
+                return Some(s);
+            }
+            s += 1;
+        }
+        None
     }
 
     /// The last match ending at character `before` or earlier.
@@ -130,10 +159,25 @@ fn is_empty(cell: &AlacCell) -> bool {
         && cell.zerowidth().is_none_or(|marks| marks.is_empty())
 }
 
-/// Appends a row's characters; returns the length the text keeps if the logical line ends here.
-fn push_row(row: &Row<AlacCell>, base: u32, chars: &mut Vec<char>, cells: &mut Vec<u32>) -> usize {
+/// Appends a row's characters; returns the length the text keeps if the logical line ends here. A row that `ends` the
+/// line stops at its last cell that is not empty.
+fn push_row(
+    row: &Row<AlacCell>,
+    base: u32,
+    ends: bool,
+    chars: &mut Vec<char>,
+    cells: &mut Vec<u32>,
+) -> usize {
     let mut content = chars.len();
-    for (col, cell) in row[..].iter().enumerate() {
+    let cells_in = if ends {
+        row[..]
+            .iter()
+            .rposition(|c| !is_empty(c))
+            .map_or(0, |i| i + 1)
+    } else {
+        row.len()
+    };
+    for (col, cell) in row[..][..cells_in].iter().enumerate() {
         if cell
             .flags
             .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
@@ -159,6 +203,17 @@ fn push_row(row: &Row<AlacCell>, base: u32, chars: &mut Vec<char>, cells: &mut V
     content
 }
 
+/// Rows read bottom up by [`Engine::search_previous`], so each is decoded once: finding where a line starts reads the
+/// row above it, which ends the next line up and stays here for it.
+#[derive(Default)]
+struct RowsUp {
+    /// Each row's characters and cells (counted from its own column 0), the bottom row first.
+    chars: Vec<char>,
+    cells: Vec<u32>,
+    /// Where each row starts in `chars`.
+    starts: Vec<usize>,
+}
+
 impl Engine {
     fn top_line(&self) -> i32 {
         -(self.history_len() as i32)
@@ -175,18 +230,37 @@ impl Engine {
 
     /// The logical line starting at row `first`.
     fn read_line(&self, first: i32) -> Option<Text> {
+        let (mut chars, mut cells) = (Vec::new(), Vec::new());
+        let rows = self.read_line_into(first, &mut chars, &mut cells)?;
+        Some(Text {
+            first,
+            rows,
+            chars,
+            cells,
+        })
+    }
+
+    /// Reads the logical line starting at row `first` into reused buffers; returns its row count.
+    fn read_line_into(
+        &self,
+        first: i32,
+        chars: &mut Vec<char>,
+        cells: &mut Vec<u32>,
+    ) -> Option<i32> {
+        chars.clear();
+        cells.clear();
         let cols = self.cols() as u32;
         let bottom = self.rows() as i32 - 1;
-        let (mut chars, mut cells) = (Vec::new(), Vec::new());
         let mut rows = 0;
         let mut keep;
         loop {
             let line = first + rows;
             let (content, wrapped) = self.with_row(line, |row| {
-                let content = push_row(row, rows as u32 * cols, &mut chars, &mut cells);
                 let wrapped = row
                     .last()
                     .is_some_and(|c| c.flags.contains(Flags::WRAPLINE));
+                let ends = !wrapped || line >= bottom;
+                let content = push_row(row, rows as u32 * cols, ends, chars, cells);
                 (content, wrapped)
             })?;
             keep = content;
@@ -197,9 +271,52 @@ impl Engine {
         }
         chars.truncate(keep);
         cells.truncate(keep);
+        Some(rows)
+    }
+
+    /// Pushes row `line` onto `up`; returns whether it wraps.
+    fn push_up(&self, line: i32, up: &mut RowsUp) -> Option<bool> {
+        up.starts.push(up.chars.len());
+        self.with_row(line, |row| {
+            let wrapped = row
+                .last()
+                .is_some_and(|c| c.flags.contains(Flags::WRAPLINE));
+            push_row(row, 0, !wrapped, &mut up.chars, &mut up.cells);
+            wrapped
+        })
+    }
+
+    /// The logical line that ends at row `last` (above a row that starts one), as [`Engine::read_line`] reads it.
+    fn read_line_up(&self, last: i32, up: &mut RowsUp) -> Option<Text> {
+        if up.starts.is_empty() {
+            self.push_up(last, up)?;
+        }
+        let top = self.top_line();
+        let mut first = last;
+        while first > top && self.push_up(first - 1, up)? {
+            first -= 1;
+        }
+        let rows = (last - first + 1) as usize;
+        let end = up.starts.get(rows).copied().unwrap_or(up.chars.len());
+        let cols = self.cols() as u32;
+        let (mut chars, mut cells) = (Vec::with_capacity(end), Vec::with_capacity(end));
+        for k in (0..rows).rev() {
+            let row = up.starts[k]..up.starts.get(k + 1).copied().unwrap_or(end);
+            let base = (rows - 1 - k) as u32 * cols;
+            chars.extend_from_slice(&up.chars[row.clone()]);
+            cells.extend(up.cells[row].iter().map(|&at| at + base));
+        }
+        // What is left is the row above, the last of the next line up
+        let carried = up.starts.len() > rows;
+        up.chars.drain(..end);
+        up.cells.drain(..end);
+        up.starts.clear();
+        if carried {
+            up.starts.push(0);
+        }
         Some(Text {
             first,
-            rows,
+            rows: rows as i32,
             chars,
             cells,
         })
@@ -298,20 +415,24 @@ impl Engine {
         } else {
             (line, col)
         };
-        let (mut first, mut before) = self.locate(line, col)?;
+        let (first, mut before) = self.locate(line, col)?;
         let top = self.top_line();
+        let mut text = self.read_folded(first, options)?;
+        let mut up = RowsUp::default();
         loop {
-            let text = self.read_folded(first, options)?;
             let bound = (0..text.cells.len())
                 .find(|&i| text.end(i) > before)
                 .unwrap_or(text.cells.len());
             if let Some(s) = text.previous(&needle, bound, options.whole_word) {
                 return Some(text.found(s, needle.len(), cols));
             }
-            if first <= top {
+            if text.first <= top {
                 return None;
             }
-            first = self.line_start(first - 1);
+            text = self.read_line_up(text.first - 1, &mut up)?;
+            if !options.case_sensitive {
+                text = text.fold();
+            }
             before = u32::MAX;
         }
     }
@@ -334,10 +455,20 @@ impl Engine {
         }
         let cols = self.cols() as u32;
         let mut line = self.line_start(first.max(self.top_line()));
+        let (mut chars, mut cells) = (Vec::new(), Vec::new());
         while line <= last {
-            let Some(text) = self.read_folded(line, options) else {
+            let Some(rows) = self.read_line_into(line, &mut chars, &mut cells) else {
                 return;
             };
+            let mut text = Text {
+                first: line,
+                rows,
+                chars: std::mem::take(&mut chars),
+                cells: std::mem::take(&mut cells),
+            };
+            if !options.case_sensitive {
+                text = text.fold();
+            }
             let mut at = 0;
             while let Some(s) = text.next(&needle, at, options.whole_word) {
                 let found = text.found(s, needle.len(), cols);
@@ -347,6 +478,7 @@ impl Engine {
                 at = s + needle.len();
             }
             line += text.rows;
+            (chars, cells) = (text.chars, text.cells);
         }
     }
 
@@ -366,6 +498,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TermHistory;
 
     fn found(
         t: &Engine,
@@ -376,6 +509,64 @@ mod tests {
     ) -> Option<(i32, u16, i32, u16)> {
         t.search_next(q, o, line, col)
             .map(|m| (m.start_line, m.start_col, m.end_line, m.end_col))
+    }
+
+    /// Every match `search_previous` steps through from the end of the buffer.
+    fn all_previous(t: &Engine, q: &str, o: SearchOptions) -> Vec<SearchMatch> {
+        let (mut line, mut col) = (t.rows() as i32, 0);
+        let mut out = Vec::new();
+        while let Some(m) = t.search_previous(q, o, line, col) {
+            out.push(m);
+            (line, col) = (m.start_line, m.start_col);
+        }
+        out
+    }
+
+    #[test]
+    fn previous_reads_compressed_history_as_the_grid_does_and_decodes_each_row_once() {
+        let mut packed = Engine::new(12, 4, 500);
+        let mut plain = Engine::new_uncompressed(12, 4, 500);
+        for i in 0..300 {
+            // Single rows, lines that wrap over up to four rows, wide characters and İ (two characters lowercased)
+            let line = match i % 5 {
+                0 => format!("Ab{i} "),
+                1 => format!("{}ab", "x Ab ".repeat(i % 9)),
+                2 => format!("漢字Ab{}", "İab".repeat(i % 4)),
+                3 => String::new(),
+                _ => format!("{}AB", "-".repeat(11)),
+            };
+            packed.feed(format!("{line}\r\n").as_bytes());
+            plain.feed(format!("{line}\r\n").as_bytes());
+        }
+        let options = [
+            SearchOptions::default(),
+            SearchOptions {
+                case_sensitive: true,
+                whole_word: false,
+            },
+            SearchOptions {
+                case_sensitive: false,
+                whole_word: true,
+            },
+        ];
+        let mut matches = 0;
+        for offset in [0, 150] {
+            packed.scroll_to_bottom();
+            packed.scroll_display(offset);
+            for o in options {
+                for q in ["ab", "Ab", "i̇ab", "字a"] {
+                    let want = all_previous(&plain, q, o);
+                    matches += want.len();
+                    assert_eq!(all_previous(&packed, q, o), want, "{q} {o:?} at {offset}");
+                }
+            }
+        }
+        assert!(matches > 1000, "{matches}");
+        packed.scroll_to_bottom();
+        let before = crate::DECODES.with(std::cell::Cell::get);
+        assert_eq!(packed.search_previous("absent", options[0], 4, 0), None);
+        let decoded = crate::DECODES.with(std::cell::Cell::get) - before;
+        assert_eq!(decoded, packed.history_len() - TermHistory::RECENT);
     }
 
     #[test]
@@ -494,5 +685,17 @@ mod tests {
         assert_eq!(found(&t, "abc", o, 2, 0), None);
         assert!(t.search_line(2).is_none());
         assert!(t.search_line(-1).is_none());
+    }
+
+    #[test]
+    fn a_character_that_lowercases_to_two_keeps_the_cells_after_it() {
+        let mut t = Engine::new(20, 2, 100);
+        // U+0130 lowercases to "i\u{307}": the characters after it still map to their own cells
+        t.feed("aB \u{130}x Ab".as_bytes());
+        let o = SearchOptions::default();
+        assert_eq!(found(&t, "ab", o, 0, 0), Some((0, 0, 0, 2)));
+        assert_eq!(found(&t, "ab", o, 0, 1), Some((0, 6, 0, 8)));
+        assert_eq!(found(&t, "x", o, 0, 0), Some((0, 4, 0, 5)));
+        assert_eq!(found(&t, "\u{130}", o, 0, 0), Some((0, 3, 0, 4)));
     }
 }

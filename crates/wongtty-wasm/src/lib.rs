@@ -110,7 +110,7 @@ fn set_out(bytes: Vec<u8>) -> u32 {
 /// ABI version of these exports; bump on any incompatible change.
 #[no_mangle]
 pub extern "C" fn wongtty_abi() -> u32 {
-    13
+    14
 }
 
 #[no_mangle]
@@ -139,6 +139,12 @@ pub extern "C" fn wongtty_out_ptr() -> *const u8 {
 #[no_mangle]
 pub extern "C" fn wongtty_out_len() -> u32 {
     OUT.with_borrow(|out| out.len() as u32)
+}
+
+/// Frees OUT, once the host has copied a large result (a snapshot) out of it.
+#[no_mangle]
+pub extern "C" fn wongtty_out_release() {
+    OUT.with_borrow_mut(|out| *out = Vec::new());
 }
 
 #[no_mangle]
@@ -523,7 +529,11 @@ pub extern "C" fn wongtty_ansi_snapshot(h: u32, scrollback: i32, flags: u32) -> 
         exclude_modes: flags & 1 != 0,
     };
     with(h, 0, |t| match t.ansi_snapshot_with(options) {
-        Ok(bytes) => set_out(bytes) as i32,
+        Ok(mut bytes) => {
+            // Linear memory never shrinks: hold only the bytes until the host takes them
+            bytes.shrink_to_fit();
+            set_out(bytes) as i32
+        }
         Err(why) => -(set_out(why.as_str().as_bytes().to_vec()) as i32),
     })
 }
