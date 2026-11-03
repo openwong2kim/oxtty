@@ -427,8 +427,8 @@ fn release_freed() {
 
 /// The older history rows while the grid resizes. A column change reflows
 /// them one row at a time, decoding each and storing the result in a new
-/// [`History`] whose rows are numbered from `next` on; a block whose rows it
-/// changes none of moves there as it is.
+/// [`History`] whose rows are numbered from `next` on; a row or a block of
+/// rows it changes none of moves there as it is stored.
 #[derive(Debug)]
 struct Above {
     rows: History,
