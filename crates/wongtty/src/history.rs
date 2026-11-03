@@ -181,6 +181,67 @@ impl History {
         })
     }
 
+    /// The ASCII characters of row `i`'s text as a set (bit `c` for `c`; a space may be missing, as blanks read as
+    /// spaces too), whether it wraps (`wrapped`), and how many bytes it is stored in, from its bytes. `None` for a
+    /// row with extras or bytes that do not read.
+    pub(crate) fn ascii_in(&self, i: usize) -> Option<(u128, bool, usize)> {
+        let abs = self.first + i as u64;
+        if self
+            .extras
+            .binary_search_by_key(&abs, |(at, _)| *at)
+            .is_ok()
+        {
+            return None;
+        }
+        let mut bytes = self.bytes(i);
+        let len = bytes.len();
+        let cols = take_varint(&mut bytes)?;
+        let (mut cells, mut flags, mut ascii) = (0, 0, 0u128);
+        while !bytes.is_empty() {
+            let head = take(&mut bytes, 3)?;
+            let (tag, n) = (head[0], u16::from_le_bytes([head[1], head[2]]) as usize);
+            // A colour is its kind and 2, 1 or 3 bytes (`Out::color`).
+            for color in [FG, BG] {
+                if tag & color != 0 {
+                    let kind = *bytes.first()?;
+                    take(&mut bytes, [3, 2].get(kind as usize).map_or(4, |&n| n))?;
+                }
+            }
+            if tag & FLAGS != 0 {
+                let b = take(&mut bytes, 2)?;
+                flags = u16::from_le_bytes([b[0], b[1]]);
+            }
+            if tag & BLANK != 0 {
+                cells += n;
+                continue;
+            }
+            for _ in 0..n {
+                let (&b, rest) = bytes.split_first()?;
+                if b < UNIT_2 {
+                    ascii |= 1 << b;
+                    bytes = rest;
+                    cells += 1;
+                } else {
+                    let unit = take(&mut bytes, if b < UNIT_3 { 2 } else { 3 })?;
+                    // A wide ASCII character
+                    if b & !WIDE == UNIT_2 && unit[1] < 0x80 {
+                        ascii |= 1 << unit[1];
+                    }
+                    cells += 1 + (b & WIDE != 0) as usize;
+                }
+                if let Some(&m) = bytes.first().filter(|&&m| m > MARKS) {
+                    for &m in &take(&mut bytes, 1 + (m - MARKS) as usize)?[1..] {
+                        ascii |= if m < 0x80 { 1 << m } else { 0 };
+                    }
+                }
+            }
+        }
+        let wraps = flags as u32 & Flags::WRAPLINE.bits() != 0
+            && cells == cols
+            && (self.cols == 0 || self.cols == cols);
+        Some((ascii, wraps, len))
+    }
+
     /// Row `i` as `Engine::row_packed` gives it decoded, read straight from its bytes into `out`. False when the
     /// row has extras or zerowidth characters, or bytes `decode` would not read: the caller decodes it instead.
     pub(crate) fn row_packed_into(&self, i: usize, out: &mut Vec<u32>) -> bool {
@@ -2214,6 +2275,21 @@ mod tests {
             plain && !marks,
             "row {i}"
         );
+        // Every ASCII character of the text (and those of runs a right half's flag leaves out), but for blanks and
+        // tabs (row_string has spaces for them), and the wrap.
+        if let Some((ascii, wraps, _)) = history.ascii_in(i) {
+            let mut text = String::new();
+            crate::push_row_string(row, false, &mut text);
+            let want = text
+                .chars()
+                .filter(|c| c.is_ascii())
+                .fold(0u128, |m, c| m | 1 << c as u32);
+            let blanks = 1 | 1 << b' ' | 1 << b'\t';
+            assert_eq!(want & !ascii & !blanks, 0, "row {i}");
+            assert_eq!(wraps, history.wrapped(i), "row {i}");
+        } else {
+            assert!(!plain, "row {i}");
+        }
         for width in [0, 1, row.len().saturating_sub(3).max(1), row.len() + 5] {
             if plain && !marks {
                 let mut want = Vec::new();
