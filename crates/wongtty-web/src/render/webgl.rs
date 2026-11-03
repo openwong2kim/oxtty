@@ -14,9 +14,11 @@
 //! (`display: none`, zero size, scrolled away): it redraws everything when it comes back. A blinking cursor
 //! draws nothing either: it is a small layer over the canvas whose opacity the blink flips ([`CursorLayer`]).
 //!
-//! The canvas's pixels live in the GPU process, where Chromium keeps several buffers of the canvas's size behind a
-//! 2D canvas that keeps drawing. A pane that stopped drawing gets back down to one ([`Inner::compact_canvas`]), and
-//! a pane that takes no room on the page (`display: none`) has none ([`collapse_observer`]).
+//! The canvas's pixels live in the GPU process. A canvas that takes frames by transfer (on a GPU, see
+//! [`super::gpu`]) holds the last one only; behind a 2D canvas that keeps drawing (the copy path), Chromium keeps
+//! several buffers of the canvas's size, and a pane that stopped drawing gets back down to one
+//! ([`Inner::compact_canvas`]). A pane that takes no room on the page (`display: none`) has none
+//! ([`collapse_observer`]).
 //!
 //! # Re-entrancy
 //!
@@ -463,6 +465,7 @@ impl Inner {
         self.collapsed = collapsed;
         if collapsed {
             self.compact = None;
+            self.present.clear();
             self.canvas.set_width(0);
             self.canvas.set_height(0);
             return;
@@ -521,6 +524,7 @@ impl Inner {
         atlas::release(self.id);
         self.atlas = None;
         self.glyphs.set_atlas(None);
+        self.present.clear();
         self.canvas.remove();
         self.measure = None;
     }
@@ -891,10 +895,11 @@ impl Inner {
             layer.show(blink_shown);
         }
     }
-    /// Compacts the canvas once it has not drawn for [`COMPACT_AFTER_MS`].
+    /// Compacts the canvas once it has not drawn for [`COMPACT_AFTER_MS`] (a canvas that takes frames by
+    /// transfer has no buffers of its own to free).
     fn schedule_compact(&mut self) {
         self.last_draw_at = timer::now();
-        if self.compact.is_none() {
+        if self.compact.is_none() && self.present.has_buffers() {
             self.arm_compact(COMPACT_AFTER_MS);
         }
     }
@@ -1164,6 +1169,12 @@ impl Inner {
         );
         set("liveAtlases", atlas::live_atlases().into());
         set("canvas", self.canvas.clone().into());
+        let present = if self.present.has_buffers() {
+            "copy"
+        } else {
+            "transfer"
+        };
+        set("present", present.into());
         set("focused", self.focused.into());
         set("visible", self.visible.into());
         set("draws", self.draws.into());
