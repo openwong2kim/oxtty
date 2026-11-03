@@ -54,8 +54,8 @@ struct Block {
     /// The rows take `bytes[..end]`; the rest is room for the next row.
     bytes: Vec<u8>,
     end: usize,
-    /// Where each row starts in `bytes`.
-    starts: Vec<u32>,
+    /// Where each row starts in `bytes`: below `BLOCK_BYTES`, so a `u16`.
+    starts: Vec<u16>,
 }
 
 type Extras = Box<[(u16, Arc<CellExtra>)]>;
@@ -70,7 +70,8 @@ pub(crate) struct History {
     /// Rows are appended in order and dropped from the front, so a deque
     /// sorted by row number is enough.
     extras: VecDeque<(u64, Extras)>,
-    /// The last block dropped from the oldest end, kept for the next one.
+    /// The last block of `BLOCK_BYTES` dropped from the oldest end, kept for the next one: the system allocator
+    /// of macOS does not always hand a freed 64 KiB back, which costs more footprint than the block.
     spare: Option<Block>,
     /// The program cleared the history (`CSI 3 J`, RIS). The engine returns
     /// the view to the bottom and lowers this.
@@ -134,37 +135,52 @@ impl History {
     }
 
     /// Stores a row that leaves the grid (or a reflow): the sink may blank the cells it takes (`encode_take`).
+    ///
+    /// A row is written straight into the room left in the newest block. Where that room may be too small, it is
+    /// encoded aside first and goes in where it fits, so that no block grows past `BLOCK_BYTES` (into a larger
+    /// allocation) but a block holding one row that is larger.
     fn push_row(&mut self, row: &mut Row<Cell>) {
         if self.limit == 0 {
             return;
         }
         let abs = self.first + self.len as u64;
-        if self.blocks.back().is_none_or(|b| b.end >= BLOCK_BYTES) {
-            let mut block = self.spare.take().unwrap_or_else(|| Block {
-                first: 0,
-                bytes: vec![0; BLOCK_BYTES],
-                end: 0,
-                starts: Vec::new(),
-            });
-            block.first = abs;
-            block.end = 0;
-            block.starts.clear();
-            self.blocks.push_back(block);
-        }
-        // Write at the end of the block. A row may run past the block size;
-        // the next row then starts a new block.
-        let Some(block) = self.blocks.back_mut() else {
-            return;
-        };
         let scan = scan_len(row);
-        let room = block.end + max_len(scan);
-        if block.bytes.len() < room {
-            block.bytes.reserve_exact(room - block.bytes.len());
-            block.bytes.resize(room, 0);
-        }
-        block.starts.push(block.end as u32);
+        let room = max_len(scan);
         let mut extras = Vec::new();
-        block.end = encode_take(row, scan, &mut block.bytes, block.end, &mut extras);
+        match self.blocks.back_mut() {
+            Some(block) if block.end + room <= block.bytes.len() => {
+                block.starts.push(block.end as u16);
+                block.end = encode_take(row, scan, &mut block.bytes, block.end, &mut extras);
+            }
+            _ => {
+                let mut aside = vec![0; room];
+                let len = encode_take(row, scan, &mut aside, 0, &mut extras);
+                if self
+                    .blocks
+                    .back()
+                    .is_none_or(|b| b.end + len > b.bytes.len())
+                {
+                    let spare = self.spare.take().filter(|_| len <= BLOCK_BYTES);
+                    let mut block = spare.unwrap_or_else(|| Block {
+                        first: 0,
+                        bytes: vec![0; BLOCK_BYTES.max(len)],
+                        end: 0,
+                        starts: Vec::new(),
+                    });
+                    block.first = abs;
+                    block.end = 0;
+                    block.starts.clear();
+                    self.blocks.push_back(block);
+                }
+                let Some(block) = self.blocks.back_mut() else {
+                    return;
+                };
+                debug_assert!(block.end < BLOCK_BYTES);
+                block.starts.push(block.end as u16);
+                block.bytes[block.end..block.end + len].copy_from_slice(&aside[..len]);
+                block.end += len;
+            }
+        }
         if !extras.is_empty() {
             self.extras.push_back((abs, extras.into_boxed_slice()));
         }
@@ -183,7 +199,10 @@ impl History {
         if let Some(front) = self.blocks.front() {
             if self.first >= front.first + front.starts.len() as u64 {
                 let block = self.blocks.pop_front();
-                if self.spare.is_none() {
+                // A larger block (one row past `BLOCK_BYTES`) is freed: rows start below `BLOCK_BYTES` only.
+                if self.spare.is_none()
+                    && block.as_ref().is_some_and(|b| b.bytes.len() == BLOCK_BYTES)
+                {
                     self.spare = block;
                 }
             }
@@ -1743,6 +1762,45 @@ mod tests {
             decode(&bytes, Some(&extras));
         }
         assert_eq!(&decode(&[0xff; 12], None)[..], &Row::<Cell>::new(1)[..]);
+    }
+
+    /// No block grows past `BLOCK_BYTES` but one that holds a single larger row, and every row reads back, with
+    /// rows that fill a block in a few (a colour per cell) and one larger than a block.
+    #[test]
+    fn blocks_keep_their_size() {
+        let mut history = History::new(1000);
+        let mut rows = Vec::new();
+        for n in 0..300u32 {
+            let cols = if n == 151 {
+                30000
+            } else {
+                2000 + n as usize % 7
+            };
+            let mut row = Row::<Cell>::new(cols);
+            for col in 0..cols.min(if n % 3 == 0 { 40 } else { cols }) {
+                let rgb = Rgb {
+                    r: col as u8,
+                    g: n as u8,
+                    b: 7,
+                };
+                row[Column(col)] = cell('x', Color::Spec(rgb), DEFAULT_BG, Flags::empty());
+            }
+            history.push(&mut row.clone());
+            rows.push(row);
+        }
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(history.row(i), *row, "row {i}");
+        }
+        assert!(history.blocks.len() > 3);
+        assert!(history.blocks.iter().any(|b| b.bytes.len() > BLOCK_BYTES));
+        for block in &history.blocks {
+            assert!(
+                block.bytes.len() == BLOCK_BYTES || block.starts.len() == 1,
+                "{}",
+                block.bytes.len()
+            );
+            assert!(block.end <= block.bytes.len());
+        }
     }
 
     /// The default-attribute first run of `encode` (`plain`) writes the bytes `runs` writes for the whole row, on
