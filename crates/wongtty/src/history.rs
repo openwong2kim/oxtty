@@ -755,10 +755,22 @@ fn is_default(c: &Cell) -> bool {
 /// past `occ` all equal the last cell (the Row::reset invariant), so with a
 /// default blank last the scan can stop there.
 #[inline]
-/// What `Row::plain` promises of every cell of the row.
-fn is_plain(c: &Cell) -> bool {
-    let attrs = c.fg == DEFAULT_FG && c.bg == DEFAULT_BG && c.extra.is_none();
-    attrs && (c.flags - Flags::TYPED_SPACE).is_empty() && (' '..='~').contains(&c.c)
+/// What `Row::plain` promises of the cells of a row.
+fn is_plain(cells: &[Cell]) -> bool {
+    let attrs = |c: &Cell| c.fg == DEFAULT_FG && c.bg == DEFAULT_BG && c.extra.is_none();
+    let mut i = 0;
+    while let Some(c) = cells.get(i) {
+        let pair = c.flags == Flags::WIDE_CHAR
+            && c.c != ' '
+            && cells
+                .get(i + 1)
+                .is_some_and(|r| attrs(r) && r.c == ' ' && r.flags == Flags::WIDE_CHAR_SPACER);
+        if !(attrs(c) && (pair || (c.flags - Flags::TYPED_SPACE).is_empty())) {
+            return false;
+        }
+        i += 1 + pair as usize;
+    }
+    true
 }
 
 fn scan_len(row: &Row<Cell>) -> usize {
@@ -860,13 +872,13 @@ fn unit(c: char, wide: bool) -> (u32, usize) {
     // first of the three bytes is the marker alone, and the other two are the two-byte form but for its marker.
     let three = ((UNIT_3 as u32 | w) << 16 | n).swap_bytes() >> 8;
     let two = three >> 8 | UNIT_2 as u32 | w;
-    if (n < 0x80) & !wide {
-        (n, 1)
-    } else if n < 0x2000 {
-        (two, 2)
-    } else {
-        (three, 3)
-    }
+    // Selects, not branches: in mixed text the length changes from one character to the next.
+    let (long, big) = ((n >= 0x80) | wide, n >= 0x2000);
+    let word = if big { three } else { two };
+    (
+        if long { word } else { n },
+        1 + long as usize + big as usize,
+    )
 }
 
 /// Writes the leading `cells` that are narrow ASCII characters (typed spaces
@@ -1047,9 +1059,9 @@ fn encode(
 }
 
 /// `encode` for a row that leaves the grid. A plain row (`Row::plain`: default
-/// blanks and narrow ASCII with the default attributes) is one run of its
-/// characters, read without checking each cell's attributes, and left blank
-/// for the grid's reset (`occ` 0).
+/// blanks, narrow characters and wide pairs with the default attributes) is
+/// one run of its units, read without checking each cell's attributes or
+/// pairs, and left blank for the grid's reset (`occ` 0).
 fn encode_take(
     row: &mut Row<Cell>,
     scan: usize,
@@ -1060,30 +1072,58 @@ fn encode_take(
     if !row.plain {
         return encode(row, scan, buf, at, extras);
     }
-    debug_assert!(row[..].iter().all(is_plain), "stale Row::plain");
-    let cols = row.len();
+    debug_assert!(is_plain(&row[..]), "stale Row::plain");
     let mut out = Out { buf, at };
-    out.varint(cols);
+    out.varint(row.len());
     let head = out.at;
-    let body = head + 3;
+    out.at += 3;
     let cells = &mut row[..][..scan];
-    let dst = &mut out.buf[body..body + scan];
+    // Narrow ASCII first, a byte a cell (a wide character is never ASCII, and its spacer comes after it).
+    let dst = &mut out.buf[out.at..out.at + scan];
+    let mut i = 0;
     for (d, cell) in dst.iter_mut().zip(cells.iter_mut()) {
+        let c = cell.c as u32;
+        if c >= 0x80 {
+            break;
+        }
         // An erased blank is 0 in a run, a typed space ' '.
-        let erased = (cell.c == ' ') & !cell.flags.contains(Flags::TYPED_SPACE);
-        *d = if erased { 0 } else { cell.c as u8 };
+        let erased = (c == b' ' as u32) & cell.flags.is_empty();
+        *d = if erased { 0 } else { c as u8 };
+        cell.c = ' ';
+        cell.flags = Flags::empty();
+        i += 1;
+    }
+    let mut units = i;
+    // After the last unit that is not an erased blank.
+    let mut end_units = dst[..i].iter().rposition(|&b| b != 0).map_or(0, |n| n + 1);
+    out.at += i;
+    let mut end = out.at - (i - end_units);
+    // Then the rest a cell at a time, a spacer as nothing: the next cell does not wait on this one's width.
+    for cell in &mut cells[i..] {
+        let flags = cell.flags.bits();
+        let spacer = flags & Flags::WIDE_CHAR_SPACER.bits() != 0;
+        // An erased blank is 0 in a run, a typed space ' '.
+        let erased = (cell.c == ' ') & (flags == 0);
+        let (word, len) = unit(cell.c, flags & Flags::WIDE_CHAR.bits() != 0);
+        out.word(
+            word & (erased as u32).wrapping_sub(1),
+            if spacer { 0 } else { len },
+        );
+        units += !spacer as usize;
+        let text = !(erased | spacer);
+        end = if text { out.at } else { end };
+        end_units = if text { units } else { end_units };
         cell.c = ' ';
         cell.flags = Flags::empty();
     }
-    let n = dst.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
     row.occ = 0;
     row.plain = true;
-    if n == 0 {
+    if end_units == 0 {
         return head;
     }
-    let [lo, hi] = (n as u16).to_le_bytes();
-    out.buf[head..body].copy_from_slice(&[0, lo, hi]);
-    body + n
+    let [lo, hi] = (end_units as u16).to_le_bytes();
+    out.buf[head..head + 3].copy_from_slice(&[0, lo, hi]);
+    end
 }
 
 /// Goes on with the first run of `encode` from cell `at`, which narrow ASCII
@@ -1762,6 +1802,56 @@ mod tests {
             let end = runs(&row[..][..scan], 0, out, &mut Vec::new());
             assert_eq!(a, &b[..end], "{row:?}");
             assert_eq!(decode(&a, None), row);
+        }
+    }
+
+    /// A plain row (`Row::plain`) taken by `encode_take` gives the bytes `encode` writes for it, and is left blank.
+    #[test]
+    fn plain_take_matches_encode() {
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let chars = ['a', ' ', 'é', '가', '字', '😀', '~', '\u{2500}'];
+        for _ in 0..20000 {
+            let cols = 1 + (next() % 24) as usize;
+            let mut row = Row::<Cell>::new(cols);
+            let mut col = (next() % 3) as usize;
+            while col < cols {
+                let r = next();
+                let c = chars[(r % 8) as usize];
+                let wide = matches!(c, '가' | '字' | '😀');
+                if wide && col + 1 < cols {
+                    row[Column(col)] = cell(c, DEFAULT_FG, DEFAULT_BG, Flags::WIDE_CHAR);
+                    row[Column(col + 1)] =
+                        cell(' ', DEFAULT_FG, DEFAULT_BG, Flags::WIDE_CHAR_SPACER);
+                    col += 2;
+                } else if !wide {
+                    let typed = c == ' ' && r & 8 != 0;
+                    let flags = if typed {
+                        Flags::TYPED_SPACE
+                    } else {
+                        Flags::empty()
+                    };
+                    row[Column(col)] = cell(c, DEFAULT_FG, DEFAULT_BG, flags);
+                    col += 1;
+                }
+                col += (r >> 20) as usize % 4 / 3;
+            }
+            row.plain = true;
+            assert!(is_plain(&row[..]));
+            let want = encoded(&row);
+            let scan = scan_len(&row);
+            let mut got = vec![0; max_len(scan)];
+            let mut taken = row.clone();
+            taken.plain = true;
+            let end = encode_take(&mut taken, scan, &mut got, 0, &mut Vec::new());
+            assert_eq!(&got[..end], want, "{row:?}");
+            assert_eq!(taken, Row::new(cols));
+            assert_eq!(decode(&want, None), row);
         }
     }
 }

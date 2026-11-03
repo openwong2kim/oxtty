@@ -24,9 +24,10 @@ pub struct Row<T> {
     /// wongtty: a `u32`, which leaves room for `plain` in the row's four words on 64-bit targets.
     pub(crate) occ: u32,
 
-    /// wongtty: every cell is a default blank or a narrow printable ASCII character with the default colours, no
-    /// flags but `TYPED_SPACE` and no extra (as `Term::input_ascii` writes them with the default pen), so the
-    /// compressed history can take the row without checking each cell. Any other change through the row clears it.
+    /// wongtty: every cell has the default colours and no extra, and is a default blank, a narrow character with
+    /// no flags but `TYPED_SPACE`, or a `WIDE_CHAR` with its `WIDE_CHAR_SPACER` blank right after it (as
+    /// `Term::input_ascii` and `Term::input_run` write them with the default pen), so the compressed history can
+    /// take the row without checking each cell. Any other change through the row clears it.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) plain: bool,
 }

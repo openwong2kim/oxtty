@@ -1404,27 +1404,19 @@ impl<T> Term<T> {
             && fg == Color::Named(NamedColor::Foreground)
             && bg == Color::Named(NamedColor::Background);
         let mut n = 0;
-        if plain {
-            // wongtty: a plain row holds no wide characters or extras and its colours are the pen's already, so
-            // only the character and the flags change.
-            for (cell, &b) in row[point.column..].iter_mut().zip(bytes) {
-                if !(0x20..0x7f).contains(&b) {
-                    break;
-                }
-                cell.c = b as char;
-                cell.flags = if b == b' ' { Flags::TYPED_SPACE } else { Flags::empty() };
-                n += 1;
-            }
-        }
-        for (cell, &b) in row[point.column + n..].iter_mut().zip(&bytes[n..]) {
-            if plain || !(0x20..0x7f).contains(&b) || cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER) {
+        for (cell, &b) in row[point.column..].iter_mut().zip(bytes) {
+            if !(0x20..0x7f).contains(&b) || cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER) {
                 break;
             }
             cell.c = b as char;
-            cell.fg = fg;
-            cell.bg = bg;
             cell.flags = if b == b' ' { space_flags } else { flags };
-            cell.extra = extra.clone();
+            // wongtty: the colours of a plain row's narrow cells are the default pen's already, and it has no
+            // extras.
+            if !plain {
+                cell.fg = fg;
+                cell.bg = bg;
+                cell.extra = extra.clone();
+            }
             n += 1;
         }
         let end = point.column.0 + n;
@@ -1460,6 +1452,13 @@ impl<T> Term<T> {
         // The cells are written through the whole row, which marks all of it occupied; only the cells written
         // are, as when written one by one.
         let occ = row.occ as usize;
+        // wongtty: the row stays plain (`Row::plain`) when written with the default pen.
+        let was_plain = row.plain;
+        let plain = was_plain
+            && flags.is_empty()
+            && extra.is_none()
+            && fg == Color::Named(NamedColor::Foreground)
+            && bg == Color::Named(NamedColor::Background);
         let cells = &mut row[..];
         let wide_cell = |cell: &Cell| cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER);
         let (mut col, mut used) = (point.column.0, 0);
@@ -1492,6 +1491,7 @@ impl<T> Term<T> {
             cells[point.column.0..col].iter_mut().for_each(|cell| cell.extra = Some(extra.clone()));
         }
         row.occ = if used == 0 { occ } else { occ.max(col) } as u32;
+        row.plain = if used == 0 { was_plain } else { plain };
         if used == 0 {
             return 0;
         }
