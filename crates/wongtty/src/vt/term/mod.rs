@@ -1420,7 +1420,7 @@ impl<T> Term<T> {
             n += 1;
         }
         let end = point.column.0 + n;
-        row.occ = if n == 0 { occ } else { occ.max(end) } as u32;
+        row.occ = if n == 0 { occ } else { occ.max(end) } as u16;
         row.plain = if n == 0 { was_plain } else { plain };
         if n == 0 {
             return 0;
@@ -1490,7 +1490,7 @@ impl<T> Term<T> {
         if let Some(extra) = extra {
             cells[point.column.0..col].iter_mut().for_each(|cell| cell.extra = Some(extra.clone()));
         }
-        row.occ = if used == 0 { occ } else { occ.max(col) } as u32;
+        row.occ = if used == 0 { occ } else { occ.max(col) } as u16;
         row.plain = if used == 0 { was_plain } else { plain };
         if used == 0 {
             return 0;

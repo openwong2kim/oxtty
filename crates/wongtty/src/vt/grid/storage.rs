@@ -163,9 +163,7 @@ impl<T> Storage<T> {
     /// instructions. This implementation achieves the swap in only 8 movups
     /// instructions.
     pub fn swap(&mut self, a: Line, b: Line) {
-        // wongtty: four words on 64-bit targets, five on wasm32, where `Row::plain` takes a word of its own.
-        let words = mem::size_of::<Row<T>>() / mem::size_of::<usize>();
-        debug_assert_eq!(mem::size_of::<Row<T>>(), mem::size_of::<usize>() * words);
+        debug_assert_eq!(mem::size_of::<Row<T>>(), mem::size_of::<usize>() * 4);
 
         let a = self.compute_index(a);
         let b = self.compute_index(b);
@@ -181,7 +179,7 @@ impl<T> Storage<T> {
             //
             // The optimizer unrolls this loop and vectorizes it.
             let mut tmp: MaybeUninit<usize>;
-            for i in 0..words as isize {
+            for i in 0..4 {
                 tmp = *a_ptr.offset(i);
                 *a_ptr.offset(i) = *b_ptr.offset(i);
                 *b_ptr.offset(i) = tmp;
@@ -204,9 +202,7 @@ impl<T> Storage<T> {
             if positions == 1 {
                 rotate_one(rows, up);
             } else {
-                // One `rotate` for both directions: `rotate_left(k)` is `rotate_right(len - k)`.
-                let k = if up { positions } else { rows.len() - positions };
-                rows.rotate_right(k);
+                rotate(rows, positions, up);
             }
             return;
         }
@@ -218,13 +214,13 @@ impl<T> Storage<T> {
         if positions <= head.len().min(tail.len()) {
             let at = tail.len() - positions;
             if up {
-                head.rotate_right(positions);
+                rotate(head, positions, true);
                 tail[at..].swap_with_slice(&mut head[..positions]);
-                tail.rotate_right(positions);
+                rotate(tail, positions, true);
             } else {
-                tail.rotate_left(positions);
+                rotate(tail, positions, false);
                 tail[at..].swap_with_slice(&mut head[..positions]);
-                head.rotate_left(positions);
+                rotate(head, positions, false);
             }
         } else if up {
             for i in (region.start.0..region.end.0 - positions as i32).map(Line::from) {
@@ -305,6 +301,14 @@ impl<T> Storage<T> {
         self.inner.rotate_left(self.zero);
         self.zero = 0;
     }
+}
+
+/// wongtty: `rows.rotate_right(positions)` (`right`) or `rows.rotate_left(positions)`, in one function: inlined at
+/// each place, `slice::rotate` takes most of a kilobyte of wasm a time.
+#[inline(never)]
+fn rotate<T>(rows: &mut [T], positions: usize, right: bool) {
+    let k = if right { positions } else { rows.len() - positions };
+    rows.rotate_right(k);
 }
 
 /// wongtty: `rows.rotate_right(1)` (`right`) or `rows.rotate_left(1)`: one row held aside and one `memmove` of

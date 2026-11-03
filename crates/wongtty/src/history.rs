@@ -147,39 +147,47 @@ impl History {
         let scan = scan_len(row);
         let room = max_len(scan);
         let mut extras = Vec::new();
-        match self.blocks.back_mut() {
+        let mut aside = Vec::new();
+        let (buf, at) = match self.blocks.back_mut() {
             Some(block) if block.end + room <= block.bytes.len() => {
-                block.starts.push(block.end as u16);
-                block.end = encode_take(row, scan, &mut block.bytes, block.end, &mut extras);
+                (&mut block.bytes[..], block.end)
             }
             _ => {
-                let mut aside = vec![0; room];
-                let len = encode_take(row, scan, &mut aside, 0, &mut extras);
-                if self
-                    .blocks
-                    .back()
-                    .is_none_or(|b| b.end + len > b.bytes.len())
-                {
-                    let spare = self.spare.take().filter(|_| len <= BLOCK_BYTES);
-                    let mut block = spare.unwrap_or_else(|| Block {
-                        first: 0,
-                        bytes: vec![0; BLOCK_BYTES.max(len)],
-                        end: 0,
-                        starts: Vec::new(),
-                    });
-                    block.first = abs;
-                    block.end = 0;
-                    block.starts.clear();
-                    self.blocks.push_back(block);
-                }
-                let Some(block) = self.blocks.back_mut() else {
-                    return;
-                };
-                debug_assert!(block.end < BLOCK_BYTES);
-                block.starts.push(block.end as u16);
-                block.bytes[block.end..block.end + len].copy_from_slice(&aside[..len]);
-                block.end += len;
+                aside.resize(room, 0);
+                (&mut aside[..], 0)
             }
+        };
+        let end = encode_take(row, scan, buf, at, &mut extras);
+        if !aside.is_empty() {
+            let len = end;
+            if self
+                .blocks
+                .back()
+                .is_none_or(|b| b.end + len > b.bytes.len())
+            {
+                let spare = self.spare.take().filter(|_| len <= BLOCK_BYTES);
+                let mut block = spare.unwrap_or_else(|| Block {
+                    first: 0,
+                    bytes: vec![0; BLOCK_BYTES.max(len)],
+                    end: 0,
+                    starts: Vec::new(),
+                });
+                block.first = abs;
+                block.end = 0;
+                block.starts.clear();
+                self.blocks.push_back(block);
+            }
+        }
+        let Some(block) = self.blocks.back_mut() else {
+            return;
+        };
+        debug_assert!(block.end < BLOCK_BYTES);
+        block.starts.push(block.end as u16);
+        if aside.is_empty() {
+            block.end = end;
+        } else {
+            block.bytes[block.end..block.end + end].copy_from_slice(&aside[..end]);
+            block.end += end;
         }
         if !extras.is_empty() {
             self.extras.push_back((abs, extras.into_boxed_slice()));

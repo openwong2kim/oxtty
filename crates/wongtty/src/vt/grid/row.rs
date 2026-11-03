@@ -21,8 +21,9 @@ pub struct Row<T> {
     ///
     /// This is the upper bound on the number of elements in the row, which have been modified
     /// since the last reset. All cells after this point are guaranteed to be equal.
-    /// wongtty: a `u32`, which leaves room for `plain` in the row's four words on 64-bit targets.
-    pub(crate) occ: u32,
+    /// wongtty: a `u16` (rows are at most `u16::MAX` columns wide), which leaves room for `plain` in the
+    /// row's four words (`Storage::swap`).
+    pub(crate) occ: u16,
 
     /// wongtty: every cell has the default colours and no extra, and is a default blank, a narrow character with
     /// no flags but `TYPED_SPACE`, or a `WIDE_CHAR` with its `WIDE_CHAR_SPACER` blank right after it (as
@@ -44,6 +45,7 @@ impl<T: Default> Row<T> {
     /// Ideally the `template` should be `Copy` in all performance sensitive scenarios.
     pub fn new(columns: usize) -> Row<T> {
         debug_assert!(columns >= 1);
+        debug_assert!(columns <= u16::MAX as usize);
 
         let mut inner: Vec<T> = Vec::with_capacity(columns);
 
@@ -72,7 +74,7 @@ impl<T: Default> Row<T> {
 
         // wongtty: cells past `occ` must all match the last cell for the lazy `reset`; the new
         // default cells may not match the old ones, so the old cells count as occupied.
-        self.occ = self.inner.len() as u32;
+        self.occ = self.inner.len() as u16;
         self.plain = false;
         self.inner.resize_with(columns, T::default);
     }
@@ -113,7 +115,7 @@ impl<T: Default> Row<T> {
         let index = new_row.iter().rposition(|c| !c.is_empty()).map_or(0, |i| i + 1);
         new_row.truncate(index);
 
-        self.occ = min(self.occ, columns as u32);
+        self.occ = min(self.occ, columns as u16);
         self.plain = false;
 
         if new_row.is_empty() { None } else { Some(new_row) }
@@ -137,7 +139,7 @@ impl<T: Default> Row<T> {
         );
         let to_default = template.discriminant() == T::default().discriminant();
         if self.inner[(self.occ as usize).min(len - 1)].discriminant() != template.discriminant() {
-            self.occ = len as u32;
+            self.occ = len as u16;
         }
 
         // Reset every dirty cell in the row.
@@ -162,7 +164,7 @@ impl<T: Default> Row<T> {
 impl<T> Row<T> {
     #[inline]
     pub fn from_vec(vec: Vec<T>, occ: usize) -> Row<T> {
-        Row { inner: vec, occ: occ as u32, plain: false }
+        Row { inner: vec, occ: occ as u16, plain: false }
     }
 
     #[inline]
@@ -177,7 +179,7 @@ impl<T> Row<T> {
 
     #[inline]
     pub fn last_mut(&mut self) -> Option<&mut T> {
-        self.occ = self.inner.len() as u32;
+        self.occ = self.inner.len() as u16;
         self.plain = false;
         self.inner.last_mut()
     }
@@ -188,14 +190,14 @@ impl<T> Row<T> {
         T: GridCell,
     {
         // wongtty: the appended cells sit past every old cell, so all of them count as occupied.
-        self.occ = (self.inner.len() + vec.len()) as u32;
+        self.occ = (self.inner.len() + vec.len()) as u16;
         self.plain = false;
         self.inner.append(vec);
     }
 
     #[inline]
     pub fn append_front(&mut self, mut vec: Vec<T>) {
-        self.occ += vec.len() as u32;
+        self.occ += vec.len() as u16;
         self.plain = false;
 
         vec.append(&mut self.inner);
@@ -213,7 +215,7 @@ impl<T> Row<T> {
 
     #[inline]
     pub fn front_split_off(&mut self, at: usize) -> Vec<T> {
-        self.occ = self.occ.saturating_sub(at as u32);
+        self.occ = self.occ.saturating_sub(at as u16);
         self.plain = false;
 
         let mut split = self.inner.split_off(at);
@@ -238,7 +240,7 @@ impl<'a, T> IntoIterator for &'a mut Row<T> {
 
     #[inline]
     fn into_iter(self) -> slice::IterMut<'a, T> {
-        self.occ = self.len() as u32;
+        self.occ = self.len() as u16;
         self.plain = false;
         self.inner.iter_mut()
     }
@@ -257,7 +259,7 @@ impl<T> IndexMut<Column> for Row<T> {
     #[inline]
     fn index_mut(&mut self, index: Column) -> &mut T {
         self.plain = false;
-        self.occ = max(self.occ, (*index + 1) as u32);
+        self.occ = max(self.occ, (*index + 1) as u16);
         &mut self.inner[index.0]
     }
 }
@@ -275,7 +277,7 @@ impl<T> IndexMut<Range<Column>> for Row<T> {
     #[inline]
     fn index_mut(&mut self, index: Range<Column>) -> &mut [T] {
         self.plain = false;
-        self.occ = max(self.occ, *index.end as u32);
+        self.occ = max(self.occ, *index.end as u16);
         &mut self.inner[(index.start.0)..(index.end.0)]
     }
 }
@@ -293,7 +295,7 @@ impl<T> IndexMut<RangeTo<Column>> for Row<T> {
     #[inline]
     fn index_mut(&mut self, index: RangeTo<Column>) -> &mut [T] {
         self.plain = false;
-        self.occ = max(self.occ, *index.end as u32);
+        self.occ = max(self.occ, *index.end as u16);
         &mut self.inner[..(index.end.0)]
     }
 }
@@ -311,7 +313,7 @@ impl<T> IndexMut<RangeFrom<Column>> for Row<T> {
     #[inline]
     fn index_mut(&mut self, index: RangeFrom<Column>) -> &mut [T] {
         self.plain = false;
-        self.occ = self.len() as u32;
+        self.occ = self.len() as u16;
         &mut self.inner[(index.start.0)..]
     }
 }
@@ -329,7 +331,7 @@ impl<T> IndexMut<RangeFull> for Row<T> {
     #[inline]
     fn index_mut(&mut self, _: RangeFull) -> &mut [T] {
         self.plain = false;
-        self.occ = self.len() as u32;
+        self.occ = self.len() as u16;
         &mut self.inner[..]
     }
 }
@@ -347,7 +349,7 @@ impl<T> IndexMut<RangeToInclusive<Column>> for Row<T> {
     #[inline]
     fn index_mut(&mut self, index: RangeToInclusive<Column>) -> &mut [T] {
         self.plain = false;
-        self.occ = max(self.occ, (*index.end + 1) as u32);
+        self.occ = max(self.occ, (*index.end + 1) as u16);
         &mut self.inner[..=(index.end.0)]
     }
 }
