@@ -13,7 +13,9 @@ async function inPage(fn, arg) {
 
 const TEXT = '\x1b[31mred\x1b[0m 한글 \x1b[42mgreen\x1b[0m\r\n\x1b[1mbold\x1b[0m │─┼─ WM';
 
-test('a pane idle for a second redraws its last frame once into a fresh canvas, with the same pixels', async () => {
+// The copy path only: a pane that takes frames by transfer (on a GPU, see renderer-transfer.test.mjs) has no
+// buffers to drop
+test('a pane idle for a second redraws its last frame once into a fresh canvas, with the same pixels', async (t) => {
   const r = await inPage(async (text) => {
     const p = new T.Pane(30, 4, { cursorBlink: true });
     p.focus(true);
@@ -40,11 +42,13 @@ test('a pane idle for a second redraws its last frame once into a fresh canvas, 
       same: T.diff(shown, T.read(idle.canvas)),
       size: [idle.canvas.width, idle.canvas.height].join('x') === [start.canvas.width, start.canvas.height].join('x'),
       changed: T.diff(before, shown) > 0,
+      present: p.debug.present,
     };
     p.dispose();
     return out;
   }, TEXT);
-  assert.deepEqual(r, { busy: true, idle: 1, requests: [], same: 0, size: true, changed: true });
+  if (r.present !== 'copy') return t.skip(`panes present by ${r.present}`);
+  assert.deepEqual(r, { busy: true, idle: 1, requests: [], same: 0, size: true, changed: true, present: 'copy' });
 });
 
 test('a pane with display: none has no canvas pixels, and has its last frame back before the page paints it again', async () => {

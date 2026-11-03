@@ -1,6 +1,7 @@
 // The present path on a real GPU (Metal through ANGLE): panes take the shared surface's frames by transfer into a
 // `bitmaprenderer` canvas, with no copy and no compaction, and still survive context loss. SwiftShader, which the
-// other browser tests run on, keeps the copy into a 2D canvas. Skipped where Chrome gives no GPU context.
+// other browser tests run on, keeps the copy into a 2D canvas, and so does Electron. Skipped where Chrome gives no
+// GPU context.
 //
 // Chrome crashes the renderer when a context is lost on purpose between a transfer and the commit of that frame,
 // so these tests lose the context only after a couple of frames have gone by (see the docs of render/gpu.rs).
@@ -8,16 +9,20 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { withPage } from './harness.mjs';
 
-async function inPage(fn, arg) {
+async function inPage(fn, arg, userAgent) {
   return withPage(
     'renderer.mjs',
     async (page) => {
       await page.waitForFunction(() => window.ready);
       return page.evaluate(fn, arg);
     },
-    { gpu: true },
+    { gpu: true, userAgent },
   );
 }
+
+/** Chrome's user agent as Electron 41 sends it, which takes the copy path on a GPU too. */
+const ELECTRON =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.7680.188 Electron/41.10.6 Safari/537.36';
 
 const TEXT = '\x1b[31mred\x1b[0m 한글 \x1b[42mgreen\x1b[0m\r\n\x1b[1mbold\x1b[0m │─┼─ WM 😀';
 
@@ -43,31 +48,75 @@ const gpu = await inPage(() => {
 });
 const skip = gpu === 'transfer' ? false : `no GPU context here (panes present by ${gpu})`;
 
-test('panes take frames by transfer, cursor layer included, and draw what the copy path draws', { skip }, async () => {
+/** In the page: a focused pane with a blinking cursor showing `text`, read with its cursor layer in one frame. */
+async function layered([text, framesSrc]) {
+  const frames = eval(framesSrc);
+  const p = new T.Pane(30, 4, { cursorBlink: true });
+  p.focus(true);
+  await p.write(text);
+  const { canvas, shown, region } = await p.layered();
+  const { canvas: element, cursorLayer } = p.debug;
+  const out = {
+    present: p.debug.present,
+    canvas: Array.from(canvas),
+    shown: Array.from(shown),
+    region,
+    // A canvas has one kind of context: a bitmaprenderer canvas has no 2D context
+    bitmaprenderer: [element.getContext('2d') === null, cursorLayer.getContext('2d') === null],
+  };
+  // Idle panes are not compacted on the transfer path: a transferred canvas has no buffers of its own
+  const before = p.debug.compactions;
+  await T.sleep(1500);
+  await frames(2);
+  out.compactions = p.debug.compactions - before;
+  out.idle = T.diff(canvas, T.read(element));
+  p.dispose();
+  return out;
+}
+
+const diff = (a, b) => (a.length === b.length ? a.reduce((n, v, i) => n + (v !== b[i]), 0) : Math.max(a.length, b.length));
+
+test('panes take frames by transfer and show what the copy path (Electron) shows, cursor layer included', { skip }, async () => {
+  const transfer = await inPage(layered, [TEXT, FRAMES]);
+  const copy = await inPage(layered, [TEXT, FRAMES], ELECTRON);
+  assert.deepEqual([transfer.present, transfer.bitmaprenderer, transfer.compactions, transfer.idle], ['transfer', [true, true], 0, 0]);
+  assert.deepEqual([copy.present, copy.bitmaprenderer], ['copy', [false, false]]);
+  assert.deepEqual(transfer.region, copy.region);
+  assert.ok(transfer.canvas.some((v, i) => i % 4 !== 3 && v > 0x80), 'the canvas shows text');
+  assert.ok(diff(transfer.canvas, transfer.shown) > 0, 'the cursor layer shows the cursor');
+  assert.deepEqual([diff(transfer.canvas, copy.canvas), diff(transfer.shown, copy.shown)], [0, 0]);
+});
+
+test('the shared surface shrinks to a pixel once every pane has idled for a second, and grows back for the next frame', { skip }, async () => {
   const r = await inPage(async ([text, framesSrc]) => {
     const frames = eval(framesSrc);
-    const p = new T.Pane(30, 4, { cursorBlink: true });
-    p.focus(true);
-    await p.write(text);
-    const pixels = await p.pixels();
-    const { canvas, cursorLayer } = p.debug;
-    const out = {
-      present: p.debug.present,
-      // A canvas has one kind of context: this one is a bitmaprenderer
-      canvas2d: canvas.getContext('2d') === null && canvas.getContext('bitmaprenderer') !== null,
-      layer2d: cursorLayer.getContext('2d') === null,
-      lit: pixels.some((v, i) => i % 4 !== 3 && v > 0x80),
-    };
-    // Idle panes are not compacted: a transferred canvas has no buffers of its own
-    const before = p.debug.compactions;
+    const a = new T.Pane(30, 4);
+    const b = new T.Pane(30, 4);
+    await a.write(text);
+    await b.write(text);
+    const shown = await a.pixels();
+    const surface = a.debug.gl.canvas;
+    const size = () => [surface.width, surface.height].join('x');
+    const drawn = size();
+    // b keeps drawing while a idles
+    for (let i = 0; i < 8; i++) {
+      await T.sleep(200);
+      await b.write(`\r${i}`);
+      await frames(1);
+    }
+    const busy = size();
     await T.sleep(1500);
-    await frames(2);
-    out.compactions = p.debug.compactions - before;
-    out.same = T.diff(pixels, T.read(canvas));
-    p.dispose();
+    const idle = size();
+    const kept = T.diff(shown, T.read(a.canvas));
+    await a.write('\x1b[2;1Hmore');
+    const after = await a.pixels();
+    const out = { drawn, busy, idle, kept, grown: size(), redrawn: T.diff(shown, after) > 0 };
+    a.dispose();
+    b.dispose();
     return out;
   }, [TEXT, FRAMES]);
-  assert.deepEqual(r, { present: 'transfer', canvas2d: true, layer2d: true, lit: true, compactions: 0, same: 0 });
+  assert.notEqual(r.drawn, '1x1');
+  assert.deepEqual(r, { drawn: r.drawn, busy: r.drawn, idle: '1x1', kept: 0, grown: r.drawn, redrawn: true });
 });
 
 test('a lost shared context that is restored, or replaced, redraws every pane as before', { skip }, async () => {

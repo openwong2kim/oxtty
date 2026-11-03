@@ -11,13 +11,17 @@
 //! canvas this saves the GPU process a copy of every frame and the buffers Chromium keeps behind a 2D canvas that
 //! keeps drawing (15 panes of 120×40 printing logs: GPU process 446 → 320 MB); once every pane idles, the surface
 //! shrinks to a pixel ([`trim`]). A region (the cursor layer) is drawn as a frame of its own, the pane's picture
-//! shifted by the viewport. Software GL (SwiftShader) and a surface that is not an `OffscreenCanvas` keep the copy
-//! into a 2D canvas.
+//! shifted by the viewport. Software GL (SwiftShader), a surface that is not an `OffscreenCanvas` and Electron
+//! keep the copy into a 2D canvas.
 //!
 //! Chrome crashes the page's renderer when a WebGL context is lost on purpose (`WEBGL_lose_context`, or Chrome
 //! dropping the oldest context once a page has more than 16) between a transfer and the commit of that frame; a
 //! lost GPU process is fine. [`release`] loses the context only after every pane's canvas is gone, and the test
-//! suite's context-loss tests run on SwiftShader, which copies.
+//! suite's context-loss tests run on SwiftShader, which copies. Chrome drops the context that flushed least
+//! recently, and a transfer does not count as a flush, so a context that transfers every frame is the one dropped
+//! when the page makes its 17th. Electron 41 crashes this way when a page that holds 16 contexts makes another in
+//! an animation frame, which a host with its own WebGL contexts can do (wmux keeps up to 15 for xterm.js panes).
+//! Electron therefore keeps the copy: a dropped context there costs a redraw, not the window.
 //!
 //! Context loss is handled here once for every pane: a lost context waits [`CONTEXT_RESTORE_TIMEOUT`] for
 //! `webglcontextrestored`, then a new one is made under a back-off throttle; either way every pane redraws.
@@ -246,8 +250,15 @@ fn is_software(gl: &Gl) -> bool {
     renderer.contains("SwiftShader")
 }
 
+/// Whether the page runs in Electron, which keeps the copy (see the module docs).
+fn is_electron() -> bool {
+    web_sys::window()
+        .and_then(|w| w.navigator().user_agent().ok())
+        .is_some_and(|ua| ua.contains("Electron/"))
+}
+
 fn can_transfer(surface: &Surface, gl: &Gl) -> bool {
-    matches!(surface, Surface::Offscreen(_)) && !is_software(gl)
+    matches!(surface, Surface::Offscreen(_)) && !is_software(gl) && !is_electron()
 }
 
 /// Makes the page's context if there is none yet.

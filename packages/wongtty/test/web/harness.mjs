@@ -22,9 +22,9 @@ const IMPORTS = {
 
 /**
  * Opens `page` (a module under test/web/pages) and calls `fn(page)`. Any console error or page exception fails
- * the call. Options: `viewport`, `deviceScaleFactor`, `gpu` (the real GPU, Metal through ANGLE, instead of SwiftShader).
+ * the call. Options: `viewport`, `deviceScaleFactor`, `gpu` (the real GPU, Metal through ANGLE, instead of SwiftShader), `userAgent`.
  */
-export async function withPage(page, fn, { viewport = { width: 1000, height: 700 }, deviceScaleFactor = 1, gpu = false } = {}) {
+export async function withPage(page, fn, { viewport = { width: 1000, height: 700 }, deviceScaleFactor = 1, gpu = false, userAgent } = {}) {
   const html = `<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,">
 <link rel="stylesheet" href="/node_modules/@xterm/xterm/css/xterm.css">
 <script type="importmap">${JSON.stringify({ imports: IMPORTS })}</script>
@@ -49,7 +49,7 @@ export async function withPage(page, fn, { viewport = { width: 1000, height: 700
     // Launched inside the try, so a failed launch still closes the server instead of keeping the process alive.
     const args = gpu ? ['--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist'] : ['--enable-unsafe-swiftshader', '--use-angle=swiftshader'];
     browser = await chromium.launch({ channel: 'chrome', headless: true, args });
-    const tab = await browser.newPage({ viewport, deviceScaleFactor });
+    const tab = await browser.newPage({ viewport, deviceScaleFactor, userAgent });
     tab.on('console', (m) => m.type() === 'error' && errors.push(`console: ${m.text()}`));
     tab.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
     await tab.goto(`http://127.0.0.1:${server.address().port}/`);
