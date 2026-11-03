@@ -285,15 +285,43 @@ impl std::ops::Deref for HeldRow<'_> {
     }
 }
 
-/// Decoded compressed-history rows kept for repeated reads beyond the screen's
+/// Compressed-history rows kept for repeated reads beyond the screen's
 /// rows (a scrolled-back view redraws the same rows every frame). Nothing is
 /// kept while the view is at the bottom.
 const ROW_CACHE_SPARE: usize = 8;
+
+/// Rows the row cache decodes without trying a direct read after one with extras (`RowCache::decode_next`).
+const DECODE_RUN: u8 = 16;
+
+/// A history row in the row cache: its cells as [`Engine::row_packed`] gives them (16 bytes a cell, not the 24 of a
+/// decoded cell), or, for a row with extras, the decoded row instead, as a renderer reads [`Engine::row_extras`] of
+/// those rows too (`row_packed` packs it on each read).
+struct CachedRow {
+    id: u64,
+    /// When it was last read (`RowCache::reads`).
+    read: u64,
+    /// Empty when `row` is kept.
+    packed: Vec<u32>,
+    row: Option<Row<AlacCell>>,
+}
+
+#[derive(Default)]
+struct RowCache {
+    rows: Vec<CachedRow>,
+    reads: u64,
+    /// Rows still to put in decoded without a direct read first, as one of the last [`DECODE_RUN`] put in had
+    /// extras: in text with zerowidth characters most rows have them, and the direct read gives up at the first.
+    /// WebAssembly decodes every row (`Engine::cached`).
+    #[cfg(not(target_arch = "wasm32"))]
+    decode_next: u8,
+}
 
 #[cfg(test)]
 thread_local! {
     /// Compressed history rows [`Engine::held_row`] decoded on this thread.
     static DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Direct reads of compressed history rows (`read_packed`) tried on this thread, whether they read or not.
+    static DIRECT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Row `i` of the compressed history, decoded.
@@ -301,6 +329,17 @@ fn decode(stored: &History, i: usize) -> Row<AlacCell> {
     #[cfg(test)]
     DECODES.with(|n| n.set(n.get() + 1));
     stored.row(i)
+}
+
+/// Row `i` of the compressed history packed straight from its bytes (`History::row_packed_into`), which tests count
+/// as a decode.
+fn read_packed(stored: &History, i: usize, out: &mut Vec<u32>) -> bool {
+    let read = stored.row_packed_into(i, out);
+    #[cfg(test)]
+    DECODES.with(|n| n.set(n.get() + read as usize));
+    #[cfg(test)]
+    DIRECT_READS.with(|n| n.set(n.get() + 1));
+    read
 }
 
 /// Unanswered clipboard reads and untaken writes kept at most (oldest dropped first).
@@ -344,7 +383,7 @@ fn push_bounded<T>(queue: &mut VecDeque<T>, item: T) {
 struct Listener(Arc<Mutex<Inbox>>);
 
 impl Listener {
-    // A poisoned lock (a panic elsewhere) keeps its contents usable, as TermHistory::lock does.
+    // A poisoned lock (a panic elsewhere) keeps its contents usable.
     fn inbox(&self) -> MutexGuard<'_, Inbox> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -451,7 +490,7 @@ pub struct Engine {
     // Host colours that answer colour queries; none means queries go unanswered.
     colors: Option<Box<[u32; COLOR_SLOTS]>>,
     // Recently read history rows by their History::id, most recently read last; empty while the view is at the bottom.
-    row_cache: RefCell<VecDeque<(u64, Row<AlacCell>)>>,
+    row_cache: RefCell<RowCache>,
     markers: markers::Markers,
 }
 
@@ -527,7 +566,7 @@ impl Engine {
             decstr: DecstrScan::default(),
             decstr_owed: false,
             colors: None,
-            row_cache: RefCell::new(VecDeque::new()),
+            row_cache: RefCell::default(),
             markers: Default::default(),
         }
     }
@@ -546,8 +585,9 @@ impl Engine {
     }
 
     /// The compressed history; `None` on the alternate screen, where history is not visible.
-    fn stored(&self) -> Option<MutexGuard<'_, History>> {
-        Some(self.history.as_ref().filter(|_| !self.alt_screen())?.lock())
+    fn stored(&self) -> Option<&History> {
+        let history = self.history.as_ref().filter(|_| !self.alt_screen())?;
+        Some(history.stored(&self.term))
     }
 
     /// Moves a scrolled-back view up as far as the primary screen scrolled (as Alacritty's `display_offset` does).
@@ -561,7 +601,7 @@ impl Engine {
         let cleared = self
             .history
             .as_ref()
-            .is_some_and(|h| std::mem::take(&mut h.lock().cleared));
+            .is_some_and(|h| std::mem::take(&mut h.stored_mut(&mut self.term).cleared));
         // Alacritty returns the view to the bottom when history is cleared (without damage).
         if cleared {
             self.offset = 0;
@@ -577,7 +617,7 @@ impl Engine {
     /// Frees the decoded history rows once the view is back at the bottom.
     fn release_row_cache(&mut self) {
         if self.display_offset() == 0 {
-            *self.row_cache.get_mut() = VecDeque::new();
+            *self.row_cache.get_mut() = RowCache::default();
         }
     }
 
@@ -594,7 +634,11 @@ impl Engine {
 
     // Unlike `history_len`, also while the alternate screen is up.
     fn primary_history_len(&self) -> usize {
-        self.primary().history_size() + self.history.as_ref().map_or(0, |h| h.lock().len())
+        self.primary().history_size()
+            + self
+                .history
+                .as_ref()
+                .map_or(0, |h| h.stored(&self.term).len())
     }
 
     /// Hands the row at `line` to `f`, decoding a compressed history row on the spot.
@@ -607,42 +651,100 @@ impl Engine {
     #[inline(never)]
     fn held_row(&self, line: i32) -> Option<HeldRow<'_>> {
         let grid = self.term.grid();
-        let recent = grid.history_size() as i32;
-        if (-recent..self.rows() as i32).contains(&line) {
+        if (-(grid.history_size() as i32)..self.rows() as i32).contains(&line) {
             return Some(HeldRow::Grid(&grid[Line(line)]));
         }
+        let (stored, i) = self.history_row(line)?;
+        // A scrolled-back view keeps the decoded rows that have extras (`cached`); the rest decode on the spot.
+        if self.display_offset() > 0 {
+            let id = stored.id(i);
+            let mut cache = self.row_cache.borrow_mut();
+            if let Some(at) = cache
+                .rows
+                .iter()
+                .position(|c| c.id == id && c.row.is_some())
+            {
+                cache.reads += 1;
+                cache.rows[at].read = cache.reads;
+                drop(cache);
+                return Ref::filter_map(self.row_cache.borrow(), |c| c.rows[at].row.as_ref())
+                    .ok()
+                    .map(HeldRow::Cached);
+            }
+        }
+        Some(HeldRow::Decoded(decode(stored, i)))
+    }
+
+    /// The compressed history and the index in it of row `line`; `None` for a grid row or past the history.
+    fn history_row(&self, line: i32) -> Option<(&History, usize)> {
+        let recent = self.term.grid().history_size() as i32;
         let stored = self.stored()?;
-        let older = stored.len() as i32;
-        if line >= -recent || line < -(recent + older) {
-            return None;
-        }
-        let i = (older + recent + line) as usize;
-        // At the bottom only searches and copies read history, each row once: nothing is cached
-        if self.display_offset() == 0 {
-            return Some(HeldRow::Decoded(decode(&stored, i)));
-        }
+        let i = stored.len() as i32 + recent + line;
+        (line < -recent && i >= 0).then_some((stored, i as usize))
+    }
+
+    /// History row `i` from the row cache, which is put in it (decoded, packed) if it is not, in place of the row
+    /// read least recently. A view scrolling back k lines a frame reads k new rows above rows it still shows, which
+    /// must not push those out.
+    fn cached(&self, stored: &History, i: usize) -> Ref<'_, CachedRow> {
         let id = stored.id(i);
         let mut cache = self.row_cache.borrow_mut();
-        // Least recently used goes first: a view scrolling back k lines a frame reads k new rows above rows it
-        // still shows, which must not push those out
-        let at = match cache.iter().position(|(at, _)| *at == id) {
-            Some(at) => {
-                let hit = cache.remove(at).expect("position is in range");
-                cache.push_back(hit);
-                cache.len() - 1
-            }
+        let at = match cache.rows.iter().position(|c| c.id == id) {
+            Some(at) => at,
             None => {
-                while cache.len() >= self.rows() as usize + ROW_CACHE_SPARE {
-                    cache.pop_front();
+                let room = self.rows() as usize + ROW_CACHE_SPARE;
+                cache.rows.truncate(room);
+                let at = if cache.rows.len() < room {
+                    cache.rows.push(CachedRow {
+                        id,
+                        read: 0,
+                        packed: Vec::new(),
+                        row: None,
+                    });
+                    cache.rows.len() - 1
+                } else {
+                    (0..room).min_by_key(|&k| cache.rows[k].read).unwrap_or(0)
+                };
+                // WebAssembly has no `decode_next`: it decodes every row
+                #[cfg(not(target_arch = "wasm32"))]
+                let RowCache {
+                    rows, decode_next, ..
+                } = &mut *cache;
+                #[cfg(target_arch = "wasm32")]
+                let (RowCache { rows, .. }, decode_next) = (&mut *cache, &mut 1u8);
+                let entry = &mut rows[at];
+                entry.id = id;
+                // The buffer of the row that went takes this one. Natively most rows are read from their bytes,
+                // the rest decoded (WebAssembly decodes them all: the direct read is 2.3 KB of code).
+                entry.row = None;
+                if cfg!(target_arch = "wasm32")
+                    || *decode_next > 0
+                    || !read_packed(stored, i, &mut entry.packed)
+                {
+                    let row = decode(stored, i);
+                    let extras = row[..].iter().any(|c| c.extra.is_some());
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        *decode_next = if extras {
+                            DECODE_RUN
+                        } else {
+                            decode_next.saturating_sub(1)
+                        };
+                    }
+                    if extras {
+                        entry.packed = Vec::new();
+                        entry.row = Some(row);
+                    } else {
+                        pack_row(&row, &mut entry.packed);
+                    }
                 }
-                cache.push_back((id, decode(&stored, i)));
-                cache.len() - 1
+                at
             }
         };
+        cache.reads += 1;
+        cache.rows[at].read = cache.reads;
         drop(cache);
-        Some(HeldRow::Cached(Ref::map(self.row_cache.borrow(), |c| {
-            &c[at].1
-        })))
+        Ref::map(self.row_cache.borrow(), |c| &c.rows[at])
     }
 
     /// Interprets bytes written by the program (UTF-8 and escape sequences
@@ -878,27 +980,44 @@ impl Engine {
     pub fn row_string(&self, line: i32, trim_right: bool) -> Option<String> {
         self.with_row(line, |row| {
             let mut text = String::with_capacity(row.len());
-            let mut content = 0;
-            for cell in &row[..] {
-                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    continue;
-                }
-                text.push(if cell.c == '\t' { ' ' } else { cell.c });
-                let marks = cell.zerowidth().unwrap_or_default();
-                text.extend(marks);
-                if cell.c != ' ' || cell.flags.contains(Flags::TYPED_SPACE) || !marks.is_empty() {
-                    content = text.len();
-                }
-            }
-            if trim_right {
-                text.truncate(content);
-            }
+            push_row_string(row, trim_right, &mut text);
             text
         })
     }
 
+    /// [`Engine::row_string`] of rows `first..=last` (clamped to the buffer), each followed by `\n`, appended to
+    /// `out` in one call. History rows are read straight from their compressed bytes, without a decode (but for
+    /// rows with extras) or the row cache.
+    pub fn text_rows(&self, first: i32, last: i32, trim_right: bool, out: &mut String) {
+        let grid = self.term.grid();
+        let recent = grid.history_size() as i32;
+        let last = last.min(self.rows() as i32 - 1);
+        let mut line = first.max(-recent);
+        if let Some(stored) = self.stored() {
+            let older = stored.len() as i32;
+            line = first.max(-(recent + older));
+            while line < -recent && line <= last {
+                let i = (older + recent + line) as usize;
+                if !stored.row_text_into(i, trim_right, out) {
+                    push_row_string(&stored.row(i), trim_right, out);
+                }
+                out.push('\n');
+                line += 1;
+            }
+        }
+        while line <= last {
+            push_row_string(&grid[Line(line)], trim_right, out);
+            out.push('\n');
+            line += 1;
+        }
+    }
+
     /// Whether `line` continues on the next line (soft wrap).
     pub fn row_wrapped(&self, line: i32) -> bool {
+        // A history row tells from its bytes
+        if let Some((stored, i)) = self.history_row(line) {
+            return stored.wrapped(i);
+        }
         self.with_row(line, |row| {
             row.last()
                 .is_some_and(|cell| cell.flags.contains(Flags::WRAPLINE))
@@ -917,20 +1036,23 @@ impl Engine {
     /// Cells of one row as `[ch, fg, bg, attrs]` words — the form handed to
     /// WebAssembly and N-API hosts. Returns `false` if `line` is out of range.
     pub fn row_packed(&self, line: i32, out: &mut Vec<u32>) -> bool {
-        // Every word is overwritten, so a buffer as long as the last row is not cleared first
-        let found = self.with_row(line, |row| {
-            out.resize(row.len() * Cell::PACKED_WORDS, 0);
-            for (cell, o) in row[..].iter().zip(out.chunks_exact_mut(Cell::PACKED_WORDS)) {
-                o[0] = cell.c as u32;
-                o[1] = pack_color(cell.fg);
-                o[2] = pack_color(cell.bg);
-                o[3] = attrs(cell);
+        // A scrolled-back view redraws the same history rows every frame: they are copied from the row cache
+        if let Some((stored, i)) = self.history_row(line).filter(|_| self.display_offset() > 0) {
+            let cached = self.cached(stored, i);
+            match &cached.row {
+                Some(row) => pack_row(row, out),
+                None => {
+                    out.clear();
+                    out.extend_from_slice(&cached.packed);
+                }
             }
-        });
-        if found.is_none() {
+            return true;
+        }
+        let found = self.with_row(line, |row| pack_row(row, out)).is_some();
+        if !found {
             out.clear();
         }
-        found.is_some()
+        found
     }
 
     /// Cells of one row that carry combining marks, an underline colour or a
@@ -1286,12 +1408,12 @@ impl Engine {
     /// [`Engine::ansi_snapshot`] with less history or without the modes, as `@xterm/addon-serialize` offers
     /// (`{ scrollback: 0, excludeModes: true }` paints just the screen the terminal shows).
     pub fn ansi_snapshot_with(&self, options: SnapshotOptions) -> Result<Vec<u8>, SnapshotRefusal> {
-        let history = self.history.as_ref().map(TermHistory::lock);
+        let history = self.history.as_ref().map(|h| h.stored(&self.term));
         snapshot::ansi(
             &self.term,
             self.sync_pending(),
             &self.tail,
-            history.as_deref(),
+            history,
             options,
         )
     }
@@ -1366,6 +1488,37 @@ impl DecstrScan {
             _ => DecstrScan::Ground,
         };
         false
+    }
+}
+
+/// `row`'s cells as [`Engine::row_packed`] gives them, into `out`.
+fn pack_row(row: &Row<AlacCell>, out: &mut Vec<u32>) {
+    // Every word is overwritten, so a buffer as long as the last row is not cleared first
+    out.resize(row.len() * Cell::PACKED_WORDS, 0);
+    for (cell, o) in row[..].iter().zip(out.chunks_exact_mut(Cell::PACKED_WORDS)) {
+        o[0] = cell.c as u32;
+        o[1] = pack_color(cell.fg);
+        o[2] = pack_color(cell.bg);
+        o[3] = attrs(cell);
+    }
+}
+
+/// [`Engine::row_string`] of `row`, appended to `text`.
+fn push_row_string(row: &Row<AlacCell>, trim_right: bool, text: &mut String) {
+    let mut content = text.len();
+    for cell in &row[..] {
+        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            continue;
+        }
+        text.push(if cell.c == '\t' { ' ' } else { cell.c });
+        let marks = cell.zerowidth().unwrap_or_default();
+        text.extend(marks);
+        if cell.c != ' ' || cell.flags.contains(Flags::TYPED_SPACE) || !marks.is_empty() {
+            content = text.len();
+        }
+    }
+    if trim_right {
+        text.truncate(content);
     }
 }
 
@@ -1526,6 +1679,84 @@ mod tests {
                 "step {step}"
             );
         }
+    }
+
+    /// A scrolled-back renderer reads every row's cells and the extras of rows that have some: each history row is
+    /// decoded once, as it comes into view, and its cached cells are the decoded row's.
+    #[test]
+    fn a_scrolled_back_frame_decodes_only_the_rows_that_come_into_view() {
+        let rows = 10;
+        let mut t = super::Engine::new(40, rows, 500);
+        for i in 0..400 {
+            let extra = ["", "e\u{301} ", "\x1b]8;;https://x\x07L\x1b]8;;\x07 "][i % 3];
+            t.feed(format!("{extra}line {i}\r\n").as_bytes());
+        }
+        let (mut packed, mut extras) = (Vec::new(), Vec::new());
+        let frame =
+            |t: &super::Engine, packed: &mut Vec<u32>, extras: &mut Vec<crate::CellExtra>| {
+                let mut seen = Vec::new();
+                for y in 0..rows as i32 {
+                    let line = y - t.display_offset() as i32;
+                    assert!(t.row_packed(line, packed));
+                    extras.clear();
+                    if packed
+                        .chunks(4)
+                        .any(|c| c[3] & (crate::attr::COMBINING | crate::attr::HYPERLINK) != 0)
+                    {
+                        assert!(t.row_extras(line, extras) && !extras.is_empty());
+                    }
+                    seen.push((line, packed.clone(), extras.clone()));
+                }
+                seen
+            };
+        t.scroll_display(200);
+        let mut seen = frame(&t, &mut packed, &mut extras);
+        for _ in 0..30 {
+            t.scroll_display(1);
+            let before = decodes();
+            seen = frame(&t, &mut packed, &mut extras);
+            assert_eq!(decodes() - before, 1);
+        }
+        // At the bottom nothing is cached: these reads decode
+        t.scroll_to_bottom();
+        for (line, cells, cell_extras) in &seen {
+            assert!(t.row_packed(*line, &mut packed) && t.row_extras(*line, &mut extras));
+            assert_eq!((&packed, &extras), (cells, cell_extras), "line {line}");
+        }
+    }
+
+    /// Paging back through rows that end in a combining mark tries the direct read once, not once a row (it gives up
+    /// only at the mark); plain rows past them go back to direct reads after `DECODE_RUN` rows.
+    #[test]
+    fn rows_with_marks_are_decoded_without_a_direct_read_first() {
+        let rows = 10;
+        let mut t = super::Engine::new(40, rows, 500);
+        // Older rows end in a combining mark, newer ones are plain
+        for i in 0..200 {
+            t.feed(format!("line {i} e\u{301}\r\n").as_bytes());
+        }
+        for i in 0..200 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        let mut packed = Vec::new();
+        // The direct reads and decodes of a frame at `offset`, and whether every row has a combining mark
+        let mut frame = |t: &mut super::Engine, offset: usize| {
+            t.scroll_display(offset as i32 - t.display_offset() as i32);
+            let before = (super::DIRECT_READS.with(std::cell::Cell::get), decodes());
+            let mut marked = true;
+            for y in 0..rows as i32 {
+                assert!(t.row_packed(y - offset as i32, &mut packed));
+                marked &= packed.chunks(4).any(|c| c[3] & crate::attr::COMBINING != 0);
+            }
+            let after = (super::DIRECT_READS.with(std::cell::Cell::get), decodes());
+            (after.0 - before.0, after.1 - before.1, marked)
+        };
+        assert_eq!(frame(&mut t, 100), (rows as usize, rows as usize, false));
+        assert_eq!(frame(&mut t, 300), (1, rows as usize, true));
+        let run = super::DECODE_RUN as usize;
+        assert_eq!(frame(&mut t, 150).0, 0);
+        assert_eq!(frame(&mut t, 140).0, 2 * rows as usize - run);
+        assert_eq!(frame(&mut t, 130).0, rows as usize);
     }
 
     /// The byte-at-a-time scanner `DecstrScan::find` must agree with.

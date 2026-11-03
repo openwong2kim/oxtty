@@ -128,6 +128,15 @@ test('native windowsPty', () => {
   assert.throws(() => t.setWindowsPty('pty', 1), /unknown backend/);
 });
 
+test('textRows: translateToString of each line in one call', () => {
+  const t = new Terminal(10, 2, 50);
+  t.write('a\r\n한 b  \r\nwrapped line');
+  // Typed spaces stay, as in translateToString(true)
+  assert.equal(t.textRows(-2, 1), 'a\n한 b  \nwrapped li\nne\n');
+  assert.equal(t.textRows(1, 1, false), 'ne        \n');
+  assert.equal(t.textRows(-9, -2), 'a\n');
+});
+
 test('native search mirrors the wasm one (without regex)', () => {
   const t = new Terminal(10, 3, 50);
   t.write('foo one\r\n0123456789abcdef\r\n한글foo');

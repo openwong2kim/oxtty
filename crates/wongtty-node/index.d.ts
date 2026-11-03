@@ -12,6 +12,11 @@ export declare class Terminal {
   /** Lines that have left the top of the scrollback so far (a full history dropping rows, ED3, RIS). */
   get trimmedLines(): number
   rowText(line: number): string | null
+  /**
+   * `translateToString(trimRight)` of lines `first`…`last` (clamped to the buffer), each followed by `\n`, in one
+   * call. `trimRight` defaults to true.
+   */
+  textRows(first: number, last: number, trimRight?: boolean | undefined | null): string
   /** `[ch, fg, bg, attrs]` per cell, or `null` if out of range. */
   rowCells(line: number): Uint32Array | null
   /**

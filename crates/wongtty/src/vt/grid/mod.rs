@@ -1,5 +1,6 @@
 //! A specialized 2D grid implementation optimized for use in a terminal.
 
+use std::any::Any;
 use std::cmp::{max, min};
 use std::fmt;
 use std::mem;
@@ -156,9 +157,9 @@ pub struct Grid<T> {
     grow_blank: bool,
 
     /// wongtty: receives lines that would be dropped because the history is full (wongtty keeps them compressed).
-    /// If `None`, they are dropped as in the original Alacritty behavior.
+    /// If none, they are dropped as in the original Alacritty behavior.
     #[cfg_attr(feature = "serde", serde(skip))]
-    history_sink: Option<Arc<Mutex<dyn HistorySink<T>>>>,
+    history_sink: Sink<T>,
 
     /// wongtty: number of lines scrolled up so far. Counted under the same conditions that raise `display_offset`.
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -197,6 +198,33 @@ pub trait HistorySink<T>: fmt::Debug + Send {
 
     /// The history was cleared (`CSI 3 J`, reset).
     fn clear(&mut self);
+
+    /// The sink itself, for its owner to read the rows it keeps.
+    fn as_any(&self) -> &dyn Any;
+
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+/// wongtty: the grid's `HistorySink`, owned by the grid (one thread drives a terminal). A clone of the grid has
+/// none, as the rows it holds go with the grid they left.
+struct Sink<T>(Option<Box<dyn HistorySink<T>>>);
+
+impl<T> Default for Sink<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<T> Clone for Sink<T> {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+impl<T> fmt::Debug for Sink<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 /// wongtty: the oldest history rows, held outside the grid while it resizes.
@@ -245,7 +273,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             columns,
             keep_cursor_paragraph: false,
             grow_blank: false,
-            history_sink: None,
+            history_sink: Sink(None),
             scrolled_lines: 0,
             history_entered: 0,
             history_above: None,
@@ -315,9 +343,18 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
     /// wongtty: sets where rows dropped from a full history go; returns the previous sink.
     pub fn set_history_sink(
         &mut self,
-        sink: Option<Arc<Mutex<dyn HistorySink<T>>>>,
-    ) -> Option<Arc<Mutex<dyn HistorySink<T>>>> {
-        mem::replace(&mut self.history_sink, sink)
+        sink: Option<Box<dyn HistorySink<T>>>,
+    ) -> Option<Box<dyn HistorySink<T>>> {
+        mem::replace(&mut self.history_sink.0, sink)
+    }
+
+    /// wongtty: where rows dropped from a full history go.
+    pub fn history_sink(&self) -> Option<&dyn HistorySink<T>> {
+        self.history_sink.0.as_deref()
+    }
+
+    pub fn history_sink_mut(&mut self) -> Option<&mut (dyn HistorySink<T> + 'static)> {
+        self.history_sink.0.as_deref_mut()
     }
 
     /// wongtty: sets the view offset as it is, without clamping to the history
@@ -500,10 +537,9 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             self.history_entered += positions as u64;
             // wongtty: hand the rows a full history is about to drop to the sink. They are the
             // oldest history rows, then (with less history than `positions`) the top screen rows.
-            if let Some(sink) = &self.history_sink {
-                let history = self.history_size();
+            let history = self.history_size();
+            if let Some(sink) = &mut self.history_sink.0 {
                 let dropped = (history + positions).saturating_sub(self.max_scroll_limit);
-                let mut sink = sink.lock().unwrap_or_else(PoisonError::into_inner);
                 for i in 0..dropped {
                     sink.push(&mut self.raw[Line(i as i32 - history as i32)]);
                 }
@@ -622,8 +658,8 @@ impl<T> Grid<T> {
 
     #[inline]
     pub fn clear_history(&mut self) {
-        if let Some(sink) = &self.history_sink {
-            sink.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        if let Some(sink) = &mut self.history_sink.0 {
+            sink.clear();
         }
 
         // Explicitly purge all lines from history.

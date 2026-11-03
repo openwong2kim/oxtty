@@ -15,10 +15,11 @@
 //! the encoder writes into room it has made sure of, by index, rather than
 //! growing a `Vec` byte by byte.
 
+use std::any::Any;
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::mem;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::vt::event::EventListener;
 use crate::vt::grid::{Dimensions, HistoryAbove, HistorySink, Row};
@@ -168,6 +169,106 @@ impl History {
     /// Row `i`'s `shape`.
     fn shape(&self, i: usize) -> Option<(usize, bool)> {
         shape(self.bytes(i))
+    }
+
+    /// Whether row `i`, at the width rows are read at, wraps (its last cell has WRAPLINE), from its bytes: a row
+    /// read at another width than it was stored at has a default blank there.
+    pub(crate) fn wrapped(&self, i: usize) -> bool {
+        let bytes = self.bytes(i);
+        let cols = take_varint(&mut &bytes[..]);
+        shape(bytes).is_some_and(|(cells, wraps)| {
+            wraps && Some(cells) == cols && (self.cols == 0 || Some(self.cols) == cols)
+        })
+    }
+
+    /// The ASCII characters of row `i`'s text as a set (bit `c` for `c`; a space may be missing, as blanks read as
+    /// spaces too), whether it wraps (`wrapped`), and how many bytes it is stored in, from its bytes. `None` for a
+    /// row with extras or bytes that do not read.
+    pub(crate) fn ascii_in(&self, i: usize) -> Option<(u128, bool, usize)> {
+        let abs = self.first + i as u64;
+        if self
+            .extras
+            .binary_search_by_key(&abs, |(at, _)| *at)
+            .is_ok()
+        {
+            return None;
+        }
+        let mut bytes = self.bytes(i);
+        let len = bytes.len();
+        let cols = take_varint(&mut bytes)?;
+        let (mut cells, mut flags, mut ascii) = (0, 0, 0u128);
+        while !bytes.is_empty() {
+            let head = take(&mut bytes, 3)?;
+            let (tag, n) = (head[0], u16::from_le_bytes([head[1], head[2]]) as usize);
+            // A colour is its kind and 2, 1 or 3 bytes (`Out::color`).
+            for color in [FG, BG] {
+                if tag & color != 0 {
+                    let kind = *bytes.first()?;
+                    take(&mut bytes, [3, 2].get(kind as usize).map_or(4, |&n| n))?;
+                }
+            }
+            if tag & FLAGS != 0 {
+                let b = take(&mut bytes, 2)?;
+                flags = u16::from_le_bytes([b[0], b[1]]);
+            }
+            if tag & BLANK != 0 {
+                cells += n;
+                continue;
+            }
+            for _ in 0..n {
+                let (&b, rest) = bytes.split_first()?;
+                if b < UNIT_2 {
+                    ascii |= 1 << b;
+                    bytes = rest;
+                    cells += 1;
+                } else {
+                    let unit = take(&mut bytes, if b < UNIT_3 { 2 } else { 3 })?;
+                    // A wide ASCII character
+                    if b & !WIDE == UNIT_2 && unit[1] < 0x80 {
+                        ascii |= 1 << unit[1];
+                    }
+                    cells += 1 + (b & WIDE != 0) as usize;
+                }
+                if let Some(&m) = bytes.first().filter(|&&m| m > MARKS) {
+                    for &m in &take(&mut bytes, 1 + (m - MARKS) as usize)?[1..] {
+                        ascii |= if m < 0x80 { 1 << m } else { 0 };
+                    }
+                }
+            }
+        }
+        let wraps = flags as u32 & Flags::WRAPLINE.bits() != 0
+            && cells == cols
+            && (self.cols == 0 || self.cols == cols);
+        Some((ascii, wraps, len))
+    }
+
+    /// Row `i` as `Engine::row_packed` gives it decoded, read straight from its bytes into `out`. False when the
+    /// row has extras or zerowidth characters, or bytes `decode` would not read: the caller decodes it instead.
+    pub(crate) fn row_packed_into(&self, i: usize, out: &mut Vec<u32>) -> bool {
+        let abs = self.first + i as u64;
+        self.extras
+            .binary_search_by_key(&abs, |(at, _)| *at)
+            .is_err()
+            && packed_into(self.bytes(i), self.cols, out).is_some()
+    }
+
+    /// Appends row `i`'s text as `Engine::row_string` gives it, read straight from its bytes. False, with nothing
+    /// appended, when the row has extras or bytes `decode` would not read: the caller decodes it instead.
+    pub(crate) fn row_text_into(&self, i: usize, trim_right: bool, out: &mut String) -> bool {
+        let abs = self.first + i as u64;
+        if self
+            .extras
+            .binary_search_by_key(&abs, |(at, _)| *at)
+            .is_ok()
+        {
+            return false;
+        }
+        let start = out.len();
+        let read = text_into(self.bytes(i), self.cols, trim_right, out).is_some();
+        if !read {
+            out.truncate(start);
+        }
+        read
     }
 
     /// Removes every row, oldest first.
@@ -402,6 +503,14 @@ impl HistorySink<Cell> for History {
         if freed {
             release_freed();
         }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -831,9 +940,11 @@ fn shrink_row(
 /// column change records the width rows are read at, which has to stay the
 /// primary grid's width, so a [`Term::resize`] past this would have rows
 /// stored at the new width read back at the old one.
+///
+/// The rows live in the primary grid, as its history sink, so the methods
+/// that take a term must get the one this was attached to.
 #[derive(Clone)]
 pub struct TermHistory {
-    inner: Arc<Mutex<History>>,
     scrollback: usize,
 }
 
@@ -846,30 +957,48 @@ impl TermHistory {
     /// Attaches to the primary grid of `term`, keeping `scrollback` history
     /// rows in all.
     pub fn attach<T>(term: &mut Term<T>, scrollback: usize) -> Self {
-        let inner = Arc::new(Mutex::new(History::new(
-            scrollback.saturating_sub(Self::RECENT),
-        )));
-        let sink: Arc<Mutex<dyn HistorySink<Cell>>> = inner.clone();
-        term.grid_mut().set_history_sink(Some(sink));
-        Self { inner, scrollback }
+        let history = History::new(scrollback.saturating_sub(Self::RECENT));
+        term.grid_mut().set_history_sink(Some(Box::new(history)));
+        Self { scrollback }
     }
 
-    pub(crate) fn lock(&self) -> MutexGuard<'_, History> {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    /// The rows held for `term`: its primary grid owns them, as its history sink.
+    pub(crate) fn stored<'a, T>(&self, term: &'a Term<T>) -> &'a History {
+        let grid = if term.mode().contains(TermMode::ALT_SCREEN) {
+            term.inactive_grid()
+        } else {
+            term.grid()
+        };
+        held(grid.history_sink())
+    }
+
+    pub(crate) fn stored_mut<'a, T>(&self, term: &'a mut Term<T>) -> &'a mut History {
+        let grid = if term.mode().contains(TermMode::ALT_SCREEN) {
+            term.inactive_grid_mut()
+        } else {
+            term.grid_mut()
+        };
+        held_mut(grid.history_sink_mut())
     }
 
     /// Rows held here, above the grid's history.
-    pub fn len(&self) -> usize {
-        self.lock().len()
+    ///
+    /// # Panics
+    ///
+    /// If `term`'s primary grid does not hold a history from
+    /// [`TermHistory::attach`] (another term, or a history sink replaced
+    /// since). The same holds for every method that takes a term.
+    pub fn len<T>(&self, term: &Term<T>) -> usize {
+        self.stored(term).len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    pub fn is_empty<T>(&self, term: &Term<T>) -> bool {
+        self.len(term) == 0
     }
 
     /// Row `i`, 0 being the oldest.
-    pub fn row(&self, i: usize) -> Row<Cell> {
-        self.lock().row(i)
+    pub fn row<T>(&self, term: &Term<T>, i: usize) -> Row<Cell> {
+        self.stored(term).row(i)
     }
 
     /// Resizes `term`, reflowing these rows with the grid's.
@@ -903,8 +1032,9 @@ impl TermHistory {
         } else {
             term.grid_mut()
         };
-        let mut stored = self.lock();
-        let sink = grid.set_history_sink(None);
+        // The history leaves the grid for the resize, which then has no sink.
+        let mut sink = grid.set_history_sink(None);
+        let stored = held_mut(sink.as_deref_mut());
         let (next, cleared, limit) = (stored.id(stored.len()), stored.cleared, stored.limit);
         let blocks = stored.blocks.len() + stored.spare.is_some() as usize;
         let columns_change = columns != grid.columns();
@@ -992,7 +1122,6 @@ impl TermHistory {
             grid.prepend_history(back, self.scrollback);
         }
         let mut older = grid.split_off_history(Self::RECENT);
-        grid.set_history_sink(sink);
         rows.limit = limit;
         rows.cleared = cleared;
         for row in &mut older {
@@ -1007,7 +1136,7 @@ impl TermHistory {
         }
         let freed = rows.blocks.len() + (rows.spare.is_some() as usize) < blocks;
         *stored = rows;
-        drop(stored);
+        grid.set_history_sink(sink);
         // A column change also frees the rows the grid took back and reflowed: about 0.6 MiB at 120x40 that the
         // macOS allocator keeps in the footprint otherwise, while those of a row change are fewer and taken again.
         // Elsewhere only freed blocks are worth a release: glibc's `malloc_trim` walks every arena.
@@ -1027,14 +1156,14 @@ impl TermHistory {
         size: impl Dimensions,
         offset: usize,
     ) -> usize {
-        let older = self.lock().take_all();
         let alt = term.mode().contains(TermMode::ALT_SCREEN);
         let grid = if alt {
             term.inactive_grid_mut()
         } else {
             term.grid_mut()
         };
-        let sink = grid.set_history_sink(None);
+        let mut sink = grid.set_history_sink(None);
+        let older = held_mut(sink.as_deref_mut()).take_all();
         grid.prepend_history(older, self.scrollback);
         grid.set_display_offset(offset);
         term.resize(size);
@@ -1045,13 +1174,26 @@ impl TermHistory {
         };
         let offset = grid.display_offset();
         let mut older = grid.split_off_history(Self::RECENT);
-        grid.set_history_sink(sink);
-        let mut stored = self.lock();
+        let stored = held_mut(sink.as_deref_mut());
         for row in &mut older {
             stored.push_row(row);
         }
+        grid.set_history_sink(sink);
         offset
     }
+}
+
+/// The `History` a primary grid keeps as its sink (`TermHistory::attach`).
+#[inline(never)]
+fn held(sink: Option<&dyn HistorySink<Cell>>) -> &History {
+    sink.and_then(|s| s.as_any().downcast_ref())
+        .expect("the history is attached to the primary grid")
+}
+
+#[inline(never)]
+fn held_mut<'a>(sink: Option<&'a mut (dyn HistorySink<Cell> + 'static)>) -> &'a mut History {
+    sink.and_then(|s| s.as_any_mut().downcast_mut())
+        .expect("the history is attached to the primary grid")
 }
 
 /// A wide character cell and the cell right after it (a blank with the same
@@ -1773,6 +1915,228 @@ fn decode_cells(
     Some(Row::from_vec(cells, width))
 }
 
+/// `Engine::row_packed` of what `decode` gives at `width` cells (0: as stored), without the cells, into `out`. For a
+/// row without extras; `None` for one with zerowidth characters or bytes `decode` would not read.
+fn packed_into(mut bytes: &[u8], width: usize, out: &mut Vec<u32>) -> Option<()> {
+    let cols = take_varint(&mut bytes).filter(|n| (1..=u16::MAX as usize).contains(n))?;
+    let width = if width == 0 { cols } else { width };
+    let blank = [
+        ' ' as u32,
+        crate::pack_color(DEFAULT_FG),
+        crate::pack_color(DEFAULT_BG),
+        0,
+    ];
+    let (mut fg, mut bg, mut flags) = (blank[1], blank[2], Flags::empty());
+    out.clear();
+    out.reserve_exact(width * crate::Cell::PACKED_WORDS);
+    let mut cells = 0;
+    while cells < cols && !bytes.is_empty() {
+        let head = take(&mut bytes, 3)?;
+        let (tag, n) = (head[0], u16::from_le_bytes([head[1], head[2]]) as usize);
+        if tag & FG != 0 {
+            fg = crate::pack_color(take_color(&mut bytes)?);
+        }
+        if tag & BG != 0 {
+            bg = crate::pack_color(take_color(&mut bytes)?);
+        }
+        if tag & FLAGS != 0 {
+            let b = take(&mut bytes, 2)?;
+            flags = Flags::from_bits_retain(u16::from_le_bytes([b[0], b[1]]) as u32);
+        }
+        let attrs = |extra: Flags| crate::flag_attrs(flags | extra);
+        let run = attrs(Flags::empty());
+        if tag & BLANK != 0 {
+            if cells + n > cols {
+                return None;
+            }
+            for _ in 0..n {
+                out.extend_from_slice(&[' ' as u32, fg, bg, run]);
+            }
+            cells += n;
+            continue;
+        }
+        for _ in 0..n {
+            let (&b, rest) = bytes.split_first()?;
+            let (c, len) = match b {
+                0 => (' ' as u32, 1),
+                0x01..UNIT_2 => (b as u32, 1),
+                UNIT_2..UNIT_3 => (((b & 0x1f) as u32) << 8 | *rest.first()? as u32, 2),
+                _ => {
+                    let [mid, low] = *rest.first_chunk()?;
+                    (
+                        ((b & 0x1f) as u32) << 16 | (mid as u32) << 8 | low as u32,
+                        3,
+                    )
+                }
+            };
+            let c = char::from_u32(c)? as u32;
+            bytes = &bytes[len..];
+            if b >= UNIT_2 && b & WIDE != 0 {
+                out.extend_from_slice(&[c, fg, bg, attrs(Flags::WIDE_CHAR)]);
+                out.extend_from_slice(&[' ' as u32, fg, bg, attrs(Flags::WIDE_CHAR_SPACER)]);
+                cells += 2;
+            } else {
+                let typed = if b == b' ' {
+                    attrs(Flags::TYPED_SPACE)
+                } else {
+                    run
+                };
+                out.extend_from_slice(&[c, fg, bg, typed]);
+                cells += 1;
+            }
+            // Zerowidth characters: the caller decodes the row.
+            if bytes.first().is_some_and(|&b| b > MARKS) {
+                return None;
+            }
+        }
+        if cells > cols {
+            return None;
+        }
+    }
+    // The default blanks that end the row, and the cut or the blanks of a read at another width.
+    while cells < width {
+        out.extend_from_slice(&blank);
+        cells += 1;
+    }
+    out.truncate(width * crate::Cell::PACKED_WORDS);
+    Some(())
+}
+
+/// `String::push` without a branch on the length: in mixed text it changes from one character to the next.
+#[inline(always)]
+fn push_char(out: &mut String, c: char) {
+    let n = c as u32;
+    let len = c.len_utf8();
+    let tail = |shift: u32| 0x80 | (n >> shift & 0x3f);
+    let words = [
+        n,
+        (0xc0 | n >> 6) | tail(0) << 8,
+        (0xe0 | n >> 12) | tail(6) << 8 | tail(0) << 16,
+        (0xf0 | n >> 18) | tail(12) << 8 | tail(6) << 16 | tail(0) << 24,
+    ];
+    let bytes = words[len - 1].to_le_bytes();
+    // SAFETY: the first `len` bytes of `bytes` are the UTF-8 of `c` (the four forms above, as `char::encode_utf8`
+    // writes them), written into room reserved for them, so the string stays UTF-8.
+    unsafe {
+        let v = out.as_mut_vec();
+        v.reserve(4);
+        let at = v.len();
+        v.as_mut_ptr()
+            .add(at)
+            .cast::<[u8; 4]>()
+            .write_unaligned(bytes);
+        v.set_len(at + len);
+    }
+}
+
+/// `Engine::row_string` of what `decode` gives at `width` cells (0: as stored), without the cells, appended to `out`:
+/// wide characters once, with the zerowidth characters that follow their unit, blanks as spaces, and with
+/// `trim_right` the empty cells that end the row dropped. For a row without extras; `None` (with part of the text
+/// appended) for bytes `decode` would not read.
+fn text_into(mut bytes: &[u8], width: usize, trim_right: bool, out: &mut String) -> Option<()> {
+    let cols = take_varint(&mut bytes).filter(|n| (1..=u16::MAX as usize).contains(n))?;
+    let width = if width == 0 { cols } else { width };
+    // Cells read so far, and the length of the text up to the last content.
+    let (mut cells, mut content) = (0, out.len());
+    // A run with the right half's flag (one that is not a wide character's pair) is left out, as `row_string` skips
+    // those cells.
+    let mut spacer = false;
+    while cells < cols && !bytes.is_empty() {
+        let head = take(&mut bytes, 3)?;
+        let (tag, n) = (head[0], u16::from_le_bytes([head[1], head[2]]) as usize);
+        if tag & FG != 0 {
+            skip_color(&mut bytes)?;
+        }
+        if tag & BG != 0 {
+            skip_color(&mut bytes)?;
+        }
+        if tag & FLAGS != 0 {
+            let b = take(&mut bytes, 2)?;
+            spacer = u16::from_le_bytes([b[0], b[1]]) as u32 & Flags::WIDE_CHAR_SPACER.bits() != 0;
+        }
+        // The read stops at `width`.
+        let end = if spacer { 0 } else { width };
+        if tag & BLANK != 0 {
+            if cells + n > cols {
+                return None;
+            }
+            // Erased blanks, which runs keep without TYPED_SPACE: spaces, none of them content.
+            out.extend(std::iter::repeat_n(' ', n.min(end.saturating_sub(cells))));
+            cells += n;
+            continue;
+        }
+        let mut left = n;
+        while left > 0 {
+            let (&b, rest) = bytes.split_first()?;
+            let mut unit_at = cells;
+            if (0x20..0x80).contains(&b) {
+                // A stretch of printable ASCII (typed spaces too, all content) goes in one copy.
+                let stretch = 1 + rest[..(left - 1).min(rest.len())]
+                    .iter()
+                    .take_while(|&&b| (0x20..0x80).contains(&b))
+                    .count();
+                match stretch.min(end.saturating_sub(cells)) {
+                    0 => {}
+                    1 => out.push(b as char),
+                    shown => out.push_str(std::str::from_utf8(&bytes[..shown]).ok()?),
+                }
+                if cells < end {
+                    content = out.len();
+                }
+                bytes = &bytes[stretch..];
+                unit_at = cells + stretch - 1;
+                cells += stretch;
+                left -= stretch;
+            } else {
+                // 0 an erased blank, other ASCII a control (a tab reads as a space but is content), the rest a
+                // unit of two or three bytes.
+                let (c, len) = match b {
+                    0 | b'\t' => (' ' as u32, 1),
+                    0x01..0x80 => (b as u32, 1),
+                    UNIT_2..UNIT_3 => (((b & 0x1f) as u32) << 8 | *rest.first()? as u32, 2),
+                    _ => {
+                        let [mid, low] = *rest.first_chunk()?;
+                        (
+                            ((b & 0x1f) as u32) << 16 | (mid as u32) << 8 | low as u32,
+                            3,
+                        )
+                    }
+                };
+                let c = char::from_u32(c)?;
+                if cells < end {
+                    push_char(out, c);
+                    if b != 0 && (c != ' ' || b < 0x80) {
+                        content = out.len();
+                    }
+                }
+                bytes = &bytes[len..];
+                cells += 1 + (b >= UNIT_2 && b & WIDE != 0) as usize;
+                left -= 1;
+            }
+            // The zerowidth characters of the last unit, which `decode` puts on its (first) cell.
+            if bytes.first().is_some_and(|&b| b > MARKS) {
+                let (&b, rest) = bytes.split_first()?;
+                let (marks, rest) = rest.split_at_checked((b - MARKS) as usize)?;
+                let marks = std::str::from_utf8(marks).ok()?;
+                if unit_at < end {
+                    out.push_str(marks);
+                    content = out.len();
+                }
+                bytes = rest;
+            }
+        }
+        if cells > cols {
+            return None;
+        }
+    }
+    if trim_right {
+        out.truncate(content);
+    } else {
+        out.extend(std::iter::repeat_n(' ', width - cells.min(width)));
+    }
+    Some(())
+}
+
 /// Takes the zerowidth characters that follow a unit (`MARKS`) onto `cell`,
 /// and returns the bytes after them.
 #[inline(never)]
@@ -1784,6 +2148,23 @@ fn take_marks<'a>(bytes: &'a [u8], cell: &mut Cell) -> Option<&'a [u8]> {
         .chars()
         .for_each(|m| cell.push_zerowidth(m));
     Some(rest)
+}
+
+/// `take_color` without the colour.
+#[inline(always)]
+fn skip_color(bytes: &mut &[u8]) -> Option<()> {
+    let (&kind, rest) = bytes.split_first()?;
+    let len = match kind {
+        0 => {
+            let [lo, hi] = *rest.first_chunk()?;
+            named(u16::from_le_bytes([lo, hi]))?;
+            2
+        }
+        1 => 1,
+        _ => 3,
+    };
+    *bytes = rest.get(len..)?;
+    Some(())
 }
 
 fn take_color(bytes: &mut &[u8]) -> Option<Color> {
@@ -1915,6 +2296,61 @@ mod tests {
         let end = encode(row, scan, &mut out, 0, &mut Vec::new());
         out.truncate(end);
         out
+    }
+
+    /// The text and the packed cells read from row `i`'s bytes are those of the decoded row (`row`), at any width
+    /// it is read at.
+    fn assert_text(history: &History, i: usize, row: &Row<Cell>) {
+        let plain = history.extras.iter().all(|(at, _)| *at != history.id(i));
+        let marks = row[..]
+            .iter()
+            .any(|c| c.zerowidth().is_some_and(|z| !z.is_empty()));
+        let mut packed = Vec::new();
+        assert_eq!(
+            history.row_packed_into(i, &mut packed),
+            plain && !marks,
+            "row {i}"
+        );
+        // Every ASCII character of the text (and those of runs a right half's flag leaves out), but for blanks and
+        // tabs (row_string has spaces for them), and the wrap.
+        if let Some((ascii, wraps, _)) = history.ascii_in(i) {
+            let mut text = String::new();
+            crate::push_row_string(row, false, &mut text);
+            let want = text
+                .chars()
+                .filter(|c| c.is_ascii())
+                .fold(0u128, |m, c| m | 1 << c as u32);
+            let blanks = 1 | 1 << b' ' | 1 << b'\t';
+            assert_eq!(want & !ascii & !blanks, 0, "row {i}");
+            assert_eq!(wraps, history.wrapped(i), "row {i}");
+        } else {
+            assert!(!plain, "row {i}");
+        }
+        for width in [0, 1, row.len().saturating_sub(3).max(1), row.len() + 5] {
+            if plain && !marks {
+                let mut want = Vec::new();
+                packed_into(history.bytes(i), width, &mut packed).unwrap();
+                crate::pack_row(&decode(history.bytes(i), None, width), &mut want);
+                assert_eq!(packed, want, "row {i} at {width}");
+            }
+        }
+        for trim in [false, true] {
+            let mut text = String::new();
+            assert_eq!(history.row_text_into(i, trim, &mut text), plain, "row {i}");
+            let mut want = String::new();
+            if plain {
+                crate::push_row_string(row, trim, &mut want);
+                assert_eq!(text, want, "row {i}");
+            }
+            for width in [1, row.len().saturating_sub(3).max(1), row.len() + 5] {
+                if plain {
+                    let (mut text, mut want) = (String::new(), String::new());
+                    text_into(history.bytes(i), width, trim, &mut text).unwrap();
+                    crate::push_row_string(&decode(history.bytes(i), None, width), trim, &mut want);
+                    assert_eq!(text, want, "row {i} at {width}");
+                }
+            }
+        }
     }
 
     fn cell(c: char, fg: Color, bg: Color, flags: Flags) -> Cell {
@@ -2105,6 +2541,11 @@ mod tests {
             let scan = scan_len(row);
             let wrapped = scan > 0 && row[Column(scan - 1)].flags.contains(Flags::WRAPLINE);
             assert_eq!(history.shape(i), Some((scan, wrapped)), "row {i}");
+            let last = row
+                .last()
+                .is_some_and(|c| c.flags.contains(Flags::WRAPLINE));
+            assert_eq!(history.wrapped(i), last, "row {i}");
+            assert_text(&history, i, row);
         }
     }
 
@@ -2189,6 +2630,11 @@ mod tests {
             let scan = scan_len(row);
             let wrapped = scan > 0 && row[Column(scan - 1)].flags.contains(Flags::WRAPLINE);
             assert_eq!(history.shape(i), Some((scan, wrapped)), "row {i}");
+            let last = row
+                .last()
+                .is_some_and(|c| c.flags.contains(Flags::WRAPLINE));
+            assert_eq!(history.wrapped(i), last, "row {i}");
+            assert_text(&history, i, row);
         }
     }
 
@@ -2767,7 +3213,7 @@ mod oracle {
     }
 
     fn state(side: &Side) -> State {
-        let stored = side.history.lock();
+        let stored = side.history.stored(&side.term);
         let grid = |g: &crate::vt::grid::Grid<Cell>| GridState {
             rows: (-(g.history_size() as i32)..g.screen_lines() as i32)
                 .map(|l| g[Line(l)].clone())
@@ -2825,7 +3271,7 @@ mod oracle {
         while line > g.topmost_line() && g[Line(line.0 - 1)][last].flags.contains(Flags::WRAPLINE) {
             line -= 1;
         }
-        line == g.topmost_line() && !side.history.is_empty()
+        line == g.topmost_line() && !side.history.is_empty(&side.term)
     }
 
     #[derive(Default, Debug)]
@@ -2887,7 +3333,7 @@ mod oracle {
             let what = format!("seed {seed} step {step}");
             assert_same(&a, &b, &format!("{what} before the resize"));
 
-            let total = a.history.len() + a.primary().history_size();
+            let total = a.history.len(&a.term) + a.primary().history_size();
             offset = match rng.below(5) {
                 0 => 0,
                 1 => offset,
@@ -2905,7 +3351,7 @@ mod oracle {
                 }
             }
             seen.resizes += 1;
-            let n = a.history.len();
+            let n = a.history.len(&a.term);
             if cols != old_cols && n > 2 * (old_rows + rows) + 20 {
                 seen.split += 1;
             }
@@ -2929,7 +3375,7 @@ mod oracle {
                 continue;
             }
             let (next, blocks) = {
-                let stored = a.history.lock();
+                let stored = a.history.stored(&a.term);
                 // A block taken again for other rows (the spare) has other row starts.
                 let blocks: Vec<_> = (stored.blocks.iter())
                     .map(|b| (b.bytes.as_ptr(), b.starts.clone()))
@@ -2939,7 +3385,7 @@ mod oracle {
             let size = TermSize::new(cols, rows);
             let got = a.history.reflow(&mut a.term, size, offset);
             {
-                let stored = a.history.lock();
+                let stored = a.history.stored(&a.term);
                 let kept = (stored.blocks.iter())
                     .filter(|b| {
                         blocks.iter().any(|(at, starts)| {
@@ -2957,8 +3403,50 @@ mod oracle {
             assert_same(&a, &b, &what);
             assert_eq!(got, want, "{what}: returned offset");
             // Every row stored again has a new id, so cached rows cannot come back.
-            assert!(a.history.lock().id(0) >= next, "{what}: row ids");
+            assert!(a.history.stored(&a.term).id(0) >= next, "{what}: row ids");
             offset = got;
+        }
+    }
+
+    /// `Engine::text_rows` and `row_wrapped` read history rows from their bytes as the decoded rows read: after any
+    /// output and resize (rows read at another width than they were stored at), past either end of the buffer.
+    #[test]
+    fn reads_from_the_bytes_match_the_decoded_rows() {
+        for seed in 1..=200u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let (cols, rows) = (rng.below(38) as u16 + 2, rng.below(8) as u16 + 1);
+            let scrollback = [17, 24, 60, 150, 400][rng.below(5) as usize];
+            let mut t = crate::Engine::new(cols, rows, scrollback);
+            for step in 0..6 {
+                let n = rng.below(400);
+                let bytes = if seed % 3 == 0 {
+                    log_chunk(&mut rng, n)
+                } else {
+                    chunk(&mut rng, n)
+                };
+                t.feed(bytes.as_bytes());
+                if rng.below(3) == 0 {
+                    t.resize(rng.below(38) as u16 + 2, rng.below(8) as u16 + 1);
+                }
+                let (top, bottom) = (-(t.history_len() as i32), t.rows() as i32);
+                for trim in [false, true] {
+                    let want: String = (top..bottom)
+                        .map(|l| t.row_string(l, trim).unwrap() + "\n")
+                        .collect();
+                    let mut got = String::new();
+                    t.text_rows(top - 3, bottom + 3, trim, &mut got);
+                    assert_eq!(got, want, "seed {seed} step {step} trim {trim}");
+                }
+                // The wrap read from a history row's bytes is the decoded row's.
+                for l in top - 1..bottom {
+                    let last = t.with_row(l, |r| r.last().unwrap().flags.contains(Flags::WRAPLINE));
+                    assert_eq!(
+                        t.row_wrapped(l),
+                        last.unwrap_or(false),
+                        "seed {seed} step {step} line {l}"
+                    );
+                }
+            }
         }
     }
 
@@ -2990,12 +3478,11 @@ mod oracle {
                         .map(|l| g[Line(l)].clone())
                         .collect::<Vec<_>>()
                 };
-                let stored = side.history.lock();
+                let stored = side.history.stored(&side.term);
                 let got: Vec<_> = (0..stored.len())
                     .map(|i| stored.row(i))
                     .chain(grid(&side.term))
                     .collect();
-                drop(stored);
                 let want = grid(&whole);
                 assert_eq!(got.len(), want.len(), "seed {seed} step {step}: rows");
                 for (i, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -3056,13 +3543,16 @@ mod oracle {
             log.push_str("\r\n");
         }
         side.feed(log.as_bytes());
-        assert!(side.history.len() > 5000);
+        assert!(side.history.len(&side.term) > 5000);
         assert_eq!(resize(&mut side, 100, 30), 0, "rows only");
         assert_eq!(resize(&mut side, 100, 40), 0, "rows only");
         let reflowed = cfg!(target_os = "macos") as usize;
         for (i, cols) in [120, 100, 120, 100, 120].into_iter().enumerate() {
             assert_eq!(resize(&mut side, cols, 40), reflowed, "column change {i}");
-            assert!(side.history.lock().spare.is_none(), "column change {i}");
+            assert!(
+                side.history.stored(&side.term).spare.is_none(),
+                "column change {i}"
+            );
         }
     }
 

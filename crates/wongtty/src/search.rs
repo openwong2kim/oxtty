@@ -89,6 +89,30 @@ impl Text {
         self
     }
 
+    /// `fold` as an ASCII query sees it, without the case tables: only characters that lowercase to ones with ASCII
+    /// in them can match it, ASCII letters and two others (`ascii_lowercase_is_ascii_letters_and_two_others`). The
+    /// rest stay as they are, which no query character matches.
+    fn fold_ascii(mut self) -> Self {
+        let mut dotted = None;
+        for (i, c) in self.chars.iter_mut().enumerate() {
+            if c.is_ascii() {
+                c.make_ascii_lowercase();
+            } else if *c == '\u{212a}' {
+                // KELVIN SIGN
+                *c = 'k';
+            } else if *c == '\u{130}' {
+                dotted = Some(i);
+            }
+        }
+        // İ lowercases to `i` and U+0307 (which is not a word separator, for `whole_word`)
+        while let Some(i) = dotted {
+            self.chars.splice(i..=i, ['i', '\u{307}']);
+            self.cells.insert(i, self.cells[i]);
+            dotted = self.chars[..i].iter().rposition(|&c| c == '\u{130}');
+        }
+        self
+    }
+
     /// Lowercases characters `i..` into new buffers (some lowercase to several characters).
     fn fold_from(self, i: usize) -> Self {
         let mut chars = Vec::with_capacity(self.chars.len() + 1);
@@ -201,6 +225,46 @@ fn push_row(
         }
     }
     content
+}
+
+/// Lines a search walking down has looked at and skipped (`Engine::lacks`). Looking at a line costs about its bytes
+/// and reading it about its cells, so where few lines are skipped (text with a colour for every cell takes 12 bytes
+/// a cell), looking costs more than it saves: past 64 lines a search stops looking unless the cells of the lines it
+/// skipped are at least a 32nd of the bytes of all lines it looked at.
+#[derive(Default)]
+struct Skips {
+    looked: u32,
+    bytes: usize,
+    skipped: usize,
+    /// The rows of the line skipped last.
+    rows: i32,
+}
+
+impl Skips {
+    #[inline]
+    fn lacks(
+        &mut self,
+        engine: &Engine,
+        line: i32,
+        required: Option<u128>,
+        options: SearchOptions,
+    ) -> bool {
+        let cols = engine.cols() as usize;
+        let Some(required) =
+            required.filter(|_| self.looked < 64 || self.skipped * cols * 32 >= self.bytes)
+        else {
+            return false;
+        };
+        self.looked += 1;
+        let (rows, bytes) = engine.lacks(line, required, options);
+        self.bytes += bytes;
+        let Some(rows) = rows else {
+            return false;
+        };
+        self.skipped += rows as usize;
+        self.rows = rows;
+        true
+    }
 }
 
 /// Rows read bottom up by [`Engine::search_previous`], so each is decoded once: finding where a line starts reads the
@@ -322,13 +386,55 @@ impl Engine {
         })
     }
 
-    fn read_folded(&self, first: i32, options: SearchOptions) -> Option<Text> {
+    fn read_folded(&self, first: i32, options: SearchOptions, ascii: bool) -> Option<Text> {
         let text = self.read_line(first)?;
         Some(if options.case_sensitive {
             text
+        } else if ascii {
+            text.fold_ascii()
         } else {
             text.fold()
         })
+    }
+
+    /// The characters a line must hold for an ASCII `needle` to be in it, as a set (bit `c` for `c`), lowercase
+    /// when the search ignores case. A space is left out (blanks read as spaces), and when ignoring case so are `i`
+    /// and `k`, which other characters lowercase to (`fold_ascii`).
+    fn required(needle: &[char], options: SearchOptions) -> u128 {
+        let other = |c| c == ' ' || !options.case_sensitive && (c == 'i' || c == 'k');
+        needle
+            .iter()
+            .filter(|&&c| !other(c))
+            .fold(0, |set, &c| set | 1 << c as u32)
+    }
+
+    /// The rows of the logical line starting at history row `line` when its text lacks a character of `required`
+    /// (`History::ascii_in`), so that it holds no match, `None` when it may hold one or goes on into the grid's
+    /// rows; and the bytes looked at.
+    fn lacks(&self, line: i32, required: u128, options: SearchOptions) -> (Option<i32>, usize) {
+        let Some((stored, first)) = self.history_row(line).filter(|_| required != 0) else {
+            return (None, 0);
+        };
+        let (mut held, mut i, mut bytes) = (0, first, 0);
+        loop {
+            let Some((ascii, wraps, len)) = stored.ascii_in(i) else {
+                return (None, bytes);
+            };
+            (held, bytes) = (held | ascii, bytes + len);
+            i += 1;
+            if !wraps {
+                break;
+            }
+            if i == stored.len() {
+                return (None, bytes);
+            }
+        }
+        if !options.case_sensitive {
+            // `A`..=`Z` count as `a`..=`z`
+            held |= ((held >> b'A') & ((1 << 26) - 1)) << b'a';
+        }
+        let rows = (i - first) as i32;
+        ((required & !held != 0).then_some(rows), bytes)
     }
 
     /// Clamps a cell position to the buffer: `col` past the row goes on to the next rows.
@@ -377,8 +483,19 @@ impl Engine {
             (line, col) = (self.top_line(), 0);
         }
         let cols = self.cols() as u32;
+        let ascii = query.is_ascii();
+        let required = ascii.then(|| Self::required(&needle, options));
         let (mut first, mut from) = self.locate(line, col)?;
-        while let Some(text) = self.read_folded(first, options) {
+        let mut skips = Skips::default();
+        loop {
+            // Past the first line, lines whose text lacks the query are skipped without being read
+            if from == 0 && skips.lacks(self, first, required, options) {
+                first += skips.rows;
+                continue;
+            }
+            let Some(text) = self.read_folded(first, options, ascii) else {
+                break;
+            };
             let at = (0..text.cells.len())
                 .find(|&i| text.start(i) >= from)
                 .unwrap_or(text.cells.len());
@@ -417,7 +534,8 @@ impl Engine {
         };
         let (first, mut before) = self.locate(line, col)?;
         let top = self.top_line();
-        let mut text = self.read_folded(first, options)?;
+        let ascii = query.is_ascii();
+        let mut text = self.read_folded(first, options, ascii)?;
         let mut up = RowsUp::default();
         loop {
             let bound = (0..text.cells.len())
@@ -431,7 +549,11 @@ impl Engine {
             }
             text = self.read_line_up(text.first - 1, &mut up)?;
             if !options.case_sensitive {
-                text = text.fold();
+                text = if ascii {
+                    text.fold_ascii()
+                } else {
+                    text.fold()
+                };
             }
             before = u32::MAX;
         }
@@ -447,8 +569,47 @@ impl Engine {
         last: i32,
         out: &mut Vec<SearchMatch>,
     ) {
+        if !self.search_rows_ascii(query, options, first, last, out) {
+            let needle = Self::query(query, options);
+            self.search_rows_with(&needle, options, first, last, None, out);
+        }
+    }
+
+    /// [`Engine::search_rows`] of an ASCII query, which needs no case tables; false, finding nothing, for any other
+    /// query. History lines whose text lacks a character of the query are skipped without being read.
+    fn search_rows_ascii(
+        &self,
+        query: &str,
+        options: SearchOptions,
+        first: i32,
+        last: i32,
+        out: &mut Vec<SearchMatch>,
+    ) -> bool {
         out.clear();
-        let needle = Self::query(query, options);
+        if !query.is_ascii() {
+            return false;
+        }
+        let needle: Vec<char> = if options.case_sensitive {
+            query.chars().collect()
+        } else {
+            query.chars().map(|c| c.to_ascii_lowercase()).collect()
+        };
+        let required = Self::required(&needle, options);
+        self.search_rows_with(&needle, options, first, last, Some(required), out);
+        true
+    }
+
+    /// `search_rows` of a folded `needle`, ASCII when `required` holds the bytes its lines need (`lacks`).
+    fn search_rows_with(
+        &self,
+        needle: &[char],
+        options: SearchOptions,
+        first: i32,
+        last: i32,
+        required: Option<u128>,
+        out: &mut Vec<SearchMatch>,
+    ) {
+        out.clear();
         let last = last.min(self.rows() as i32 - 1);
         if needle.is_empty() || last < first.max(self.top_line()) {
             return;
@@ -456,7 +617,12 @@ impl Engine {
         let cols = self.cols() as u32;
         let mut line = self.line_start(first.max(self.top_line()));
         let (mut chars, mut cells) = (Vec::new(), Vec::new());
+        let mut skips = Skips::default();
         while line <= last {
+            if skips.lacks(self, line, required, options) {
+                line += skips.rows;
+                continue;
+            }
             let Some(rows) = self.read_line_into(line, &mut chars, &mut cells) else {
                 return;
             };
@@ -467,10 +633,14 @@ impl Engine {
                 cells: std::mem::take(&mut cells),
             };
             if !options.case_sensitive {
-                text = text.fold();
+                text = if required.is_some() {
+                    text.fold_ascii()
+                } else {
+                    text.fold()
+                };
             }
             let mut at = 0;
-            while let Some(s) = text.next(&needle, at, options.whole_word) {
+            while let Some(s) = text.next(needle, at, options.whole_word) {
                 let found = text.found(s, needle.len(), cols);
                 if found.end_line >= first && found.start_line <= last {
                     out.push(found);
@@ -567,6 +737,101 @@ mod tests {
         assert_eq!(packed.search_previous("absent", options[0], 4, 0), None);
         let decoded = crate::DECODES.with(std::cell::Cell::get) - before;
         assert_eq!(decoded, packed.history_len() - TermHistory::RECENT);
+    }
+
+    /// `fold_ascii` and `required` hold: outside ASCII only these two characters lowercase to ASCII.
+    #[test]
+    fn ascii_lowercase_is_ascii_letters_and_two_others() {
+        let others: Vec<char> = (0x80..=0x10ffff)
+            .filter_map(char::from_u32)
+            .filter(|c| c.to_lowercase().any(|l| l.is_ascii()))
+            .collect();
+        assert_eq!(others, ['\u{130}', '\u{212a}']);
+        assert!("\u{130}".to_lowercase() == "i\u{307}" && "\u{212a}".to_lowercase() == "k");
+    }
+
+    /// An ASCII query skips the history lines whose bytes lack it and folds case without the tables, and finds
+    /// what the full fold over every line finds: on runs of colours, wide characters, tabs, erased blanks, wrapped
+    /// lines, the two characters that lowercase to ASCII, and rows read at another width after a resize.
+    #[test]
+    fn ascii_queries_find_what_the_full_fold_finds() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let tokens = [
+            "ab",
+            "Ab",
+            "aB",
+            " ",
+            "a b",
+            "\t",
+            "x",
+            "\x1b[31mk\x1b[0mi",
+            "\u{212a}",
+            "\u{130}",
+            "İk",
+            "字",
+            "\x1b[1mA\x1b[22mb",
+            "-",
+            "\x1b[2Xz",
+            "i\u{301}",
+            "\r\n",
+            "\r\n",
+            "\r\n",
+        ];
+        let queries = [
+            "ab", "AB", "k", "ik", "a b", "i", "b-", "  ", "x\t", "zz", "qqzzxx", "b A",
+        ];
+        for round in 0..6 {
+            let cols = 6 + next(20) as u16;
+            let mut packed = Engine::new(cols, 4, 400);
+            let mut plain = Engine::new_uncompressed(cols, 4, 400);
+            let mut bytes = String::new();
+            for _ in 0..3000 {
+                bytes.push_str(tokens[next(tokens.len() as u64) as usize]);
+            }
+            packed.feed(bytes.as_bytes());
+            plain.feed(bytes.as_bytes());
+            if round % 2 == 1 {
+                // Rows the resize changes none of are read at the new width
+                packed.resize(cols + 7, 4);
+                plain.resize(cols + 7, 4);
+            }
+            let (top, bottom) = (-(packed.history_len() as i32), packed.rows() as i32 - 1);
+            assert_eq!(top, -(plain.history_len() as i32));
+            for q in queries {
+                for (case_sensitive, whole_word) in [(false, false), (true, false), (false, true)] {
+                    let o = SearchOptions {
+                        case_sensitive,
+                        whole_word,
+                    };
+                    let (mut got, mut full, mut want) = (Vec::new(), Vec::new(), Vec::new());
+                    packed.search_rows(q, o, top, bottom, &mut got);
+                    packed.search_rows_with(&Engine::query(q, o), o, top, bottom, None, &mut full);
+                    plain.search_rows(q, o, top, bottom, &mut want);
+                    assert_eq!(got, full, "round {round} {q:?} {o:?}");
+                    assert_eq!(got, want, "round {round} {q:?} {o:?}");
+                    // Stepping through them with search_next finds the same
+                    let mut steps = Vec::new();
+                    let (mut line, mut col) = (top, 0);
+                    while let Some(m) = packed.search_next(q, o, line, col) {
+                        steps.push(m);
+                        (line, col) = (m.start_line, m.start_col + 1);
+                    }
+                    let mut walk = Vec::new();
+                    let (mut line, mut col) = (top, 0);
+                    while let Some(m) = plain.search_next(q, o, line, col) {
+                        walk.push(m);
+                        (line, col) = (m.start_line, m.start_col + 1);
+                    }
+                    assert_eq!(steps, walk, "round {round} {q:?} {o:?}");
+                }
+            }
+        }
     }
 
     #[test]
