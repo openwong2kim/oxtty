@@ -227,7 +227,21 @@ fn selection_text(shared: &Rc<Shared>) -> String {
         let start_row_end_col = (start[1] == end[1]).then_some(end[0]);
         result.push(line_text(&view, start[1], start[0], start_row_end_col));
         let mut y = (start[1] + 1.0).max(first);
-        while y <= (end[1] - 1.0).min(last) {
+        let middle = (end[1] - 1.0).min(last);
+        // The whole rows in between in one engine call where it holds them all
+        let rows = (y >= 0.0 && y.fract() == 0.0 && y <= middle)
+            .then(|| view.rows_text(y as u32, middle as u32))
+            .flatten();
+        if let Some((text, wrapped)) = rows {
+            for (text, wrapped) in text.split('\n').zip(wrapped) {
+                match result.last_mut() {
+                    Some(previous) if wrapped => previous.push_str(text),
+                    _ => result.push(text.to_string()),
+                }
+            }
+            y = middle + 1.0;
+        }
+        while y <= middle {
             let line = Line::get(&view, y);
             let text = line
                 .as_ref()

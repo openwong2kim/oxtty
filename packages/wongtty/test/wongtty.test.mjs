@@ -56,6 +56,26 @@ test('scrollback with negative lines', () => {
   assert.equal(t.rowText(-9), null);
 });
 
+test('textRows is translateToString of each line, across blocks of rows and the compressed history', () => {
+  const t = make({ cols: 10, rows: 3, scrollback: 3000 });
+  for (let i = 0; i < 2500; i++) t.write(`${i} 한\x1b[31mé\x1b[0m é \r\n`);
+  t.write('wrapped line of text');
+  const lines = [];
+  for (let l = -t.historyLength; l < t.rows; l++) lines.push(t.rowText(l));
+  // rowText trims every trailing blank, translateToString(true) only the empty cells.
+  assert.equal(t.textRows().split('\n').map((l) => l.trimEnd()).join('\n'), lines.join('\n') + '\n');
+  // Row by row is the same text as in one call (which reads blocks of 1024 rows).
+  let rows = '';
+  for (let l = -t.historyLength; l < t.rows; l++) rows += t.textRows(l, l);
+  assert.equal(t.textRows(), rows);
+  // The typed space that did not fit wrapped onto row 0, where translateToString(true) keeps it.
+  assert.equal(t.textRows(-1, 0), '2499 한é é\n \n');
+  t.write('\x1b[K\r\n');
+  assert.equal(t.textRows(1, 2, false), 'ne of text\n          \n');
+  assert.equal(t.textRows(5, 9), '');
+  assert.equal(t.textRows(-9999, -t.historyLength), t.textRows(-t.historyLength, -t.historyLength));
+});
+
 test('damage lists changed rows', () => {
   const t = make();
   assert.deepEqual(t.takeDamage(), { full: true, scroll: 0, lines: [] });
@@ -357,10 +377,88 @@ test('search: plain and regex over scrollback, wrapped rows and wide characters'
   assert.deepEqual(t.searchRows('foo', { regex: true }, 0, 1).map(at), [[0, 0, 0, 3], [0, 7, 0, 10]]);
   assert.deepEqual(t.searchRows('foo', { regex: true }, 1, 1), [], 'only matches on the rows asked for');
   assert.deepEqual(t.searchRows('foo', {}, -4, 2).map(at), t.searchRows('foo', { regex: true }, -4, 2).map(at));
+  // A plain ASCII query is matched in the engine, a plain one with other characters here: both as the RegExp finds
+  for (const [q, o] of [['foo', { wholeWord: true }], ['FOO', { caseSensitive: true }], ['89ab', {}], ['o', {}], ['글f', {}], [' ', {}]]) {
+    const re = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    assert.deepEqual(t.searchRows(q, o, -4, 2).map(at), t.searchRows(re, { ...o, regex: true }, -4, 2).map(at), q);
+  }
   const line = t.searchLine(-1);
   assert.deepEqual([line.first, line.rows, line.text], [-1, 1, '한글foo']);
   assert.deepEqual(Array.from(line.cells.slice(0, 3)), [0x80000000, 0x80000002, 4]);
   assert.equal(t.searchLine(3), null);
+  t.dispose();
+});
+
+test('searchRows of a plain ASCII query, matched in the engine, finds what the per-line RegExp path finds', () => {
+  let seed = 7;
+  const next = (n) => {
+    seed = (seed * 1103515245 + 12345) >>> 0;
+    return (seed >>> 8) % n;
+  };
+  // Wide and combining characters, colours, words joined by `_`, case variants, typed and erased blanks, wraps
+  const tokens = ['ab', 'Ab', 'aB', ' ', 'a b', 'x', '\x1b[31mb\x1b[0ma', '字', '\x1b[1mA\x1b[22mb', '-', '_', 'é', '\x1b[2Xz', '\t', '\r\n', '\r\n'];
+  const queries = ['ab', 'AB', 'a b', 'b-', 'b_a', 'ba', 'z', 'xx', 'b A', 'qq', 'a'];
+  const at = (m) => [m.startLine, m.startCol, m.endLine, m.endCol];
+  let matches = 0;
+  for (const cols of [7, 13, 31]) {
+    const t = new Terminal({ cols, rows: 4, scrollback: 2000 });
+    let text = '';
+    for (let i = 0; i < 6000; i++) text += tokens[next(tokens.length)];
+    t.write(text);
+    const [top, bottom] = [-t.historyLength, t.rows - 1];
+    for (const q of queries) {
+      for (const o of [{}, { caseSensitive: true }, { wholeWord: true }]) {
+        const re = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const want = t.searchRows(re, { ...o, regex: true }, top, bottom).map(at);
+        assert.deepEqual(t.searchRows(q, o, top, bottom).map(at), want, `${cols} ${q} ${JSON.stringify(o)}`);
+        // Part of the rows: those matches that touch them
+        const [first, last] = [top + 100, top + 400];
+        assert.deepEqual(t.searchRows(q, o, first, last).map(at), t.searchRows(re, { ...o, regex: true }, first, last).map(at));
+        const view = t.searchRowsView(q, o, top, bottom, 5);
+        assert.deepEqual(Array.from(view), want.slice(0, 5).flat(), 'the first `limit` of them');
+        matches += want.length;
+      }
+    }
+    t.dispose();
+  }
+  assert.ok(matches > 5000, `${matches}`);
+});
+
+test('searchRows pages through many matches and reads bounds past the buffer as its ends', () => {
+  const t = new Terminal({ cols: 50, rows: 4, scrollback: 1000 });
+  // 1,003 lines of 20 matches each, wrapped: more than one page of engine matches
+  for (let i = 0; i < 1003; i++) t.write(`${'e'.repeat(37)} ee E${'e'.repeat(13)}e\r\n`);
+  const at = (m) => [m.startLine, m.startCol, m.endLine, m.endCol];
+  const [top, bottom] = [-t.historyLength, t.rows - 1];
+  for (const q of ['ee', 'e']) {
+    const want = t.searchRows(q, { regex: true }, top, bottom).map(at);
+    assert.ok(want.length > 9000, `${want.length}`);
+    assert.deepEqual(t.searchRows(q, {}, top, bottom).map(at), want, q);
+    for (const [first, last] of [[-Infinity, Infinity], [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER], [-(2 ** 31) - 5, 2 ** 31 + 5]]) {
+      assert.deepEqual(t.searchRows(q, {}, first, last).map(at), want, `${q} ${first} ${last}`);
+      assert.equal(t.searchRowsView(q, {}, first, last, 3).length, 12);
+    }
+  }
+  assert.deepEqual(t.searchRows('e', {}, NaN, 0), []);
+  assert.deepEqual(t.searchRows('e', {}, 0, NaN), []);
+  assert.equal(t.searchRowsView('e', {}, NaN, NaN).length, 0);
+  t.dispose();
+});
+
+test('searchRows folds case as the N-API binding does; searchRowsView refuses lines that fold longer on request', () => {
+  const t = new Terminal({ cols: 20, rows: 3, scrollback: 10 });
+  t.write('K x\r\nx İx\r\nKX');
+  const at = (m) => [m.startLine, m.startCol, m.endLine, m.endCol];
+  // KELVIN SIGN lowercases to k, İ to i and U+0307 (the RegExp `i` flag folds neither to ASCII)
+  assert.deepEqual(t.searchRows('k', {}, 0, 2).map(at), [[0, 0, 0, 1], [2, 0, 2, 1]]);
+  assert.deepEqual(t.searchRows('i', {}, 0, 2).map(at), [[1, 2, 1, 3]]);
+  assert.deepEqual(t.searchRows('ix', {}, 0, 2), [], 'U+0307 comes between');
+  assert.deepEqual(t.searchRows('k', { regex: true }, 0, 2).map(at), [[2, 0, 2, 1]]);
+  assert.deepEqual(Array.from(t.searchRowsView('x', { keepLength: true }, 0, 0)), [0, 2, 0, 3]);
+  assert.equal(t.searchRowsView('x', { keepLength: true }, 0, 2), null, 'row 1 holds İ and a match');
+  assert.equal(t.searchRowsView('x', { keepLength: true }, 0, 2, 1).length, 4, 'the limit stops before row 1');
+  assert.equal(t.searchRowsView('x', { keepLength: true, caseSensitive: true }, 0, 2).length, 12);
+  assert.equal(t.searchRowsView('é', {}, 0, 2), null, 'not ASCII');
   t.dispose();
 });
 

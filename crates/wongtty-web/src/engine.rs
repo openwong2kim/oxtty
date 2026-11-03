@@ -12,7 +12,7 @@
 //! the rows it shows from the fetched rows, so frames and the viewport read as if the engine held everything.
 use std::collections::HashMap;
 
-use js_sys::{Array, Object, Reflect, Uint32Array, Uint8Array};
+use js_sys::{Array, Int32Array, JsString, Object, Reflect, Uint32Array, Uint8Array};
 use wasm_bindgen::prelude::*;
 
 use crate::remote::Remote;
@@ -43,6 +43,14 @@ extern "C" {
     pub fn display_offset(this: &Engine) -> u32;
     #[wasm_bindgen(method, catch, js_name = rowText)]
     pub fn row_text(this: &Engine, line: i32) -> Result<Option<String>, JsValue>;
+    /// `translateToString(trimRight)` of lines `first..=last` (clamped to the buffer), each followed by `\n`.
+    #[wasm_bindgen(method, catch, js_name = textRows)]
+    pub fn text_rows(
+        this: &Engine,
+        first: i32,
+        last: i32,
+        trim_right: bool,
+    ) -> Result<String, JsValue>;
     /// A view into the engine's memory, valid until the next call into any engine terminal: copy it at once.
     #[wasm_bindgen(method, catch, js_name = rowCellsView)]
     pub fn row_cells_view(this: &Engine, line: i32) -> Result<Option<Uint32Array>, JsValue>;
@@ -105,6 +113,20 @@ extern "C" {
     /// buffer. `cells` maps each UTF-16 unit of `text` to its cell (`row * cols + col` from `first`, bit 31 wide).
     #[wasm_bindgen(method, catch, js_name = searchLine)]
     pub fn search_line(this: &Engine, line: i32) -> Result<JsValue, JsValue>;
+    /// The first `limit` matches of a plain ASCII `query` in the logical lines of lines `first..=last` that touch
+    /// them, matched in the engine, as `[start line, start col, end line, end col]` each (`options`: `{
+    /// caseSensitive, wholeWord, keepLength }`): a view into the engine's memory, valid until the next call into any
+    /// engine terminal. `null` for a query that is not ASCII, and with `keepLength` when a line with a match holds
+    /// U+0130, which lowercases to two characters.
+    #[wasm_bindgen(method, catch, js_name = searchRowsView)]
+    pub fn search_rows_view(
+        this: &Engine,
+        query: &JsString,
+        options: &Object,
+        first: i32,
+        last: i32,
+        limit: u32,
+    ) -> Result<Option<Int32Array>, JsValue>;
     /// Marker on buffer line `line` of the primary screen (0 the oldest history line); 0 when refused.
     #[wasm_bindgen(method, catch, js_name = addMarker)]
     pub fn add_marker(this: &Engine, line: i32) -> Result<u32, JsValue>;

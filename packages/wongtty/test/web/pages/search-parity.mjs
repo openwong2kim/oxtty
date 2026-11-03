@@ -11,7 +11,7 @@ let addons = [];
 let results = [[], []];
 
 Object.assign(window, {
-  start: async ({ cols, rows, scrollback }) => {
+  start: async ({ cols, rows, scrollback, highlightLimit }) => {
     await init();
     for (const t of both) t.dispose();
     document.body.replaceChildren();
@@ -25,7 +25,8 @@ Object.assign(window, {
     xterm.loadAddon(new Unicode11Addon());
     xterm.unicode.activeVersion = '11';
     both = [wongtty, xterm];
-    addons = [new SearchAddon(), new XtermSearchAddon()];
+    const addonOptions = highlightLimit === undefined ? undefined : { highlightLimit };
+    addons = [new SearchAddon(addonOptions), new XtermSearchAddon(addonOptions)];
     // `loadAddon` takes the built-in addon once the renderer branch's loadAddon is merged; `activate` is what it calls.
     addons[0].activate(wongtty);
     xterm.loadAddon(addons[1]);
@@ -34,13 +35,13 @@ Object.assign(window, {
   },
   write: (text) => Promise.all(both.map((t) => new Promise((resolve) => t.write(text, resolve)))),
   /**
-   * Runs each step on both terminals: `[method, ...args]` of the addon, or `['scrollLines', n]` of the terminal.
-   * Returns per terminal, per step: the value, the selection and the viewport top.
+   * Runs each step on both terminals: `[method, ...args]` of the addon, or `['scrollLines', n]` or `['select', col,
+   * row, length]` of the terminal. Returns per terminal, per step: the value, the selection and the viewport top.
    */
   run: (steps) => both.map((t, k) => steps.map(([method, ...args]) => {
     let value;
     try {
-      value = method === 'scrollLines' ? t.scrollLines(...args) : addons[k][method](...args);
+      value = method === 'scrollLines' || method === 'select' ? t[method](...args) : addons[k][method](...args);
     } catch (e) {
       value = `throws ${e.name}`;
     }

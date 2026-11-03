@@ -10,6 +10,15 @@
 //! each UTF-16 unit mapped to its cell) instead of `translateToString` and walks over the cells; plain text is
 //! matched with the JS string methods and regular expressions with `RegExp`, so no matcher is compiled into the wasm.
 //!
+//! A plain ASCII term without `wholeWord` is matched in the engine instead (`searchRowsView`), without reading the
+//! lines into JS: the highlight-all pass, `findNext` past the line it starts on, and the line `findPrevious` stops on
+//! past its own, whose last match is then taken as above. Its matches are the addon's: with its quirks left out
+//! (whole words, regular expressions) both find each occurrence after the previous one, and the engine lowercases
+//! the characters that lowercase to ASCII (U+212A, U+0130) as `toLowerCase` does. Where they could still differ the
+//! search goes the JS way: the host lines of viewport-only mode, and lines with a match and U+0130, which
+//! lowercases to two units and so moves the addon's matches (it reads indices of the lowercased text in the
+//! original one).
+//!
 //! Memory: an addon keeps its term, its options and, with decorations, the matches (up to `highlightLimit`, 16 bytes
 //! each), in rows that stay put as the scrollback trims. Lines are read for one search and dropped.
 //!
@@ -259,6 +268,8 @@ struct Search<'a> {
     fold_case: bool,
     whole_word: bool,
     line: Option<Rc<Line>>,
+    /// The `searchRowsView` options when the engine matches the term (module docs).
+    engine_options: Option<Object>,
 }
 
 impl<'a> Search<'a> {
@@ -278,6 +289,17 @@ impl<'a> Search<'a> {
         let fold_case = !options.regex && !options.case_sensitive;
         let history = view.history_length() as i32;
         let remote = view.remote_lines() as i32;
+        let engine_options = (!options.regex
+            && !options.whole_word
+            && remote == 0
+            && term.length() > 0
+            && term.iter().all(|unit| unit < 0x80))
+        .then(|| {
+            let o = Object::new();
+            let _ = Reflect::set(&o, &"caseSensitive".into(), &options.case_sensitive.into());
+            let _ = Reflect::set(&o, &"keepLength".into(), &true.into());
+            o
+        });
         Ok(Self {
             engine,
             cols: engine.cols().max(1),
@@ -297,7 +319,75 @@ impl<'a> Search<'a> {
             fold_case,
             whole_word: options.whole_word,
             line: None,
+            engine_options,
         })
+    }
+
+    /// The first `limit` matches in the logical lines of buffer rows `first..=last` that touch those rows, matched in
+    /// the engine; `None` where the addon's matching may differ (module docs).
+    fn engine_matches(&self, first: i32, last: i32, limit: u32) -> Option<Vec<FoundMatch>> {
+        let options = self.engine_options.as_ref()?;
+        let (first, last) = (first - self.history, last - self.history);
+        let words = self
+            .engine
+            .search_rows_view(self.term, options, first, last, limit)
+            .ok()??
+            .to_vec();
+        Some(
+            words
+                .chunks_exact(4)
+                .map(|m| FoundMatch {
+                    row: m[0] + self.history,
+                    col: m[1] as u32,
+                    size: ((m[2] - m[0]) as u32 * self.cols + m[3] as u32)
+                        .saturating_sub(m[1] as u32),
+                })
+                .collect(),
+        )
+    }
+
+    /// The last buffer row in `lo..=hi` a match touches, `Some(None)` for none: single-match engine searches over
+    /// ranges ending at `hi`, doubling until one finds a match, then halving. Each search stops above the rows
+    /// already known to have none (a match touching them would have been found there), so each row is read about
+    /// once. `None` where the engine does not match the term.
+    fn last_touched_row(&self, lo: i32, hi: i32) -> Option<Option<i32>> {
+        let touched = |from: i32, to: i32| Some(!self.engine_matches(from, to, 1)?.is_empty());
+        // `yes` has a match in `yes..=hi`, `no` none in `no..=hi`
+        let (mut yes, mut no) = (None, hi + 1);
+        let mut span = 1;
+        while yes.is_none() && no > lo {
+            let from = hi.saturating_sub(span - 1).max(lo);
+            if touched(from, no - 1)? {
+                yes = Some(from);
+            } else {
+                no = from;
+            }
+            span = span.saturating_mul(2);
+        }
+        let Some(mut yes) = yes else {
+            return Some(None);
+        };
+        while no - yes > 1 {
+            let mid = yes + (no - yes) / 2;
+            if touched(mid, no - 1)? {
+                yes = mid;
+            } else {
+                no = mid;
+            }
+        }
+        Some(Some(yes))
+    }
+
+    /// The last match of the logical line buffer row `row` is on, as `_findInLine` going backwards finds it there.
+    fn last_in_line(&mut self, row: i32) -> Result<Option<FoundMatch>, JsValue> {
+        let Some(line) = self.line(row) else {
+            return Ok(None);
+        };
+        let mut pos = Pos {
+            row: line.first,
+            col: u32::MAX,
+        };
+        self.find_in_line(&mut pos, true)
     }
 
     /// The logical line buffer row `row` is on; `None` outside the buffer.
@@ -400,6 +490,9 @@ impl<'a> Search<'a> {
 
     /// Every match from the top, as `_highlightAllMatches` collects them.
     fn find_all(&mut self, limit: u32) -> Result<Vec<FoundMatch>, JsValue> {
+        if let Some(results) = self.engine_matches(0, self.end - 1, limit) {
+            return Ok(results);
+        }
         let mut results = Vec::new();
         let mut previous: Option<(i32, u32)> = None;
         let mut result = self.find(0, 0)?;
@@ -436,6 +529,11 @@ impl<'a> Search<'a> {
             col: start_col,
         };
         let mut result = self.find_in_line(&mut pos, false)?;
+        if result.is_none() {
+            if let Some(result) = self.find_next_in_engine(start_row, selection)? {
+                return Ok(result);
+            }
+        }
         let mut y = start_row + 1;
         while result.is_none() && y < self.end {
             pos = Pos { row: y, col: 0 };
@@ -461,6 +559,99 @@ impl<'a> Search<'a> {
             result = self.find_in_line(&mut pos, false)?;
         }
         Ok(result)
+    }
+
+    /// The rest of `find_next` once the line `start_row` is on has no match after the start, with the engine finding
+    /// the first match below that line and, wrapping around, above it; `None` where the engine does not match the
+    /// term.
+    fn find_next_in_engine(
+        &mut self,
+        start_row: i32,
+        selection: Option<SelectionPosition>,
+    ) -> Result<Option<Option<FoundMatch>>, JsValue> {
+        let Some(line) = self
+            .engine_options
+            .is_some()
+            .then(|| self.line(start_row))
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        let below = line.first + line.rows;
+        let Some(found) = self.engine_matches(below, self.end - 1, 1) else {
+            return Ok(None);
+        };
+        let mut result = found.first().copied();
+        // Wrap around to the top: the addon goes over the lines that start above `start_row`, so the start line
+        // only when `start_row` continues it.
+        if result.is_none() && start_row != 0 {
+            let Some(found) = self.engine_matches(0, below - 1, 1) else {
+                return Ok(None);
+            };
+            result = found
+                .first()
+                .copied()
+                .filter(|m| m.row < line.first || line.first < start_row);
+        }
+        // Only one match: the selected one again.
+        if let (None, Some(s)) = (result, selection) {
+            let mut pos = Pos {
+                row: s.start.1,
+                col: 0,
+            };
+            result = self.find_in_line(&mut pos, false)?;
+        }
+        Ok(Some(result))
+    }
+
+    /// The rest of `find_previous` once the start cell (`start_row`, `col`) has no match before it in its row, with
+    /// the engine finding the line of the last match above the start line and, wrapping around, from the bottom;
+    /// `None` where the engine does not match the term.
+    fn find_previous_in_engine(
+        &mut self,
+        start_row: i32,
+        col: u32,
+    ) -> Result<Option<Option<FoundMatch>>, JsValue> {
+        let Some(line) = self
+            .engine_options
+            .is_some()
+            .then(|| self.line(start_row))
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        // The rows of the start line above `start_row`, as the addon goes up them
+        let mut pos = Pos {
+            row: start_row,
+            col: col.max(self.cols),
+        };
+        for y in (line.first..start_row).rev() {
+            pos.row = y;
+            if let Some(found) = self.find_in_line(&mut pos, true)? {
+                return Ok(Some(Some(found)));
+            }
+        }
+        let Some(above) = self.last_touched_row(0, line.first - 1) else {
+            return Ok(None);
+        };
+        if let Some(row) = above {
+            return self.last_in_line(row).map(Some);
+        }
+        // Wrap around to the bottom, down to `start_row`: the start line only when it starts there.
+        let bottom = self.end - 1;
+        if start_row == bottom {
+            return Ok(Some(None));
+        }
+        let lo = if line.first == start_row {
+            line.first
+        } else {
+            line.first + line.rows
+        };
+        match self.last_touched_row(lo, bottom) {
+            None => Ok(None),
+            Some(None) => Ok(Some(None)),
+            Some(Some(row)) => self.last_in_line(row).map(Some),
+        }
     }
 
     /// `findPreviousWithSelection`, after the selection was read and cleared.
@@ -496,6 +687,11 @@ impl<'a> Search<'a> {
         }
         if result.is_none() {
             result = self.find_in_line(&mut pos, true)?;
+        }
+        if result.is_none() {
+            if let Some(result) = self.find_previous_in_engine(start_row, pos.col)? {
+                return Ok(result);
+            }
         }
         if result.is_none() {
             pos.col = pos.col.max(self.cols);

@@ -1,7 +1,7 @@
 // wongtty — terminal emulator engine (Rust → WebAssembly).
 // Works in browsers, bundlers (Vite/webpack resolve the .wasm URL) and Node ≥ 18.
 
-const ABI = 14;
+const ABI = 15;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 // Input buffer: smallest allocation, and the largest one kept between writes.
@@ -103,6 +103,11 @@ function requireWasm() {
 const bytesOut = (len) => new Uint8Array(wasm.memory.buffer, wasm.wongtty_out_ptr(), len).slice();
 const textOut = (len) => (len <= 0 ? '' : decoder.decode(new Uint8Array(wasm.memory.buffer, wasm.wongtty_out_ptr(), len)));
 const wordsOut = (n) => (n <= 0 ? new Uint32Array(0) : new Uint32Array(wasm.memory.buffer, wasm.wongtty_out32_ptr(), n).slice());
+
+/** Rows `textRows` asks the engine for at a time, so the text it holds in its memory stays small. */
+const TEXT_BLOCK = 1024;
+/** Matches `searchRows` asks the engine for at a time (16 bytes each in its memory), so a common query does not grow it. */
+const MATCH_PAGE = 4096;
 
 /** `@xterm/addon-search` `NON_WORD_CHARACTERS`: what ends a word for `wholeWord`. */
 const NON_WORD = ' ~!@#$%^&*()+`-=[]{}|\\;:"\',./<>?';
@@ -426,6 +431,22 @@ export class Terminal {
     return n < 0 ? null : textOut(n);
   }
 
+  /**
+   * `translateToString(trimRight)` of lines `first`…`last` (clamped to the buffer), each followed by `\n`.
+   * @returns {string}
+   */
+  textRows(first = -this.historyLength, last = this.rows - 1, trimRight = true) {
+    const h = this.#handle();
+    first = Math.max(first, -this.historyLength);
+    last = Math.min(last, this.rows - 1);
+    let text = '';
+    for (let from = first; from <= last; from += TEXT_BLOCK) {
+      text += textOut(wasm.wongtty_text_rows(h, from, Math.min(from + TEXT_BLOCK - 1, last), trimRight ? 1 : 0));
+    }
+    wasm.wongtty_out_release();
+    return text;
+  }
+
   /** `[codepoint, fg, bg, attrs]` per cell. @returns {Uint32Array | null} */
   rowCells(line) {
     const n = wasm.wongtty_row_cells(this.#handle(), line);
@@ -648,7 +669,8 @@ export class Terminal {
   }
 
   // Search runs here over the engine's logical lines (`searchLine`), with a RegExp for every query: a plain one is
-  // escaped, and the `i` flag folds case without changing lengths. Matching in the wasm would cost the size budget.
+  // escaped, and the `i` flag folds case without changing lengths. Only `searchRows` of a plain ASCII query is
+  // matched in the engine (`searchRowsView`), whose ASCII case folding needs no Unicode tables in the wasm.
   #matcher(query, { caseSensitive = false, regex = false } = {}) {
     return new RegExp(regex ? query : query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), caseSensitive ? 'g' : 'gi');
   }
@@ -702,6 +724,18 @@ export class Terminal {
   searchRows(query, options = {}, first, last) {
     const out = [];
     if (!query) return out;
+    // Page by page, each from just after the last match
+    for (let line = -0x80000000, col = 0; !options.regex; ) {
+      const m = this.#searchRowsAt(query, options, first, last, MATCH_PAGE, line, col);
+      if (!m) break;
+      for (let i = 0; i < m.length; i += 4) out.push({ startLine: m[i], startCol: m[i + 1], endLine: m[i + 2], endCol: m[i + 3] });
+      if (m.length < MATCH_PAGE * 4) {
+        wasm.wongtty_out_release();
+        return out;
+      }
+      [line, col] = [m[m.length - 4], m[m.length - 3] + 1];
+    }
+    out.length = 0;
     const re = this.#matcher(query, options);
     last = Math.min(last, this.rows - 1);
     let found = this.searchLine(Math.max(first, -this.historyLength));
@@ -713,6 +747,39 @@ export class Terminal {
       found = this.searchLine(found.first + found.rows);
     }
     return out;
+  }
+
+  /**
+   * The engine's matching of a plain `query` over rows `first`…`last` (`searchRows` without `regex`): at most
+   * `limit` matches as `[startLine, startCol, endLine, endCol]` each, a view into WebAssembly memory valid only until
+   * the next call into any terminal. Null for a query that is not ASCII and, with `keepLength`, when a line with a
+   * match holds U+0130 (İ): ignoring case it lowercases to two characters, where a host that lowercases whole lines
+   * (`@xterm/addon-search`) places matches differently. @returns {Int32Array | null}
+   */
+  searchRowsView(query, options = {}, first, last, limit = 0xffffffff) {
+    return this.#searchRowsAt(query, options, first, last, limit, -0x80000000, 0);
+  }
+
+  // `searchRowsView` of the matches starting at or after cell (`line`, `col`).
+  #searchRowsAt(query, { caseSensitive = false, wholeWord = false, keepLength = false }, first, last, limit, line, col) {
+    const h = this.#handle();
+    // Bounds past the buffer (±Infinity too) are its ends, as the RegExp path reads them; NaN finds nothing
+    first = Math.max(first, -this.historyLength);
+    last = Math.min(last, this.rows - 1);
+    if (!(first <= last)) return new Int32Array(0);
+    const bytes = encoder.encode(query);
+    const ptr = this.#reserve(20 + bytes.length);
+    const head = new DataView(wasm.memory.buffer, ptr, 20);
+    head.setInt32(0, first, true);
+    head.setInt32(4, last, true);
+    head.setUint32(8, Math.min(limit, 0xffffffff), true);
+    head.setInt32(12, line, true);
+    head.setUint32(16, col, true);
+    new Uint8Array(wasm.memory.buffer, ptr + 20, bytes.length).set(bytes);
+    const flags = (caseSensitive ? 1 : 0) | (wholeWord ? 2 : 0) | (keepLength ? 4 : 0);
+    const n = wasm.wongtty_search_rows(h, ptr, 20 + bytes.length, flags);
+    this.#shrinkInput();
+    return n < 0 ? null : new Int32Array(wasm.memory.buffer, wasm.wongtty_out32_ptr(), n * 4);
   }
 
   /**

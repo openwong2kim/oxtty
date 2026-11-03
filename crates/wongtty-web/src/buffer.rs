@@ -191,6 +191,27 @@ impl BufferView {
         .unwrap_or_default()
     }
 
+    /// `translateToString(true)` of lines `first..=last`, each followed by `\n` and read in one engine call, and
+    /// whether each continues the previous one (`isWrapped`); `None` outside the buffer, in viewport-only mode with
+    /// host lines, or when this buffer is not on screen.
+    pub(crate) fn rows_text(&self, first: u32, last: u32) -> Option<(String, Vec<bool>)> {
+        self.read(|view| {
+            let e = view.engine();
+            let history = view.history_length();
+            if view.remote_lines() > 0 || first > last || last >= history + e.rows() {
+                return None;
+            }
+            let top = -(history as i32);
+            let (first, last) = (top + first as i32, top + last as i32);
+            let text = e.text_rows(first, last, true).ok()?;
+            let wrapped = (first..=last)
+                .map(|line| line > top && e.row_wrapped(line - 1).unwrap_or(false))
+                .collect();
+            Some((text, wrapped))
+        })
+        .flatten()
+    }
+
     /// An empty cell: no text, width 1.
     #[wasm_bindgen(js_name = getNullCell)]
     pub fn get_null_cell(&self) -> BufferCell {

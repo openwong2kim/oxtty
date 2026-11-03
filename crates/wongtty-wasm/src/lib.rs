@@ -8,8 +8,8 @@
 use std::cell::RefCell;
 
 use wongtty::{
-    Clipboard, CursorShape, Damage, Engine, HookKind, ImageCursor, SnapshotOptions, WindowsPty,
-    WindowsPtyBackend, COLOR_SLOTS,
+    Clipboard, CursorShape, Damage, Engine, HookKind, ImageCursor, SearchOptions, SnapshotOptions,
+    WindowsPty, WindowsPtyBackend, COLOR_SLOTS,
 };
 
 /// The same dlmalloc std uses on wasm, but growing linear memory in larger
@@ -110,7 +110,7 @@ fn set_out(bytes: Vec<u8>) -> u32 {
 /// ABI version of these exports; bump on any incompatible change.
 #[no_mangle]
 pub extern "C" fn wongtty_abi() -> u32 {
-    14
+    15
 }
 
 #[no_mangle]
@@ -141,10 +141,11 @@ pub extern "C" fn wongtty_out_len() -> u32 {
     OUT.with_borrow(|out| out.len() as u32)
 }
 
-/// Frees OUT, once the host has copied a large result (a snapshot) out of it.
+/// Frees OUT and OUT32, once the host has copied a large result (a snapshot, many rows' text or matches) out of them.
 #[no_mangle]
 pub extern "C" fn wongtty_out_release() {
     OUT.with_borrow_mut(|out| *out = Vec::new());
+    OUT32.with_borrow_mut(|out| *out = Vec::new());
 }
 
 #[no_mangle]
@@ -224,6 +225,16 @@ pub extern "C" fn wongtty_row_text(h: u32, line: i32) -> i32 {
     with(h, -1, |t| {
         t.row_text(line)
             .map_or(-1, |s| set_out(s.into_bytes()) as i32)
+    })
+}
+
+/// `Engine::text_rows` of lines `first..=last` (`trim_right` unless 0) into OUT; returns its byte length.
+#[no_mangle]
+pub extern "C" fn wongtty_text_rows(h: u32, first: i32, last: i32, trim_right: u32) -> u32 {
+    with(h, 0, |t| {
+        let mut text = String::new();
+        t.text_rows(first, last, trim_right != 0, &mut text);
+        set_out(text.into_bytes())
     })
 }
 
@@ -617,8 +628,51 @@ pub extern "C" fn wongtty_set_windows_pty(h: u32, backend: u32, build: f64) {
     });
 }
 
-// Search: the host matches over the engine's logical lines (`Engine::search_line`); the engine's own matching
-// stays out of the wasm to keep it small.
+// Search: the host matches over the engine's logical lines (`Engine::search_line`), but for plain ASCII queries,
+// which the engine matches without case tables (`Engine::search_rows_ascii`); a regex engine and the Unicode case
+// tables stay out of the wasm to keep it small.
+
+/// `Engine::search_rows_ascii` of the query staged at `ptr`: `first`, `last` (i32), `limit` (u32) and the cell
+/// matches start at or after, line (i32) and col (u32), little-endian, then the UTF-8 query, `len` bytes in all. `flags` bit 0: case-sensitive, bit 1: whole word, bit 2: -2 instead of
+/// matches when a line with one folds longer (U+0130). Returns the match count with `[start line, start col, end
+/// line, end col]` per match in OUT32, or -1 for a query that is not ASCII (the host matches it itself). Four
+/// parameters, as the host's export wrapper passes.
+///
+/// # Safety
+/// `ptr` must point to `len` readable bytes in linear memory.
+#[no_mangle]
+pub unsafe extern "C" fn wongtty_search_rows(h: u32, ptr: *const u8, len: u32, flags: u32) -> i32 {
+    let staged = std::slice::from_raw_parts(ptr, len as usize);
+    let Some((head, query)) = staged.split_first_chunk::<20>() else {
+        return -1;
+    };
+    let word = |i: usize| i32::from_le_bytes([head[i], head[i + 1], head[i + 2], head[i + 3]]);
+    let Ok(query) = std::str::from_utf8(query) else {
+        return -1;
+    };
+    let options = SearchOptions {
+        case_sensitive: flags & 1 != 0,
+        whole_word: flags & 2 != 0,
+    };
+    with(h, -1, |t| {
+        let mut found = Vec::new();
+        let limit = word(8) as u32 as usize;
+        let from = (word(12), word(16).clamp(0, u16::MAX as i32) as u16);
+        match t.search_rows_ascii(query, options, word(0), word(4), from, limit, &mut found) {
+            None => return -1,
+            Some(true) if flags & 4 != 0 => return -2,
+            Some(_) => {}
+        }
+        OUT32.with_borrow_mut(|out| {
+            out.clear();
+            for m in &found {
+                let (start, end) = (m.start_col as u32, m.end_col as u32);
+                out.extend([m.start_line as u32, start, m.end_line as u32, end]);
+            }
+        });
+        found.len() as i32
+    })
+}
 
 /// `Engine::search_line`: the text's character count (-1 outside the buffer), the UTF-8 text in OUT and
 /// `[first row, rows, cell of each character…]` in OUT32.

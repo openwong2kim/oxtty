@@ -372,3 +372,19 @@ test('dragging past the top or bottom scrolls and extends the selection like xte
   assert.ok(result.up.has && result.down.has);
   assert.deepEqual(result.mismatches, []);
 });
+
+test('selectAll and selectLines over a long compressed scrollback give xterm.js\'s text', { todo: TODO, timeout: 300000 }, async () => {
+  const result = await withTerminals({ cols: COLS, rows: 16, scrollback: 3000 }, async (t) => {
+    // Every line kind above, 120 times, with colours: well past the rows the engine keeps uncompressed
+    await t.write(Array.from({ length: 120 }, (_, i) => `\x1b[3${i % 8}m${LINES[i % LINES.length]}\x1b[0m ${i}`).join('\r\n'));
+    await t.call('selectAll');
+    const all = await t.compare('selectAll');
+    for (const [start, end] of [[0, 1], [0, 2], [3, 150], [100, 101], [5, 170], [150, 160]]) {
+      await t.call('selectLines', start, end);
+      await t.compare(`selectLines(${start}, ${end})`);
+    }
+    return { mismatches: t.mismatches, total: t.count(), length: all.text.length };
+  });
+  assert.ok(result.length > 4000, `${result.length}`);
+  assert.deepEqual(result.mismatches, [], `${result.mismatches.length} of ${result.total} cases differ`);
+});

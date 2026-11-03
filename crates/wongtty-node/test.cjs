@@ -216,3 +216,36 @@ test('index.d.ts declares every method and getter the binding exports', () => {
   exported.push(...Object.getOwnPropertyNames(Terminal).filter((n) => typeof Terminal[n] === 'function'));
   assert.deepEqual(exported.filter((n) => !declared.has(n)), []);
 });
+
+test('textRows and searchRows of the wasm build give what the native ones give on the same output', async () => {
+  const wasm = await import('../../packages/wongtty/dist/index.js');
+  await wasm.init();
+  let seed = 11;
+  const next = (n) => {
+    seed = (seed * 1103515245 + 12345) >>> 0;
+    return (seed >>> 8) % n;
+  };
+  // KELVIN SIGN and İ fold to ASCII; wide and combining characters, colours, typed and erased blanks, wraps
+  const tokens = ['ab', 'Ab', 'K', 'K', 'İ', 'i', ' ', 'x_y', '漢', '\x1b[32mb\x1b[0m', 'é', '\x1b[3X', '-', '\r\n', '\r\n'];
+  for (const cols of [9, 24]) {
+    const native = new Terminal(cols, 5, 1500);
+    const web = new wasm.Terminal({ cols, rows: 5, scrollback: 1500 });
+    let text = '';
+    for (let i = 0; i < 5000; i++) text += tokens[next(tokens.length)];
+    native.write(text);
+    web.write(text);
+    const [top, bottom] = [-native.historyLength, native.rows - 1];
+    assert.equal(-web.historyLength, top);
+    for (const trim of [true, false]) {
+      assert.equal(web.textRows(top, bottom, trim), native.textRows(top, bottom, trim));
+      assert.equal(web.textRows(top + 7, top + 30, trim), native.textRows(top + 7, top + 30, trim));
+    }
+    for (const q of ['ab', 'k', 'i', 'ik', 'b a', 'x_y', 'B', 'zz']) {
+      for (const o of [{}, { caseSensitive: true }, { wholeWord: true }]) {
+        assert.deepEqual(web.searchRows(q, o, top, bottom), native.searchRows(q, o, top, bottom), `${cols} ${q} ${JSON.stringify(o)}`);
+        assert.deepEqual(web.searchRows(q, o, top + 50, top + 80), native.searchRows(q, o, top + 50, top + 80));
+      }
+    }
+    web.dispose();
+  }
+});
