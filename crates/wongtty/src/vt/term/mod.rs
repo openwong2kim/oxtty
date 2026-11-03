@@ -1506,12 +1506,16 @@ impl<T> Term<T> {
                 col += width;
                 used = text.len() - chars.as_str().len();
             }
-            // The zerowidth characters after a cell this run wrote go on it, then the run goes on.
+            // The zerowidth characters after a cell this run wrote go on it, then the run goes on: but for a stretch
+            // of ASCII text (words after an emoji), left to `input_ascii`.
             match zerowidth {
                 Some(c) if col > point.column.0 && extra.is_none() => {
                     put_marks(&mut cells[..col], c, &mut chars);
                     marked = true;
                     used = text.len() - chars.as_str().len();
+                    if ascii8(chars.as_str().as_bytes()) {
+                        break;
+                    }
                 },
                 _ => break,
             }
@@ -1555,6 +1559,12 @@ impl<T> Term<T> {
         trace!("Setting keyboard mode to {new_mode:?}");
         self.mode |= new_mode;
     }
+}
+
+/// wongtty: whether the first 8 bytes of `text` are ASCII.
+#[inline(always)]
+fn ascii8(text: &[u8]) -> bool {
+    text.first_chunk::<8>().is_some_and(|b| u64::from_le_bytes(*b) & 0x8080_8080_8080_8080 == 0)
 }
 
 /// wongtty: puts zerowidth character `first` and those that follow it in `chars` on the last of `cells` (a wide
