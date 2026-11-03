@@ -106,3 +106,31 @@ test('writes still finish when frames never come (a hidden page)', async () => {
     assert.ok(ms < 10000, `${ms} ms`);
   });
 });
+
+test('a second resize before the frame reflows once, at the frame; writes after it parse at the new size', async () => {
+  await withPage('scheduler.mjs', async (page) => {
+    await page.waitForFunction(() => window.ready);
+    const r = await page.evaluate(async () => {
+      const frame = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const t = new window.Terminal({ cols: 20, rows: 6 });
+      t.open(document.getElementById('terminal'));
+      await frame();
+      const resizes = [];
+      t.onResize((e) => resizes.push(`${e.cols}x${e.rows}`));
+      t.resize(30, 6);
+      t.resize(31, 6);
+      t.resize(32, 7);
+      const atOnce = { cols: t.cols, rows: t.rows, resizes: resizes.join() };
+      await frame();
+      const after = { resizes: resizes.join(), width: t.buffer.active.getLine(0).length };
+      // Right after a frame that reflowed, the next resize waits too; a write before that frame applies it first.
+      t.resize(40, 7);
+      const line = await new Promise((resolve) => t.write('y'.repeat(35), () => resolve(t.buffer.active.getLine(0).translateToString(true))));
+      return { atOnce, after, line, cols: t.cols, resizes: resizes.join() };
+    });
+    assert.deepEqual(r.atOnce, { cols: 32, rows: 7, resizes: '30x6' });
+    assert.deepEqual(r.after, { resizes: '30x6,32x7', width: 32 });
+    assert.equal(r.line, 'y'.repeat(35));
+    assert.equal(r.resizes, '30x6,32x7,40x7');
+  });
+});

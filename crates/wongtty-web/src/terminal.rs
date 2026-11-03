@@ -128,6 +128,11 @@ pub(crate) struct Shared {
     clipboard_reads: RefCell<Promise>,
     /// Waiting for a turn of the write scheduler, or in one.
     drain_queued: Cell<bool>,
+    /// A size `resize` was given while the engine already reflowed since the last frame: applied by the next
+    /// frame or write, so a window drag reflows once per frame.
+    resize_pending: Cell<Option<(u32, u32)>>,
+    /// The engine reflowed since the last frame started.
+    resized: Cell<bool>,
     frame: RefCell<Option<timer::AnimationFrame>>,
     options_proxy: RefCell<Option<(Proxy, ProxySetTrap)>>,
     /// `onCrash` and `onSyncFlush` the engine holds; they live as long as the terminal.
@@ -209,6 +214,8 @@ impl Terminal {
             state: Cell::new(State::default()),
             clipboard_reads: RefCell::new(Promise::resolve(&JsValue::UNDEFINED)),
             drain_queued: Cell::new(false),
+            resize_pending: Cell::new(None),
+            resized: Cell::new(false),
             frame: RefCell::new(None),
             options_proxy: RefCell::new(None),
             engine_callbacks: (on_crash, on_sync_flush),
@@ -225,12 +232,12 @@ impl Terminal {
 
     #[wasm_bindgen(getter)]
     pub fn cols(&self) -> u32 {
-        self.shared.core.borrow().size().0
+        self.size().0
     }
 
     #[wasm_bindgen(getter)]
     pub fn rows(&self) -> u32 {
-        self.shared.core.borrow().size().1
+        self.size().1
     }
 
     #[wasm_bindgen(getter)]
@@ -352,35 +359,20 @@ impl Terminal {
         self.write("\r\n".into(), callback);
     }
 
+    /// A second resize before the next frame only records the size (`cols`/`rows` report it at once); the frame,
+    /// or a write before it, reflows once and fires `onResize` then.
     pub fn resize(&self, cols: u32, rows: u32) -> Result<(), JsValue> {
-        let rows_changed = {
-            let mut core = self.shared.core.borrow_mut();
-            let engine = core.view.engine();
-            if core.disposed || (cols == engine.cols() && rows == engine.rows()) {
-                return Ok(());
-            }
-            let old_rows = engine.rows();
-            engine.resize(cols, rows)?;
-            let (cols, rows) = (engine.cols(), engine.rows());
-            core.view.resized();
-            Reflect::set(&core.options, &"cols".into(), &cols.into())?;
-            Reflect::set(&core.options, &"rows".into(), &rows.into())?;
-            if let Some(renderer) = core.renderer.as_mut() {
-                renderer.resize(cols, rows);
-            }
-            rows != old_rows
-        };
-        // The selection drops on row changes and the hovered link is let go, before `onResize` (xterm.js).
-        crate::selection::after_resize(&self.shared, rows_changed);
-        crate::links::after_resize(&self.shared);
-        crate::input::after_resize(&self.shared);
-        self.shared.sync_screen_size();
-        let size = Object::new();
-        Reflect::set(&size, &"cols".into(), &self.cols().into())?;
-        Reflect::set(&size, &"rows".into(), &self.rows().into())?;
-        self.shared.events.resize.fire(&[&size]);
-        self.shared.after_change();
-        Ok(())
+        let shared = &self.shared;
+        let open = shared.core.borrow().element.is_some();
+        if open && shared.resized.get() && shared.frame.borrow().is_some() {
+            let applied = shared.core.borrow().size();
+            shared
+                .resize_pending
+                .set(((cols, rows) != applied).then_some((cols, rows)));
+            return Ok(());
+        }
+        shared.resize_pending.set(Some((cols, rows)));
+        shared.apply_pending_resize()
     }
 
     /// Positive `amount` scrolls down towards the newest output.
@@ -447,6 +439,13 @@ impl Terminal {
     }
 }
 
+impl Terminal {
+    fn size(&self) -> (u32, u32) {
+        let pending = self.shared.resize_pending.get();
+        pending.unwrap_or_else(|| self.shared.core.borrow().size())
+    }
+}
+
 impl Shared {
     pub(crate) fn schedule_drain(self: &Rc<Self>) {
         if self.drain_queued.replace(true) {
@@ -476,6 +475,7 @@ impl Shared {
         if crate::parser::paused(self) {
             return;
         }
+        self.apply_pending_resize_logged();
         let mut paused = false;
         loop {
             let (slice, rest) = {
@@ -764,14 +764,62 @@ impl Shared {
         });
     }
 
+    /// Reflows to the size a second `resize` before this frame asked for.
+    fn apply_pending_resize(self: &Rc<Self>) -> Result<(), JsValue> {
+        let Some((cols, rows)) = self.resize_pending.take() else {
+            return Ok(());
+        };
+        let rows_changed = {
+            let mut core = self.core.borrow_mut();
+            let engine = core.view.engine();
+            if core.disposed || (cols == engine.cols() && rows == engine.rows()) {
+                return Ok(());
+            }
+            self.resized.set(true);
+            let old_rows = engine.rows();
+            engine.resize(cols, rows)?;
+            let (cols, rows) = (engine.cols(), engine.rows());
+            core.view.resized();
+            Reflect::set(&core.options, &"cols".into(), &cols.into())?;
+            Reflect::set(&core.options, &"rows".into(), &rows.into())?;
+            if let Some(renderer) = core.renderer.as_mut() {
+                renderer.resize(cols, rows);
+            }
+            rows != old_rows
+        };
+        // The selection drops on row changes and the hovered link is let go, before `onResize` (xterm.js).
+        crate::selection::after_resize(self, rows_changed);
+        crate::links::after_resize(self);
+        crate::input::after_resize(self);
+        self.sync_screen_size();
+        let (cols, rows) = self.core.borrow().size();
+        let size = Object::new();
+        Reflect::set(&size, &"cols".into(), &cols.into())?;
+        Reflect::set(&size, &"rows".into(), &rows.into())?;
+        self.events.resize.fire(&[&size]);
+        self.after_change();
+        Ok(())
+    }
+
+    /// [`Self::apply_pending_resize`] where nobody takes its error.
+    fn apply_pending_resize_logged(self: &Rc<Self>) {
+        if let Err(error) = self.apply_pending_resize() {
+            web_sys::console::error_1(&error);
+        }
+    }
+
     fn render_frame(self: &Rc<Self>) {
+        // A resize this frame applies keeps the next one waiting for the frame after.
+        let pending = self.resize_pending.get().is_some();
+        self.apply_pending_resize_logged();
+        self.resized.set(pending);
         // Writes that came since the last frame show in this one, within the scheduler's frame budget.
         let deadline = timer::frame_started(self.writes_queued());
         if let Some(until) = deadline {
             self.drain(until);
         }
-        // The drain asked for the frame being drawn now.
-        if deadline.is_some() {
+        // The resize and the drain asked for the frame being drawn now.
+        if pending || deadline.is_some() {
             self.frame.borrow_mut().take();
         }
         self.handle_renderer_requests();
