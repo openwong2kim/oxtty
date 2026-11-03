@@ -295,8 +295,16 @@ const ROW_CACHE_SPARE: usize = 8;
 /// those rows alone.
 struct CachedRow {
     id: u64,
+    /// When it was last read (`RowCache::reads`).
+    read: u64,
     packed: Vec<u32>,
     row: Option<Row<AlacCell>>,
+}
+
+#[derive(Default)]
+struct RowCache {
+    rows: Vec<CachedRow>,
+    reads: u64,
 }
 
 #[cfg(test)]
@@ -310,6 +318,15 @@ fn decode(stored: &History, i: usize) -> Row<AlacCell> {
     #[cfg(test)]
     DECODES.with(|n| n.set(n.get() + 1));
     stored.row(i)
+}
+
+/// Row `i` of the compressed history packed straight from its bytes (`History::row_packed_into`), which tests count
+/// as a decode.
+fn read_packed(stored: &History, i: usize, out: &mut Vec<u32>) -> bool {
+    let read = stored.row_packed_into(i, out);
+    #[cfg(test)]
+    DECODES.with(|n| n.set(n.get() + read as usize));
+    read
 }
 
 /// Unanswered clipboard reads and untaken writes kept at most (oldest dropped first).
@@ -460,7 +477,7 @@ pub struct Engine {
     // Host colours that answer colour queries; none means queries go unanswered.
     colors: Option<Box<[u32; COLOR_SLOTS]>>,
     // Recently read history rows by their History::id, most recently read last; empty while the view is at the bottom.
-    row_cache: RefCell<VecDeque<CachedRow>>,
+    row_cache: RefCell<RowCache>,
     markers: markers::Markers,
 }
 
@@ -536,7 +553,7 @@ impl Engine {
             decstr: DecstrScan::default(),
             decstr_owed: false,
             colors: None,
-            row_cache: RefCell::new(VecDeque::new()),
+            row_cache: RefCell::default(),
             markers: Default::default(),
         }
     }
@@ -587,7 +604,7 @@ impl Engine {
     /// Frees the decoded history rows once the view is back at the bottom.
     fn release_row_cache(&mut self) {
         if self.display_offset() == 0 {
-            *self.row_cache.get_mut() = VecDeque::new();
+            *self.row_cache.get_mut() = RowCache::default();
         }
     }
 
@@ -629,11 +646,15 @@ impl Engine {
         if self.display_offset() > 0 {
             let id = stored.id(i);
             let mut cache = self.row_cache.borrow_mut();
-            if let Some(at) = cache.iter().position(|c| c.id == id && c.row.is_some()) {
-                let hit = cache.remove(at).expect("position is in range");
-                cache.push_back(hit);
+            if let Some(at) = cache
+                .rows
+                .iter()
+                .position(|c| c.id == id && c.row.is_some())
+            {
+                cache.reads += 1;
+                cache.rows[at].read = cache.reads;
                 drop(cache);
-                return Ref::filter_map(self.row_cache.borrow(), |c| c.back()?.row.as_ref())
+                return Ref::filter_map(self.row_cache.borrow(), |c| c.rows[at].row.as_ref())
                     .ok()
                     .map(HeldRow::Cached);
             }
@@ -649,30 +670,45 @@ impl Engine {
         (line < -recent && i >= 0).then_some((stored, i as usize))
     }
 
-    /// Where history row `i` is in the row cache, which is put in it (decoded, packed) if it is not; at the back,
-    /// as the least recently read goes first. A view scrolling back k lines a frame reads k new rows above rows it
-    /// still shows, which must not push those out.
+    /// History row `i` from the row cache, which is put in it (decoded, packed) if it is not, in place of the row
+    /// read least recently. A view scrolling back k lines a frame reads k new rows above rows it still shows, which
+    /// must not push those out.
     fn cached(&self, stored: &History, i: usize) -> Ref<'_, CachedRow> {
         let id = stored.id(i);
         let mut cache = self.row_cache.borrow_mut();
-        if let Some(at) = cache.iter().position(|c| c.id == id) {
-            let hit = cache.remove(at).expect("position is in range");
-            cache.push_back(hit);
-        } else {
-            let mut packed = Vec::new();
-            while cache.len() >= self.rows() as usize + ROW_CACHE_SPARE {
-                // The buffer of the row that goes takes the next one
-                packed = cache.pop_front().expect("the cache is not empty").packed;
+        let at = match cache.rows.iter().position(|c| c.id == id) {
+            Some(at) => at,
+            None => {
+                let room = self.rows() as usize + ROW_CACHE_SPARE;
+                cache.rows.truncate(room);
+                let at = if cache.rows.len() < room {
+                    cache.rows.push(CachedRow {
+                        id,
+                        read: 0,
+                        packed: Vec::new(),
+                        row: None,
+                    });
+                    cache.rows.len() - 1
+                } else {
+                    (0..room).min_by_key(|&k| cache.rows[k].read).unwrap_or(0)
+                };
+                let entry = &mut cache.rows[at];
+                entry.id = id;
+                // The buffer of the row that went takes this one. Natively most rows are read from their bytes,
+                // the rest decoded (WebAssembly decodes them all: the direct read is 2.3 KB of code).
+                entry.row = None;
+                if cfg!(target_arch = "wasm32") || !read_packed(stored, i, &mut entry.packed) {
+                    let row = decode(stored, i);
+                    pack_row(&row, &mut entry.packed);
+                    entry.row = row[..].iter().any(|c| c.extra.is_some()).then_some(row);
+                }
+                at
             }
-            let row = decode(stored, i);
-            pack_row(&row, &mut packed);
-            let row = row[..].iter().any(|c| c.extra.is_some()).then_some(row);
-            cache.push_back(CachedRow { id, packed, row });
-        }
+        };
+        cache.reads += 1;
+        cache.rows[at].read = cache.reads;
         drop(cache);
-        Ref::map(self.row_cache.borrow(), |c| {
-            c.back().expect("just put there")
-        })
+        Ref::map(self.row_cache.borrow(), |c| &c.rows[at])
     }
 
     /// Interprets bytes written by the program (UTF-8 and escape sequences

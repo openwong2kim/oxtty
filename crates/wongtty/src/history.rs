@@ -181,6 +181,16 @@ impl History {
         })
     }
 
+    /// Row `i` as `Engine::row_packed` gives it decoded, read straight from its bytes into `out`. False when the
+    /// row has extras or zerowidth characters, or bytes `decode` would not read: the caller decodes it instead.
+    pub(crate) fn row_packed_into(&self, i: usize, out: &mut Vec<u32>) -> bool {
+        let abs = self.first + i as u64;
+        self.extras
+            .binary_search_by_key(&abs, |(at, _)| *at)
+            .is_err()
+            && packed_into(self.bytes(i), self.cols, out).is_some()
+    }
+
     /// Appends row `i`'s text as `Engine::row_string` gives it, read straight from its bytes. False, with nothing
     /// appended, when the row has extras or bytes `decode` would not read: the caller decodes it instead.
     pub(crate) fn row_text_into(&self, i: usize, trim_right: bool, out: &mut String) -> bool {
@@ -1835,6 +1845,93 @@ fn decode_cells(
     Some(Row::from_vec(cells, width))
 }
 
+/// `Engine::row_packed` of what `decode` gives at `width` cells (0: as stored), without the cells, into `out`. For a
+/// row without extras; `None` for one with zerowidth characters or bytes `decode` would not read.
+fn packed_into(mut bytes: &[u8], width: usize, out: &mut Vec<u32>) -> Option<()> {
+    let cols = take_varint(&mut bytes).filter(|n| (1..=u16::MAX as usize).contains(n))?;
+    let width = if width == 0 { cols } else { width };
+    let blank = [
+        ' ' as u32,
+        crate::pack_color(DEFAULT_FG),
+        crate::pack_color(DEFAULT_BG),
+        0,
+    ];
+    let (mut fg, mut bg, mut flags) = (blank[1], blank[2], Flags::empty());
+    out.clear();
+    out.reserve_exact(width * crate::Cell::PACKED_WORDS);
+    let mut cells = 0;
+    while cells < cols && !bytes.is_empty() {
+        let head = take(&mut bytes, 3)?;
+        let (tag, n) = (head[0], u16::from_le_bytes([head[1], head[2]]) as usize);
+        if tag & FG != 0 {
+            fg = crate::pack_color(take_color(&mut bytes)?);
+        }
+        if tag & BG != 0 {
+            bg = crate::pack_color(take_color(&mut bytes)?);
+        }
+        if tag & FLAGS != 0 {
+            let b = take(&mut bytes, 2)?;
+            flags = Flags::from_bits_retain(u16::from_le_bytes([b[0], b[1]]) as u32);
+        }
+        let attrs = |extra: Flags| crate::flag_attrs(flags | extra);
+        let run = attrs(Flags::empty());
+        if tag & BLANK != 0 {
+            if cells + n > cols {
+                return None;
+            }
+            for _ in 0..n {
+                out.extend_from_slice(&[' ' as u32, fg, bg, run]);
+            }
+            cells += n;
+            continue;
+        }
+        for _ in 0..n {
+            let (&b, rest) = bytes.split_first()?;
+            let (c, len) = match b {
+                0 => (' ' as u32, 1),
+                0x01..UNIT_2 => (b as u32, 1),
+                UNIT_2..UNIT_3 => (((b & 0x1f) as u32) << 8 | *rest.first()? as u32, 2),
+                _ => {
+                    let [mid, low] = *rest.first_chunk()?;
+                    (
+                        ((b & 0x1f) as u32) << 16 | (mid as u32) << 8 | low as u32,
+                        3,
+                    )
+                }
+            };
+            let c = char::from_u32(c)? as u32;
+            bytes = &bytes[len..];
+            if b >= UNIT_2 && b & WIDE != 0 {
+                out.extend_from_slice(&[c, fg, bg, attrs(Flags::WIDE_CHAR)]);
+                out.extend_from_slice(&[' ' as u32, fg, bg, attrs(Flags::WIDE_CHAR_SPACER)]);
+                cells += 2;
+            } else {
+                let typed = if b == b' ' {
+                    attrs(Flags::TYPED_SPACE)
+                } else {
+                    run
+                };
+                out.extend_from_slice(&[c, fg, bg, typed]);
+                cells += 1;
+            }
+            // Zerowidth characters: the caller decodes the row.
+            if bytes.first().is_some_and(|&b| b > MARKS) {
+                return None;
+            }
+        }
+        if cells > cols {
+            return None;
+        }
+    }
+    // The default blanks that end the row, and the cut or the blanks of a read at another width.
+    while cells < width {
+        out.extend_from_slice(&blank);
+        cells += 1;
+    }
+    out.truncate(width * crate::Cell::PACKED_WORDS);
+    Some(())
+}
+
 /// `Engine::row_string` of what `decode` gives at `width` cells (0: as stored), without the cells, appended to `out`:
 /// wide characters once, with the zerowidth characters that follow their unit, blanks as spaces, and with
 /// `trim_right` the empty cells that end the row dropped. For a row without extras; `None` (with part of the text
@@ -1899,7 +1996,7 @@ fn text_into(mut bytes: &[u8], width: usize, trim_right: bool, out: &mut String)
                 let (c, len) = match b {
                     0 | b'\t' => (' ' as u32, 1),
                     0x01..0x80 => (b as u32, 1),
-                    ..UNIT_3 => (((b & 0x1f) as u32) << 8 | *rest.first()? as u32, 2),
+                    UNIT_2..UNIT_3 => (((b & 0x1f) as u32) << 8 | *rest.first()? as u32, 2),
                     _ => {
                         let [mid, low] = *rest.first_chunk()?;
                         (
@@ -2104,9 +2201,27 @@ mod tests {
         out
     }
 
-    /// The text read from row `i`'s bytes is that of the decoded row (`row`), at any width it is read at.
+    /// The text and the packed cells read from row `i`'s bytes are those of the decoded row (`row`), at any width
+    /// it is read at.
     fn assert_text(history: &History, i: usize, row: &Row<Cell>) {
         let plain = history.extras.iter().all(|(at, _)| *at != history.id(i));
+        let marks = row[..]
+            .iter()
+            .any(|c| c.zerowidth().is_some_and(|z| !z.is_empty()));
+        let mut packed = Vec::new();
+        assert_eq!(
+            history.row_packed_into(i, &mut packed),
+            plain && !marks,
+            "row {i}"
+        );
+        for width in [0, 1, row.len().saturating_sub(3).max(1), row.len() + 5] {
+            if plain && !marks {
+                let mut want = Vec::new();
+                packed_into(history.bytes(i), width, &mut packed).unwrap();
+                crate::pack_row(&decode(history.bytes(i), None, width), &mut want);
+                assert_eq!(packed, want, "row {i} at {width}");
+            }
+        }
         for trim in [false, true] {
             let mut text = String::new();
             assert_eq!(history.row_text_into(i, trim, &mut text), plain, "row {i}");
