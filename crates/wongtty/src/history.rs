@@ -999,9 +999,11 @@ impl TermHistory {
         let freed = rows.blocks.len() + (rows.spare.is_some() as usize) < blocks;
         *stored = rows;
         drop(stored);
-        // A column change frees the rows the grid took back and reflowed (about 0.6 MiB at 120x40 that the
-        // allocator keeps otherwise); a row change frees them too, but no more than the next one takes again.
-        if freed || (columns_change && n > 0) {
+        // A column change also frees the rows the grid took back and reflowed: about 0.6 MiB at 120x40 that the
+        // macOS allocator keeps in the footprint otherwise, while those of a row change are fewer and taken again.
+        // Elsewhere only freed blocks are worth a release: glibc's `malloc_trim` walks every arena.
+        let reflowed = cfg!(target_os = "macos") && columns_change && n > 0;
+        if freed || reflowed {
             release_freed();
         }
         offset
@@ -2846,8 +2848,8 @@ mod oracle {
         eprintln!("{seen:?}");
     }
 
-    /// A resize has the allocator hand memory back only after a column change of rows held here, or one that
-    /// drops blocks; a history that is not full keeps no spare block after it.
+    /// A resize has the allocator hand memory back only after a column change of rows held here (on macOS), or one
+    /// that drops blocks; a history that is not full keeps no spare block after it.
     #[test]
     fn reflow_releases_only_after_a_column_change() {
         let releases = || RELEASES.with(|n| n.get());
@@ -2872,8 +2874,9 @@ mod oracle {
         assert!(side.history.len() > 5000);
         assert_eq!(resize(&mut side, 100, 30), 0, "rows only");
         assert_eq!(resize(&mut side, 100, 40), 0, "rows only");
+        let reflowed = cfg!(target_os = "macos") as usize;
         for (i, cols) in [120, 100, 120, 100, 120].into_iter().enumerate() {
-            assert_eq!(resize(&mut side, cols, 40), 1, "column change {i}");
+            assert_eq!(resize(&mut side, cols, 40), reflowed, "column change {i}");
             assert!(side.history.lock().spare.is_none(), "column change {i}");
         }
     }
