@@ -575,10 +575,9 @@ impl Engine {
         }
     }
 
-    /// [`Engine::search_rows`] of an ASCII query, which needs no case tables (the WebAssembly build has none);
-    /// false, finding nothing, for any other query. History lines whose bytes lack a character of the query are
-    /// skipped without being read.
-    pub fn search_rows_ascii(
+    /// [`Engine::search_rows`] of an ASCII query, which needs no case tables; false, finding nothing, for any other
+    /// query. History lines whose text lacks a character of the query are skipped without being read.
+    fn search_rows_ascii(
         &self,
         query: &str,
         options: SearchOptions,
