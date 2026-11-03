@@ -15,6 +15,8 @@
 // prints the medians at the end. Each run also reports the GPU process peak over samples every 2 s while busy, the
 // footprint of every browser process (all-process total), the WebGL contexts made and lost, and the load average.
 // ARGS adds Chrome switches (for example ARGS=--disable-features=SkiaGraphite).
+// The dpr is the screen scale factor of a 4500×4500 window (--force-device-scale-factor); SCALE=emulate emulates it in
+// the page instead, where xterm.js's WebGL canvas stays at dpr 1.
 import { chromium } from 'playwright-core';
 import { execFileSync } from 'node:child_process';
 import { footprintDetail, launch, mb, pids, serve } from './common.mjs';
@@ -27,15 +29,28 @@ const server = await serve();
 const RUNS = Number(process.env.RUNS ?? 1);
 const KINDS = process.env.KINDS?.split(',') ?? ['wongtty', 'xterm'];
 const ARGS = process.env.ARGS ? process.env.ARGS.split(' ') : [];
+// The device pixel ratio comes from a real screen scale factor by default. With page emulation (SCALE=emulate, the
+// old way) ResizeObserver's device-pixel-content-box still reports CSS pixels, so xterm.js's addon-webgl sizes its
+// drawing buffer at dpr 1 while devicePixelRatio says 2.
+const EMULATE = process.env.SCALE === 'emulate';
 const browserFor = () =>
-  ARGS.length
-    ? chromium.launch({ channel: 'chrome', headless: true, args: ['--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist', ...ARGS] })
-    : launch();
+  EMULATE && !ARGS.length
+    ? launch()
+    : chromium.launch({
+        channel: 'chrome',
+        headless: true,
+        args: ['--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist', ...(EMULATE ? [] : [`--force-device-scale-factor=${dpr}`, '--window-size=4500,4500']), ...ARGS],
+      });
+// The GPU process of a fresh browser drops its startup surfaces about 5 s after launch; the empty page is read after.
+const SETTLE = Number(process.env.SETTLE ?? 6000);
 const loadavg = () => execFileSync('sysctl', ['-n', 'vm.loadavg']).toString().trim();
 
 /** Page init script: counts the WebGL contexts the page makes and the `webglcontextlost` events they get. */
 function countContexts() {
   window.glContexts = { made: 0, lost: 0 };
+  const made = [];
+  // Device pixels of every live WebGL drawing buffer, in millions.
+  window.glBufferMpx = () => made.reduce((a, gl) => a + (gl.isContextLost() ? 0 : gl.drawingBufferWidth * gl.drawingBufferHeight), 0) / 1e6;
   for (const C of [globalThis.HTMLCanvasElement, globalThis.OffscreenCanvas]) {
     if (!C) continue;
     const getContext = C.prototype.getContext;
@@ -44,6 +59,7 @@ function countContexts() {
       if (ctx && /webgl/.test(type) && !this.glCounted) {
         this.glCounted = true;
         window.glContexts.made++;
+        made.push(ctx);
         this.addEventListener('webglcontextlost', () => window.glContexts.lost++);
       }
       return ctx;
@@ -54,7 +70,7 @@ function countContexts() {
 async function measure(kind) {
   const browser = await browserFor();
   try {
-    const page = await browser.newPage({ viewport: { width: 4500, height: 4500 }, deviceScaleFactor: dpr });
+    const page = await browser.newPage(EMULATE ? { viewport: { width: 4500, height: 4500 }, deviceScaleFactor: dpr } : { viewport: null });
     await page.addInitScript(countContexts);
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
@@ -68,7 +84,7 @@ async function measure(kind) {
       const p = await pids(browserCdp);
       return (p.gpu ?? p.GPU)[0];
     };
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(SETTLE);
     const empty = footprintDetail(await gpuPid());
     await page.evaluate(([k, n, mixed]) => {
       window.mixed = mixed;
@@ -95,7 +111,7 @@ async function measure(kind) {
     await page.waitForTimeout(Math.max(0, seconds * 1000 - (Date.now() - started)));
     const { frames, echoes } = await page.evaluate(() => window.stopBusy());
     const counts = await page.evaluate(() => window.counts());
-    const contexts = await page.evaluate(() => window.glContexts);
+    const contexts = await page.evaluate(() => ({ ...window.glContexts, mpx: window.glBufferMpx() }));
     await page.waitForTimeout(IDLE_MS);
     const after = footprintDetail(await gpuPid());
     return { kind, errors, empty, before, busy, after, frames, echoes, counts, contexts, peak: Math.max(...samples), byType, load: loadavg() };
@@ -125,7 +141,7 @@ try {
     console.log(
       `  run ${Math.floor((results.length - 1) / KINDS.length) + 1}: GPU peak ${mb(r.peak)} MB, IOSurface ${mb(r.busy.categories['IOSurface'] ?? 0)}, ` +
         `IOAccelerator (graphics) ${mb(r.busy.categories['IOAccelerator (graphics)'] ?? 0)}, IOAccelerator ${mb(r.busy.categories['IOAccelerator'] ?? 0)} | ` +
-        `all processes ${mb(all)} MB (${types}) | WebGL contexts ${r.contexts.made}, lost ${r.contexts.lost} | load ${r.load}`,
+        `all processes ${mb(all)} MB (${types}) | WebGL contexts ${r.contexts.made}, lost ${r.contexts.lost}, drawing buffers ${r.contexts.mpx.toFixed(1)} Mpx | load ${r.load}`,
     );
     if (r.echoes.length) {
       const ms = r.echoes.map((e) => e[0]).sort((a, b) => a - b);
