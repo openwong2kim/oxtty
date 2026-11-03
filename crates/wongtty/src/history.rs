@@ -46,11 +46,12 @@ const UNIT_2: u8 = 0x80;
 const UNIT_3: u8 = 0xc0;
 const WIDE: u8 = 1 << 5;
 
-// After a unit of the first run, `MARKS + n - 1` and then `n` narrow units: the
-// cell's interned cluster of zerowidth characters (up to `INLINE_MARKS`). No
-// unit starts with these bytes, whose first byte is at most 0xf0.
-const MARKS: u8 = 0xf8;
-const INLINE_MARKS: usize = 4;
+// After a unit of the first run, `MARKS + n` and then the `n` bytes of UTF-8
+// that are the cell's interned cluster of zerowidth characters (up to
+// `INLINE_MARKS`, in at most 12 bytes). No unit starts with these bytes,
+// whose first byte is at most 0xf0.
+const MARKS: u8 = 0xf0;
+const INLINE_MARKS: usize = 3;
 
 const DEFAULT_FG: Color = Color::Named(NamedColor::Foreground);
 const DEFAULT_BG: Color = Color::Named(NamedColor::Background);
@@ -1158,11 +1159,14 @@ impl Out<'_> {
 
     /// Writes the zerowidth characters that follow a unit (`MARKS`).
     fn marks(&mut self, marks: &[char]) {
-        self.byte(MARKS + marks.len() as u8 - 1);
+        let head = self.at;
+        self.at += 1;
         for &m in marks {
-            let (word, len) = unit(m, false);
-            self.word(word, len);
+            let mut utf8 = [0; 4];
+            let len = m.encode_utf8(&mut utf8).len();
+            self.word(u32::from_le_bytes(utf8), len);
         }
+        self.buf[head] = MARKS + (self.at - head - 1) as u8;
     }
 
     fn varint(&mut self, mut n: usize) {
@@ -1234,6 +1238,14 @@ fn unit(c: char, wide: bool) -> (u32, usize) {
         if long { word } else { n },
         1 + long as usize + big as usize,
     )
+}
+
+/// `ascii` with the default attributes, for `encode` and `plain`.
+#[inline(never)]
+fn default_ascii(cells: &[Cell], out: &mut Out) -> usize {
+    ascii(cells, out, Flags::empty(), |c| {
+        matches!(c.fg, DEFAULT_FG) & matches!(c.bg, DEFAULT_BG)
+    })
 }
 
 /// Writes the leading `cells` that are narrow ASCII characters (typed spaces
@@ -1388,9 +1400,7 @@ fn encode(
     // Most rows are narrow ASCII text with the default attributes, then default blanks: one run, written here.
     let head = out.at;
     out.at += 3;
-    let n = ascii(cells, &mut out, Flags::empty(), |c| {
-        matches!(c.fg, DEFAULT_FG) & matches!(c.bg, DEFAULT_BG)
-    });
+    let n = default_ascii(cells, &mut out);
     // Then most others are text of any width with the default attributes: the run goes on through them.
     let (end, units) = if n == scan {
         (n, n)
@@ -1506,9 +1516,7 @@ fn plain(cells: &[Cell], mut at: usize, out: &mut Out) -> (usize, usize) {
         let cell = &cells[at];
         // Narrow ASCII text, as `ascii` writes it (the text between clusters).
         if (cell.c as u32 >= 0x21) & (cell.c as u32 <= 0x7e) {
-            let n = ascii(&cells[at..], out, Flags::empty(), |c| {
-                matches!(c.fg, DEFAULT_FG) & matches!(c.bg, DEFAULT_BG)
-            });
+            let n = default_ascii(&cells[at..], out);
             if n > 0 {
                 (at, units) = (at + n, units + n);
                 (end, end_units, end_out) = (at, units, out.at);
@@ -1552,8 +1560,8 @@ fn plain(cells: &[Cell], mut at: usize, out: &mut Out) -> (usize, usize) {
 }
 
 /// The zerowidth characters `plain` writes after a unit: those of an extra
-/// with nothing else (an interned cluster), 1 to `INLINE_MARKS` of them, which
-/// keeps a cell in `max_len`.
+/// with nothing else (an interned cluster), 1 to `INLINE_MARKS` of them (12
+/// bytes of UTF-8 at most), which keeps a cell in `max_len`.
 #[inline]
 fn inline_marks(extra: &CellExtra) -> Option<&[char]> {
     let marks = &extra.zerowidth[..];
@@ -1719,25 +1727,34 @@ fn decode_cells(
             continue;
         }
         for _ in 0..n {
-            let at = cells.len();
-            match take_unit(&mut bytes)? {
-                (' ', _, true) => cells.push(cell(' ', flags | Flags::TYPED_SPACE)),
-                ('\0', ..) => cells.push(cell(' ', flags)),
-                (c, true, _) => {
-                    cells.push(cell(c, flags | Flags::WIDE_CHAR));
-                    cells.push(cell(' ', flags | Flags::WIDE_CHAR_SPACER));
+            let (&b, rest) = bytes.split_first()?;
+            let (c, wide) = match b {
+                0 => (' ', false),
+                0x01..0x80 => (b as char, false),
+                _ => {
+                    let len = if b < UNIT_3 { 2 } else { 3 };
+                    let unit = take(&mut bytes, len)?;
+                    let n = unit[1..]
+                        .iter()
+                        .fold((b & 0x1f) as u32, |n, &b| n << 8 | b as u32);
+                    (char::from_u32(n)?, b & WIDE != 0)
                 }
-                (c, false, _) => cells.push(cell(c, flags)),
+            };
+            if b < 0x80 {
+                bytes = rest;
+            }
+            if wide {
+                cells.push(cell(c, flags | Flags::WIDE_CHAR));
+                cells.push(cell(' ', flags | Flags::WIDE_CHAR_SPACER));
+            } else if b == b' ' {
+                cells.push(cell(' ', flags | Flags::TYPED_SPACE));
+            } else {
+                cells.push(cell(c, flags));
             }
             // The unit's zerowidth characters.
-            if let Some(&b) = bytes.first().filter(|&&b| b >= MARKS) {
-                let mut marks = ['\0'; INLINE_MARKS];
-                let k = (b - MARKS) as usize + 1;
-                bytes = &bytes[1..];
-                for m in marks.get_mut(..k)? {
-                    *m = take_unit(&mut bytes)?.0;
-                }
-                cells[at].set_zerowidth(&marks[..k]);
+            if bytes.first().is_some_and(|&b| b > MARKS) {
+                let at = cells.len() - 1 - wide as usize;
+                bytes = take_marks(bytes, &mut cells[at])?;
             }
         }
         if cells.len() > cols {
@@ -1753,25 +1770,17 @@ fn decode_cells(
     Some(Row::from_vec(cells, width))
 }
 
-/// Takes a unit: its character ('\0' for an erased blank, the byte of another
-/// one-byte unit), whether it is wide, and whether it is a typed space.
-#[inline(always)]
-fn take_unit(bytes: &mut &[u8]) -> Option<(char, bool, bool)> {
+/// Takes the zerowidth characters that follow a unit (`MARKS`) onto `cell`,
+/// and returns the bytes after them.
+#[inline(never)]
+fn take_marks<'a>(bytes: &'a [u8], cell: &mut Cell) -> Option<&'a [u8]> {
     let (&b, rest) = bytes.split_first()?;
-    Some(match b {
-        0x00..0x80 => {
-            *bytes = rest;
-            (b as char, false, b == b' ')
-        }
-        _ => {
-            let len = if b < UNIT_3 { 2 } else { 3 };
-            let unit = take(bytes, len)?;
-            let n = unit[1..]
-                .iter()
-                .fold((b & 0x1f) as u32, |n, &b| n << 8 | b as u32);
-            (char::from_u32(n)?, b & WIDE != 0, false)
-        }
-    })
+    let (marks, rest) = rest.split_at_checked((b - MARKS) as usize)?;
+    std::str::from_utf8(marks)
+        .ok()?
+        .chars()
+        .for_each(|m| cell.push_zerowidth(m));
+    Some(rest)
 }
 
 fn take_color(bytes: &mut &[u8]) -> Option<Color> {
@@ -1884,11 +1893,8 @@ fn shape(mut bytes: &[u8]) -> Option<(usize, bool)> {
             at += len(b);
             cells += 1 + (b >= UNIT_2 && b & WIDE != 0) as usize;
             // The unit's zerowidth characters.
-            if let Some(&b) = bytes.get(at).filter(|&&b| b >= MARKS) {
-                at += 1;
-                for _ in 0..=b - MARKS {
-                    at += len(*bytes.get(at)?);
-                }
+            if let Some(&b) = bytes.get(at).filter(|&&b| b > MARKS) {
+                at += 1 + (b - MARKS) as usize;
             }
         }
     }

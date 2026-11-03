@@ -1,5 +1,6 @@
+use std::cell::RefCell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 
 use bitflags::bitflags;
 #[cfg(feature = "serde")]
@@ -143,60 +144,37 @@ impl CellExtra {
     }
 }
 
-/// wongtty: the most zerowidth characters an interned cluster holds, and the most clusters interned. Past them a
-/// cell keeps its characters in a `CellExtra` of its own, as before, so the table stays small whatever a program
-/// prints: at most 4,096 entries of 1 to 8 characters, about 600 KiB.
-pub(crate) const MAX_MARKS: usize = 8;
-const MAX_INTERNED: usize = 4096;
+/// wongtty: the most zerowidth characters an interned cluster holds, and the most clusters interned per thread. Past
+/// them a cell keeps its characters in a `CellExtra` of its own, as before, so the table stays small whatever a
+/// program prints: at most 512 entries of 1 to 8 characters, under 80 KiB.
+const MAX_MARKS: usize = 8;
+const MAX_INTERNED: usize = 512;
 
-/// wongtty: the interned clusters, `CellExtra`s with zerowidth characters only, shared by every cell (of any
-/// terminal) that has those characters: a cell with combining marks, a variation selector or a joiner then takes
-/// no allocation of its own. An open-addressed hash table of the characters, kept at most half full; entries are
-/// never dropped.
-struct Interned {
-    slots: Vec<Option<Arc<CellExtra>>>,
-    len: usize,
+thread_local! {
+    /// wongtty: the interned clusters, `CellExtra`s with zerowidth characters only, shared by every cell (of any
+    /// terminal) that has those characters: a cell with combining marks, a variation selector or a joiner then
+    /// takes no allocation of its own. A few distinct clusters make up most text, so a list searched from the front,
+    /// where a hit moves halfway up. Entries are never dropped.
+    static INTERNED: RefCell<Vec<Arc<CellExtra>>> = const { RefCell::new(Vec::new()) };
 }
-
-static INTERNED: Mutex<Interned> = Mutex::new(Interned { slots: Vec::new(), len: 0 });
 
 /// wongtty: the interned cluster of `marks` (1 to `MAX_MARKS` characters), `None` when the table has no room left.
 pub fn intern(marks: &[char]) -> Option<Arc<CellExtra>> {
     if marks.is_empty() || marks.len() > MAX_MARKS {
         return None;
     }
-    let mut table = INTERNED.lock().unwrap_or_else(PoisonError::into_inner);
-    let at = slot(&table.slots, marks);
-    if let Some(Some(extra)) = at.map(|at| &table.slots[at]) {
-        return Some(extra.clone());
-    }
-    if table.len == MAX_INTERNED {
-        return None;
-    }
-    if table.slots.len() < 2 * (table.len + 1) {
-        let size = (table.slots.len() * 2).max(64);
-        let old = std::mem::replace(&mut table.slots, vec![None; size]);
-        for extra in old.into_iter().flatten() {
-            let at = slot(&table.slots, &extra.zerowidth).expect("a grown table has room");
-            table.slots[at] = Some(extra);
+    INTERNED.with_borrow_mut(|table| {
+        if let Some(at) = table.iter().position(|extra| extra.zerowidth == marks) {
+            table.swap(at, at / 2);
+            return Some(table[at / 2].clone());
         }
-    }
-    let extra = Arc::new(CellExtra { zerowidth: marks.to_vec(), ..Default::default() });
-    let at = slot(&table.slots, marks).expect("a grown table has room");
-    table.slots[at] = Some(extra.clone());
-    table.len += 1;
-    Some(extra)
-}
-
-/// The slot that holds `marks`, or the empty one where they go; `None` for an empty table.
-fn slot(slots: &[Option<Arc<CellExtra>>], marks: &[char]) -> Option<usize> {
-    let mask = slots.len().checked_sub(1)?;
-    let hash = marks.iter().fold(marks.len() as u32, |h, &c| (h ^ c as u32).wrapping_mul(0x9e37_79b1));
-    let mut at = (hash >> 16) as usize & mask;
-    while slots[at].as_ref().is_some_and(|extra| extra.zerowidth != marks) {
-        at = (at + 1) & mask;
-    }
-    Some(at)
+        if table.len() == MAX_INTERNED {
+            return None;
+        }
+        let extra = Arc::new(CellExtra { zerowidth: marks.to_vec(), ..Default::default() });
+        table.push(extra.clone());
+        Some(extra)
+    })
 }
 
 /// wongtty: tile `tile` (`row * cols + col`) of image `id`, which is `cols` tiles wide, covers the cell.
@@ -240,7 +218,7 @@ impl Cell {
     }
 
     /// Write a new zerowidth character to this cell.
-    #[inline]
+    #[inline(never)]
     pub fn push_zerowidth(&mut self, character: char) {
         // wongtty: a cluster of zerowidth characters alone is interned, the one with the new character too.
         if let Some(marks) = self.extra.as_ref().map_or(Some(&[][..]), |e| e.marks_only().then_some(&e.zerowidth[..])) {
@@ -257,22 +235,11 @@ impl Cell {
         Arc::make_mut(extra).zerowidth.push(character);
     }
 
-    /// wongtty: sets the zerowidth characters of a cell that has no extra (`marks` not empty), interned.
-    #[inline]
-    pub fn set_zerowidth(&mut self, marks: &[char]) {
-        debug_assert!(self.extra.is_none() && !marks.is_empty());
-        self.extra = intern(marks)
-            .or_else(|| Some(Arc::new(CellExtra { zerowidth: marks.to_vec(), ..Default::default() })));
-    }
-
     /// Remove all wide char data from a cell.
     #[inline(never)]
     pub fn clear_wide(&mut self) {
         self.flags.remove(Flags::WIDE_CHAR);
-        // wongtty: an interned cluster is dropped, not copied to be emptied.
-        if self.extra.as_ref().is_some_and(|extra| extra.marks_only()) {
-            self.extra = None;
-        } else if let Some(extra) = self.extra.as_mut() {
+        if let Some(extra) = self.extra.as_mut() {
             Arc::make_mut(extra).zerowidth = Vec::new();
         }
         self.c = ' ';
@@ -463,7 +430,8 @@ mod tests {
         assert_eq!(a.zerowidth(), Some(&['\u{fe0f}', '\u{20e3}'][..]));
         assert_ne!(a, b);
         let mut c = Cell::default();
-        c.set_zerowidth(&['\u{fe0f}', '\u{20e3}']);
+        c.push_zerowidth('\u{fe0f}');
+        c.push_zerowidth('\u{20e3}');
         assert!(Arc::ptr_eq(a.extra.as_ref().unwrap(), c.extra.as_ref().unwrap()));
     }
 

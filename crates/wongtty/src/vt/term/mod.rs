@@ -17,7 +17,7 @@ use crate::vt::event::{Event, EventListener};
 use crate::vt::grid::{Dimensions, Grid, GridIterator, Scroll};
 use crate::vt::index::{self, Boundary, Column, Direction, Line, Point, Side};
 use crate::vt::selection::{Selection, SelectionRange, SelectionType};
-use crate::vt::term::cell::{Cell, Flags, ImageTile, LineLength, MAX_MARKS};
+use crate::vt::term::cell::{Cell, Flags, ImageTile, LineLength};
 use crate::vt::term::color::Colors;
 use crate::vt::vi_mode::{ViModeCursor, ViMotion};
 use crate::vt::vte::ansi::{
@@ -1510,7 +1510,8 @@ impl<T> Term<T> {
             // of ASCII text (words after an emoji), left to `input_ascii`.
             match zerowidth {
                 Some(c) if col > point.column.0 && extra.is_none() => {
-                    put_marks(&mut cells[..col], c, &mut chars);
+                    let last = col - 1 - cells[col - 1].flags.contains(Flags::WIDE_CHAR_SPACER) as usize;
+                    cells[last].push_zerowidth(c);
                     marked = true;
                     used = text.len() - chars.as_str().len();
                     if ascii8(chars.as_str().as_bytes()) {
@@ -1565,29 +1566,6 @@ impl<T> Term<T> {
 #[inline(always)]
 fn ascii8(text: &[u8]) -> bool {
     text.first_chunk::<8>().is_some_and(|b| u64::from_le_bytes(*b) & 0x8080_8080_8080_8080 == 0)
-}
-
-/// wongtty: puts zerowidth character `first` and those that follow it in `chars` on the last of `cells` (a wide
-/// character's left half), interned once for all of them, as `input` puts each.
-#[inline(never)]
-fn put_marks(cells: &mut [Cell], first: char, chars: &mut str::Chars<'_>) {
-    let mut marks = [first; MAX_MARKS];
-    let mut n = 1;
-    while n < MAX_MARKS {
-        let mut ahead = chars.clone();
-        match ahead.next() {
-            Some(m) if char_width(m) == Some(0) => (marks[n], n, *chars) = (m, n + 1, ahead),
-            _ => break,
-        }
-    }
-    let last = cells.len() - 1;
-    let at = if cells[last].flags.contains(Flags::WIDE_CHAR_SPACER) { last - 1 } else { last };
-    let cell = &mut cells[at];
-    if cell.extra.is_none() {
-        cell.set_zerowidth(&marks[..n]);
-    } else {
-        marks[..n].iter().for_each(|&m| cell.push_zerowidth(m));
-    }
 }
 
 /// wongtty: the cells `c` takes (`wmux_unicode11::width`), without the table search for Latin text, CJK
