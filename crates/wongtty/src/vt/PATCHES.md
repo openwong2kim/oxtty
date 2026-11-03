@@ -324,9 +324,10 @@ Same results as upstream, in less time:
   limits falls back to upstream's copy-on-write. The field stays
   `Option<Arc<CellExtra>>`, so every other cell write compiles as before.
   `term/mod.rs` `input_run` puts the zerowidth characters that follow a cell
-  it wrote on that cell (`put_mark`, as `input` does) instead of leaving the
-  run, and after one goes back to `input_ascii` for a stretch of eight or
-  more ASCII bytes.
+  it wrote on that cell (`put_marks`, as `input` does, interned once for the
+  cluster) instead of leaving the run, and after them goes back to
+  `input_ascii` for a stretch of eight or more ASCII bytes. WebAssembly
+  builds leave this to `input`, for code size.
 
 ## Parser fast paths
 

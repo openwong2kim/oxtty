@@ -17,7 +17,7 @@ use crate::vt::event::{Event, EventListener};
 use crate::vt::grid::{Dimensions, Grid, GridIterator, Scroll};
 use crate::vt::index::{self, Boundary, Column, Direction, Line, Point, Side};
 use crate::vt::selection::{Selection, SelectionRange, SelectionType};
-use crate::vt::term::cell::{Cell, Flags, ImageTile, LineLength};
+use crate::vt::term::cell::{Cell, Flags, ImageTile, LineLength, MAX_MARKS, intern};
 use crate::vt::term::color::Colors;
 use crate::vt::vi_mode::{ViModeCursor, ViMotion};
 use crate::vt::vte::ansi::{
@@ -1511,7 +1511,7 @@ impl<T> Term<T> {
             // for more, `input` puts them.
             match zerowidth {
                 Some(c) if cfg!(not(target_family = "wasm")) && col > point.column.0 && extra.is_none() => {
-                    put_mark(&mut cells[..col], c);
+                    put_marks(&mut cells[..col], c, &mut chars);
                     marked = true;
                     used = text.len() - chars.as_str().len();
                     if ascii8(chars.as_str().as_bytes()) {
@@ -1568,11 +1568,25 @@ fn ascii8(text: &[u8]) -> bool {
     text.first_chunk::<8>().is_some_and(|b| u64::from_le_bytes(*b) & 0x8080_8080_8080_8080 == 0)
 }
 
-/// wongtty: puts zerowidth character `c` on the last of `cells` (a wide character's left half), as `input` does.
+/// wongtty: puts zerowidth character `first` and those that follow it in `chars` on the last of `cells` (a wide
+/// character's left half), as `input` puts each, but interned once for the cluster.
 #[inline(never)]
-fn put_mark(cells: &mut [Cell], c: char) {
+fn put_marks(cells: &mut [Cell], first: char, chars: &mut str::Chars<'_>) {
+    let mut marks = [first; MAX_MARKS];
+    let mut n = 1;
+    while n < MAX_MARKS {
+        let mut ahead = chars.clone();
+        match ahead.next() {
+            Some(m) if char_width(m) == Some(0) => (marks[n], n, *chars) = (m, n + 1, ahead),
+            _ => break,
+        }
+    }
     let last = cells.len() - 1;
-    cells[last - cells[last].flags.contains(Flags::WIDE_CHAR_SPACER) as usize].push_zerowidth(c);
+    let cell = &mut cells[last - cells[last].flags.contains(Flags::WIDE_CHAR_SPACER) as usize];
+    match intern(&marks[..n]).filter(|_| cell.extra.is_none()) {
+        Some(extra) => cell.extra = Some(extra),
+        None => marks[..n].iter().for_each(|&m| cell.push_zerowidth(m)),
+    }
 }
 
 /// wongtty: the cells `c` takes (`wmux_unicode11::width`), without the table search for Latin text, CJK

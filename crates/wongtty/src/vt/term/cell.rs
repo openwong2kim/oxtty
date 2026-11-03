@@ -147,7 +147,7 @@ impl CellExtra {
 /// wongtty: the most zerowidth characters an interned cluster holds, and the most clusters interned per thread. Past
 /// them a cell keeps its characters in a `CellExtra` of its own, as before, so the table stays small whatever a
 /// program prints: at most 512 entries of 1 to 8 characters, under 80 KiB.
-const MAX_MARKS: usize = 8;
+pub(crate) const MAX_MARKS: usize = 8;
 const MAX_INTERNED: usize = 512;
 
 thread_local! {
