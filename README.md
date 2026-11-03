@@ -158,8 +158,8 @@ does, 17 terminals take 5.1 MiB of engine memory instead of 41.1 MiB
 
 | Module | Bytes | gzip | Budget |
 | --- | ---: | ---: | --- |
-| Engine `wongtty.wasm` | 342,597 | 127,977 | 360 KiB raw, 135 KiB gzip |
-| Front end `xterm_web_bg.wasm` (`wongtty/xterm` only) | 781,162 | 295,833 | 800 KiB raw, 300 KiB gzip |
+| Engine `wongtty.wasm` | 355,767 | 133,637 | 360 KiB raw, 135 KiB gzip |
+| Front end `xterm_web_bg.wasm` (`wongtty/xterm` only) | 785,800 | 297,852 | 800 KiB raw, 300 KiB gzip |
 
 One instance of each serves every terminal on a page, so the code is paid
 once, not per pane. `scripts/build-web.sh` and `test/web/size.test.mjs` fail
@@ -416,15 +416,18 @@ Hangul, `scrollback.mjs` (median of 3 processes, load 2.6–3.5). The text
 operation calls `rowText` once per line, for xterm.js `translateToString`.
 The xterm.js search is the bench's own copy of what `@xterm/addon-search`
 0.17 does per logical line (wrapped rows joined, lowercased, `indexOf`), not
-the addon itself; it finds the same matches as wongtty's `searchRows`.
+the addon itself; it finds the same matches as wongtty's `searchRows`. The
+wasm search cells were measured again on 2026-11-03 (load 6–7), after the
+engine took over plain ASCII queries in the wasm build; the Hangul common
+match (`漢`) is still matched per line in JS.
 
 | Operation | Output | wongtty wasm | wongtty N-API | xterm.js |
 | --- | --- | ---: | ---: | ---: |
 | Resize 120 → 100 columns | Log lines | **0.07** | 0.09 | 1.60 |
 | | Hangul | **0.09** | 0.12 | 1.46 |
-| Search, no match | Log lines | 12.8 | **0.43** | 1.52 |
-| | Hangul | 25.1 | **1.30** | 2.98 |
-| Search, common match | Log lines | 13.0 | 2.15 | **1.51** |
+| Search, no match | Log lines | 1.49 | **0.43** | 1.52 |
+| | Hangul | 2.11 | **1.30** | 2.98 |
+| Search, common match | Log lines | 4.41 | 2.15 | **1.51** |
 | | Hangul | 28.9 | 23.7 | **4.15** |
 | Whole-buffer text | Log lines | 6.65 | 6.92 | **1.20** |
 | | Hangul | 15.1 | 14.9 | **0.58** |
@@ -434,7 +437,8 @@ the addon itself; it finds the same matches as wongtty's `searchRows`.
 In Node, wongtty resizes and serializes faster than xterm.js. xterm.js is
 faster at whole-buffer text a line at a time (5–26×) and at searching for a
 common match. Searching for a string that is not there is fastest from
-N-API, and about 8× slower from WebAssembly than that xterm.js search.
+N-API; from WebAssembly it is about as fast as that xterm.js search, or
+faster.
 
 **Setup.** Apple M4 (4 performance and 6 efficiency cores, 16 GB), macOS 15.6,
 rustc 1.99.1, 2026-11-03. Every engine is built in release mode with LTO. Node
@@ -704,7 +708,7 @@ later.** xterm.js members outside the checklist are not provided.
 | Addon | Status | Notes |
 | --- | :---: | --- |
 | Fit (`fit`, `proposeDimensions`, subclasses) | ✅ | Built-in `FitAddon`, ported from `@xterm/addon-fit` 0.12; refits by itself when the cell size changes |
-| Search (`findNext`, `findPrevious`, `clearDecorations`, decorations) | ✅ | Built-in `SearchAddon`, ported from `@xterm/addon-search` 0.17; plain text and regular expressions are matched in JS (string methods, `RegExp`), so no matcher is compiled into the wasm |
+| Search (`findNext`, `findPrevious`, `clearDecorations`, decorations) | ✅ | Built-in `SearchAddon`, ported from `@xterm/addon-search` 0.17; regular expressions, whole words and terms with characters outside ASCII are matched in JS (string methods, `RegExp`), other plain terms by the engine's ASCII matcher, which needs no case tables in the wasm |
 | WebLinks | ✅ | Built-in `WebLinksAddon`, ported from `@xterm/addon-web-links` 0.13; the same URL pattern or `urlRegex` |
 | Webgl (`onContextLoss`, `clearTextureAtlas`, `dispose`) | ✅ | Absorbed: the WebGL2 renderer is always on, one context per page; `onContextLoss` never fires because the renderer restores the context itself |
 | Unicode11 | ✅ | Absorbed: the engine's widths are Unicode 11 |
