@@ -10,6 +10,7 @@
 //   ro      the backing size comes from ResizeObserver's device-pixel-content-box, as xterm.js's addon-webgl does
 //   x1      the backing size is the CSS size (dpr 1 pixels) whatever the dpr
 //   clear   gl.clear before every pane draw
+// `xfer` presents the shared surface with transferToImageBitmap into 'bitmaprenderer' pane canvases.
 // `xtermlike` is xterm.js addon-webgl's setup: perpane+abs+late+ro+clear (its context attributes are perpane's:
 // antialias false, depth false, preserveDrawingBuffer false, alpha and premultipliedAlpha left at their defaults).
 window.runProbe = async ({ mode: spec, n, w, h, interval, dpr, cols, rows, busyN }) => {
@@ -126,6 +127,26 @@ window.runProbe = async ({ mode: spec, n, w, h, interval, dpr, cols, rows, busyN
       gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, cells); counts.draws++;
       p.ctx.globalCompositeOperation = 'copy';
       p.ctx.drawImage(off, 0, 0); counts.presents++;
+    };
+  } else if (mode === 'xfer') {
+    // one shared WebGL surface as copy, presented with a zero-copy transferToImageBitmap into each pane's
+    // 'bitmaprenderer' canvas instead of a 2D drawImage
+    const off = new OffscreenCanvas(W, H);
+    const gl = off.getContext('webgl2', attrs(false));
+    const g = setupGl(gl);
+    for (const p of panes) {
+      const c = paneCanvas(p);
+      p.ctx = c.getContext('bitmaprenderer');
+      c.ready();
+    }
+    present = (p) => {
+      const cw = p.ctx.canvas.width, ch = p.ctx.canvas.height;
+      if (off.width !== cw || off.height !== ch) { off.width = cw; off.height = ch; }
+      gl.viewport(0, 0, cw, ch); gl.uniform2f(g.size, W, H);
+      if (has('clear')) gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.bufferData(gl.ARRAY_BUFFER, p.data, gl.DYNAMIC_DRAW);
+      gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, cells); counts.draws++;
+      p.ctx.transferFromImageBitmap(off.transferToImageBitmap()); counts.presents++;
     };
   } else if (mode === 'copygpu') {
     // WebGL renders as today; the present is a GPU copy into the pane's WebGPU canvas instead of a 2D drawImage
