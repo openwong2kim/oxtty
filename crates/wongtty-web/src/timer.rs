@@ -4,17 +4,17 @@
 //! A timer owns its callback and frees it when dropped, also when cancelled before it fires; dropping it from
 //! inside its own callback is fine (wasm-bindgen frees a running closure once the call returns).
 //!
-//! [`schedule`] is the page-wide write scheduler: every terminal with queued writes takes turns in one task that
-//! stops [`FRAME_BUDGET_MS`] after the frame started and goes on after the next frame, so many busy terminals
-//! share the time between frames instead of each taking a whole task.
+//! [`schedule`] is the page-wide write scheduler: every terminal with queued writes takes turns in one run that
+//! parses for a few times what the last frame took to draw and then waits for the terminals' next frame, so many
+//! busy terminals share the time between frames instead of each taking a whole task.
 use std::cell::RefCell;
 use std::rc::Weak;
 
 use js_sys::Function;
-
-use crate::terminal::Shared;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+
+use crate::terminal::Shared;
 
 #[wasm_bindgen]
 extern "C" {
@@ -98,13 +98,14 @@ fn once(f: impl FnOnce() + 'static) -> Closure<dyn FnMut()> {
     })
 }
 
-/// Parse time per run, shared by every terminal. With the drawing after it, longer than a vsync interval: the
-/// frame starts as soon as the run ends instead of after an idle wait for vsync.
-const BUDGET_MS: f64 = 22.0;
+/// Parse time per run, shared by every terminal: this many times what the frame before it took, and at least
+/// so long that the run ends after the next vsync, so that frame starts at once instead of after an idle wait.
+const RUN_PER_DRAW: f64 = 6.0;
+const VSYNC_MS: f64 = 1000.0 / 60.0;
 /// What drawing the terminals a run gave a turn may cost the frame after it: when each costs more (truecolor
 /// glyphs), fewer get a turn per run.
 const DRAW_MS: f64 = 8.0;
-/// A run parses at least as long as the frame before it took, up to this (under the 50 ms of a long task).
+/// The longest run, under the 50 ms of a long task.
 const MAX_RUN_MS: f64 = 45.0;
 /// The shortest turn: each ends with the terminal's events, `onWriteParsed` and a frame request.
 const MIN_TURN_MS: f64 = 0.25;
@@ -121,8 +122,7 @@ thread_local! {
             running: false,
             fallback: None,
             no_frames: false,
-            yielded_at: 0.0,
-            resumed: false,
+            frame_at: 0.0,
             served: 0,
             draw_ms: 0.0,
             frame_until: 0.0,
@@ -140,10 +140,9 @@ struct Writes {
     fallback: Option<Timeout>,
     /// Frames do not come (hidden page, Node): runs follow each other on tasks, each up to the budget.
     no_frames: bool,
-    /// When the last run yielded (0 when it did not wait for a frame), whether that frame came, how many turns
-    /// the run gave and what drawing one cost.
-    yielded_at: f64,
-    resumed: bool,
+    /// When the frame the last run waited for started (0 when it did not wait or the frame did not come), how
+    /// many turns that run gave and what drawing one cost.
+    frame_at: f64,
     served: usize,
     draw_ms: f64,
     /// Until when frame callbacks may parse ([`frame_started`]), 0 until one asks.
@@ -178,7 +177,7 @@ pub(crate) fn frame_started(writes: bool) -> Option<f64> {
         let at = now();
         w.no_frames = false;
         if w.fallback.take().is_some() {
-            w.resumed = true;
+            w.frame_at = at;
             w.frame_until = at;
             w.kick();
         }
@@ -200,16 +199,21 @@ fn run() {
         if w.fallback.take().is_some() {
             w.no_frames = true;
         }
-        // Everything between the last run and this one counts as drawing what that run parsed. The estimate
-        // rises at once and falls slowly, so one cheap frame does not hand out turns a dear one cannot draw.
-        let drawn = if w.resumed { start - w.yielded_at } else { 0.0 };
-        if w.resumed {
+        // The frame from its start to this run counts as drawing what the last run parsed. The estimate rises at
+        // once and falls slowly, so one cheap frame does not hand out turns a dear one cannot draw.
+        let drawn = if w.frame_at > 0.0 {
+            start - w.frame_at
+        } else {
+            0.0
+        };
+        if w.frame_at > 0.0 {
             w.draw_ms = (drawn / w.served.max(1) as f64).max(w.draw_ms * 0.75);
         }
-        w.resumed = false;
+        w.frame_at = 0.0;
         // Turns at most double from run to run: the first frame after a burst draws a few terminals, not all.
         let quota = ((DRAW_MS / w.draw_ms).max(1.0) as usize).min(w.served.max(2) * 2);
-        (quota, start + drawn.clamp(BUDGET_MS, MAX_RUN_MS))
+        let run = (drawn * RUN_PER_DRAW).max(VSYNC_MS + 1.0 - drawn);
+        (quota, start + run.min(MAX_RUN_MS))
     });
     let mut served = 0;
     loop {
@@ -242,7 +246,6 @@ fn run() {
         // The terminals that parsed asked for a frame; the next run waits for it.
         if !w.no_frames {
             w.fallback = Some(Timeout::new(FRAME_WAIT_MS, run));
-            w.yielded_at = now();
             return;
         }
         w.kick();
