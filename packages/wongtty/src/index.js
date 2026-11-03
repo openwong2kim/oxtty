@@ -104,9 +104,6 @@ const bytesOut = (len) => new Uint8Array(wasm.memory.buffer, wasm.wongtty_out_pt
 const textOut = (len) => (len <= 0 ? '' : decoder.decode(new Uint8Array(wasm.memory.buffer, wasm.wongtty_out_ptr(), len)));
 const wordsOut = (n) => (n <= 0 ? new Uint32Array(0) : new Uint32Array(wasm.memory.buffer, wasm.wongtty_out32_ptr(), n).slice());
 
-/** Rows `textRows` asks the engine for at a time. */
-const TEXT_BLOCK = 1024;
-
 /** `@xterm/addon-search` `NON_WORD_CHARACTERS`: what ends a word for `wholeWord`. */
 const NON_WORD = ' ~!@#$%^&*()+`-=[]{}|\\;:"\',./<>?';
 const CELL_WIDE = 0x80000000;
@@ -427,22 +424,6 @@ export class Terminal {
   rowText(line) {
     const n = wasm.wongtty_row_text(this.#handle(), line);
     return n < 0 ? null : textOut(n);
-  }
-
-  /**
-   * `translateToString(trimRight)` of lines `first`…`last` (clamped to the buffer), each followed by `\n`. The engine
-   * reads a block of rows per call, so the text in its memory stays small. @returns {string}
-   */
-  textRows(first = -this.historyLength, last = this.rows - 1, trimRight = true) {
-    const h = this.#handle();
-    first = Math.max(first, -this.historyLength);
-    last = Math.min(last, this.rows - 1);
-    let text = '';
-    for (let from = first; from <= last; from += TEXT_BLOCK) {
-      text += textOut(wasm.wongtty_text_rows(h, from, Math.min(from + TEXT_BLOCK - 1, last), trimRight ? 1 : 0));
-    }
-    wasm.wongtty_out_release();
-    return text;
   }
 
   /** `[codepoint, fg, bg, attrs]` per cell. @returns {Uint32Array | null} */

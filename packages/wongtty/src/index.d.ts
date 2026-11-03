@@ -141,11 +141,6 @@ export class Terminal {
    */
   readonly trimmedLines: number;
   rowText(line: number): string | null;
-  /**
-   * `translateToString(trimRight)` of lines `first`…`last` (clamped to the buffer; by default all of it), each
-   * followed by `\n`, in one call.
-   */
-  textRows(first?: number, last?: number, trimRight?: boolean): string;
   /** `[codepoint, fg, bg, attrs]` per cell. */
   rowCells(line: number): Uint32Array | null;
   /**

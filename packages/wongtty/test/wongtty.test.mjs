@@ -56,23 +56,6 @@ test('scrollback with negative lines', () => {
   assert.equal(t.rowText(-9), null);
 });
 
-test('textRows is translateToString of each line, across blocks of rows and the history', () => {
-  const t = make({ cols: 10, rows: 3, scrollback: 3000 });
-  for (let i = 0; i < 2500; i++) t.write(`${i} 한\x1b[31mé\x1b[0m e\u0301 \r\n`);
-  t.write('wrapped line of text');
-  const lines = [];
-  for (let l = -t.historyLength; l < t.rows; l++) {
-    lines.push(t.rowText(l));
-  }
-  // rowText trims every trailing blank, translateToString(true) only the empty cells.
-  assert.equal(t.textRows().split('\n').map((l) => l.trimEnd()).join('\n'), lines.join('\n') + '\n');
-  // The typed space that did not fit wrapped onto row 0, where translateToString(true) keeps it.
-  assert.equal(t.textRows(-1, 0), '2499 한\u00e9 e\u0301\n \n');
-  t.write('\x1b[K\r\n');
-  assert.equal(t.textRows(1, 2, false), 'ne of text\n          \n');
-  assert.equal(t.textRows(5, 9), '');
-});
-
 test('damage lists changed rows', () => {
   const t = make();
   assert.deepEqual(t.takeDamage(), { full: true, scroll: 0, lines: [] });
