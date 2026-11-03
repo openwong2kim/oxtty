@@ -144,36 +144,61 @@ impl CellExtra {
     }
 }
 
-/// wongtty: the most zerowidth characters an interned cluster holds, and the most clusters interned per thread. Past
-/// them a cell keeps its characters in a `CellExtra` of its own, as before, so the table stays small whatever a
-/// program prints: at most 512 entries of 1 to 8 characters, under 80 KiB.
+/// wongtty: the most zerowidth characters an interned cluster holds; past it a cell keeps its characters in a
+/// `CellExtra` of its own, as before.
 pub(crate) const MAX_MARKS: usize = 8;
-const MAX_INTERNED: usize = 512;
+/// wongtty: the slots of the intern table (a power of two), and the most of them a lookup looks at. The table
+/// holds at most `SLOTS` clusters whatever a program prints, and a lookup costs at most `PROBES` comparisons.
+const SLOTS: usize = 1024;
+const PROBES: usize = 8;
 
 thread_local! {
     /// wongtty: the interned clusters, `CellExtra`s with zerowidth characters only, shared by every cell (of any
     /// terminal) that has those characters: a cell with combining marks, a variation selector or a joiner then
-    /// takes no allocation of its own. A few distinct clusters make up most text, so a list searched from the
-    /// front, the first seen first. Entries are never dropped.
-    static INTERNED: RefCell<Vec<Arc<CellExtra>>> = const { RefCell::new(Vec::new()) };
+    /// takes no allocation of its own. Open addressing on a hash of the characters, kept with each cluster so that
+    /// a lookup reads only the table until the hash matches.
+    static INTERNED: RefCell<[(u32, Option<Arc<CellExtra>>); SLOTS]> =
+        const { RefCell::new([const { (0, None) }; SLOTS]) };
 }
 
-/// wongtty: the interned cluster of `marks` (1 to `MAX_MARKS` characters), `None` when the table has no room left.
+/// wongtty: the interned cluster of `marks` (1 to `MAX_MARKS` characters). When its `PROBES` slots all hold other
+/// clusters, it takes one of them (picked by the hash, so two clusters seldom take turns at one): the cells that
+/// share the cluster it replaces keep it (an `Arc`), and a later lookup interns that one again, so the table
+/// follows what is printed now.
+#[inline(never)]
 pub(crate) fn intern(marks: &[char]) -> Option<Arc<CellExtra>> {
-    if marks.is_empty() || marks.len() > MAX_MARKS {
+    let len = marks.len();
+    if !(1..=MAX_MARKS).contains(&len) {
         return None;
     }
+    // The first two characters, the last and the count: a hash that costs the same for any cluster.
+    let at = |i: usize| marks.get(i).map_or(0, |&c| c as u32);
+    let hash = (at(0) ^ at(1).rotate_left(7) ^ at(len - 1).rotate_left(14) ^ (len as u32) << 28)
+        .wrapping_mul(0x9e37_79b1);
+    let home = (hash >> (32 - SLOTS.trailing_zeros())) as usize;
     INTERNED.with_borrow_mut(|table| {
-        if let Some(extra) = table.iter().find(|extra| extra.zerowidth == marks) {
-            return Some(extra.clone());
-        }
-        if table.len() == MAX_INTERNED {
-            return None;
+        let mut free = home + (hash as usize & (PROBES - 1));
+        // `black_box`: a loop, not eight copies of it.
+        for i in home..home + std::hint::black_box(PROBES) {
+            match &table[i % SLOTS] {
+                (h, Some(extra)) if *h == hash && extra.zerowidth == marks => return Some(extra.clone()),
+                (_, Some(_)) => {},
+                (_, None) => {
+                    free = i;
+                    break;
+                },
+            }
         }
         let extra = Arc::new(CellExtra { zerowidth: marks.to_vec(), ..Default::default() });
-        table.push(extra.clone());
+        table[free % SLOTS] = (hash, Some(extra.clone()));
         Some(extra)
     })
+}
+
+/// wongtty: the clusters the intern table holds, for tests.
+#[cfg(test)]
+pub(crate) fn interned() -> usize {
+    INTERNED.with_borrow(|table| table.iter().filter(|(_, extra)| extra.is_some()).count())
 }
 
 /// wongtty: tile `tile` (`row * cols + col`) of image `id`, which is `cols` tiles wide, covers the cell.
@@ -432,6 +457,34 @@ mod tests {
         c.push_zerowidth('\u{fe0f}');
         c.push_zerowidth('\u{20e3}');
         assert!(Arc::ptr_eq(a.extra.as_ref().unwrap(), c.extra.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn a_full_intern_table_still_shares_new_clusters() {
+        // Many more distinct clusters than slots, as Zalgo text or every NFD Hangul syllable gives: each lookup
+        // still finds or takes one of `PROBES` slots, so the table stays at `SLOTS` and keeps sharing.
+        let cluster = |i: u32| [0x300 + i % 0x70, 0x300 + i / 0x70 % 0x70, 0x1161 + i / 0x3100].map(|c| char::from_u32(c).unwrap());
+        for i in 0..20_000 {
+            let marks = cluster(i);
+            assert_eq!(intern(&marks).unwrap().zerowidth, marks);
+        }
+        assert!(interned() <= SLOTS);
+        assert!(interned() > SLOTS / 2);
+        // A cluster first seen now is shared, and a cluster seen before the table filled up is interned again.
+        for marks in [&['\u{fe0f}', '\u{20e3}'][..], &cluster(3)[..]] {
+            let (a, b) = (intern(marks).unwrap(), intern(marks).unwrap());
+            assert!(Arc::ptr_eq(&a, &b));
+            assert_eq!(a.zerowidth, marks);
+        }
+        // Cells keep a cluster the table no longer holds.
+        let mut cell = Cell::default();
+        cell.push_zerowidth('\u{301}');
+        let kept = cell.extra.clone().unwrap();
+        for i in 0..20_000 {
+            intern(&cluster(i));
+        }
+        assert_eq!(cell.zerowidth(), Some(&['\u{301}'][..]));
+        assert!(Arc::ptr_eq(cell.extra.as_ref().unwrap(), &kept));
     }
 
     #[test]
