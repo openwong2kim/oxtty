@@ -172,3 +172,23 @@ test('native image tiles', () => {
   assert.deepEqual(t.cursor().col, 2);
   assert.equal(t.pen()[0], (1 << 24) | 1);
 });
+
+test('native rowCellsInto and viewportCellsInto fill the caller buffer like rowCells', () => {
+  const t = new Terminal(6, 3, 20);
+  for (let i = 0; i < 8; i++) t.write(`\r\n\x1b[3${i % 8}m안${i}\x1b[0m`);
+  t.scrollDisplay(4);
+  const out = new Uint32Array(6 * 4 + 2).fill(7);
+  assert.equal(t.rowCellsInto(-2, out), 6 * 4);
+  assert.deepEqual(out.subarray(0, 24), t.rowCells(-2));
+  assert.deepEqual(Array.from(out.subarray(24)), [7, 7]);
+  assert.equal(t.rowCellsInto(-100, out), -1);
+  assert.throws(() => t.rowCellsInto(0, new Uint32Array(23)), /holds 23 words, the cells need 24/);
+  const view = new Uint32Array(3 * 6 * 4);
+  assert.equal(t.viewportCellsInto(view), view.length);
+  for (let y = 0; y < 3; y++) assert.deepEqual(view.subarray(y * 24, y * 24 + 24), t.rowCells(y - t.displayOffset));
+  // A view into a larger buffer is written at its own offset
+  const backing = new Uint32Array(view.length + 8);
+  assert.equal(t.viewportCellsInto(backing.subarray(8)), view.length);
+  assert.deepEqual(backing.subarray(8), view);
+  assert.throws(() => t.viewportCellsInto(new Uint32Array(view.length - 1)), /need 72/);
+});

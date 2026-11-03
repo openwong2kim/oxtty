@@ -1,7 +1,7 @@
 //! N-API binding: `new Terminal(cols, rows, scrollback?)` for Node and
 //! Electron's main process. Same engine as the WebAssembly build.
 
-use napi::bindgen_prelude::{Buffer, Either, Uint32Array};
+use napi::bindgen_prelude::{Buffer, Either, Uint32Array, Uint32ArraySlice};
 use napi_derive::napi;
 use wongtty::{Clipboard, HookKind, ImageCursor, WindowsPty, WindowsPtyBackend, COLOR_SLOTS};
 
@@ -141,6 +141,8 @@ fn search_match(m: wongtty::SearchMatch) -> SearchMatch {
 #[napi]
 pub struct Terminal {
     inner: wongtty::Engine,
+    /// One row of packed words, reused by the `…Into` reads so a frame allocates nothing.
+    scratch: Vec<u32>,
 }
 
 #[napi]
@@ -153,6 +155,7 @@ impl Terminal {
                 rows.min(u16::MAX as u32) as u16,
                 scrollback.unwrap_or(1000) as usize,
             ),
+            scratch: Vec::new(),
         }
     }
 
@@ -206,6 +209,48 @@ impl Terminal {
         self.inner
             .row_packed(line, &mut out)
             .then(|| Uint32Array::new(out))
+    }
+
+    /// `rowCells` written into `out` instead of a new array: returns the words written, or -1 if out of range.
+    /// Throws if `out` is shorter than the row (`cols * 4` words).
+    #[napi]
+    pub fn row_cells_into(&mut self, line: i32, mut out: Uint32ArraySlice) -> napi::Result<i32> {
+        if !self.inner.row_packed(line, &mut self.scratch) {
+            return Ok(-1);
+        }
+        let n = self.scratch.len();
+        // SAFETY: JS runs nothing while this call holds the view, and only this call writes through it
+        let out = unsafe { out.as_mut() };
+        let Some(dst) = out.get_mut(..n) else {
+            return Err(short_buffer(n, out.len()));
+        };
+        dst.copy_from_slice(&self.scratch);
+        Ok(n as i32)
+    }
+
+    /// Every visible row (what `rowCells(y - displayOffset)` gives for `y` in `0..rows`) written into `out` at
+    /// `y * cols * 4`, in one call; returns the words written (`rows * cols * 4`). Throws if `out` is shorter.
+    #[napi]
+    pub fn viewport_cells_into(&mut self, mut out: Uint32ArraySlice) -> napi::Result<u32> {
+        let stride = self.inner.cols() as usize * wongtty::Cell::PACKED_WORDS;
+        let rows = self.inner.rows() as usize;
+        // SAFETY: as in `row_cells_into`
+        let out = unsafe { out.as_mut() };
+        let Some(out) = out.get_mut(..stride * rows) else {
+            return Err(short_buffer(stride * rows, out.len()));
+        };
+        let top = -(self.inner.display_offset() as i32);
+        for (y, dst) in out.chunks_exact_mut(stride.max(1)).enumerate() {
+            // Visible rows are always `cols` wide; anything else is cut or padded with zero words
+            let n = if self.inner.row_packed(top + y as i32, &mut self.scratch) {
+                self.scratch.len().min(stride)
+            } else {
+                0
+            };
+            dst[..n].copy_from_slice(&self.scratch[..n]);
+            dst[n..].fill(0);
+        }
+        Ok((stride * rows) as u32)
     }
 
     #[napi]
@@ -639,6 +684,13 @@ impl Terminal {
             },
         }
     }
+}
+
+fn short_buffer(needed: usize, got: usize) -> napi::Error {
+    napi::Error::new(
+        napi::Status::InvalidArg,
+        format!("out holds {got} words, the cells need {needed}"),
+    )
 }
 
 fn selection_name(clipboard: Clipboard) -> &'static str {
