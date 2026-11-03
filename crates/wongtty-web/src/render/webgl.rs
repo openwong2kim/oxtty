@@ -14,9 +14,11 @@
 //! (`display: none`, zero size, scrolled away): it redraws everything when it comes back. A blinking cursor
 //! draws nothing either: it is a small layer over the canvas whose opacity the blink flips ([`CursorLayer`]).
 //!
-//! The canvas's pixels live in the GPU process, where Chromium keeps several buffers of the canvas's size behind a
-//! 2D canvas that keeps drawing. A pane that stopped drawing gets back down to one ([`Inner::compact_canvas`]), and
-//! a pane that takes no room on the page (`display: none`) has none ([`collapse_observer`]).
+//! The canvas's pixels live in the GPU process. A canvas that takes frames by transfer (on a GPU, see
+//! [`super::gpu`]) holds the last one only; behind a 2D canvas that keeps drawing (the copy path), Chromium keeps
+//! several buffers of the canvas's size, and a pane that stopped drawing gets back down to one
+//! ([`Inner::compact_canvas`]). A pane that takes no room on the page (`display: none`) has none
+//! ([`collapse_observer`]).
 //!
 //! # Re-entrancy
 //!
@@ -463,6 +465,7 @@ impl Inner {
         self.collapsed = collapsed;
         if collapsed {
             self.compact = None;
+            self.present.clear();
             self.canvas.set_width(0);
             self.canvas.set_height(0);
             return;
@@ -521,6 +524,7 @@ impl Inner {
         atlas::release(self.id);
         self.atlas = None;
         self.glyphs.set_atlas(None);
+        self.present.clear();
         self.canvas.remove();
         self.measure = None;
     }
@@ -918,7 +922,13 @@ impl Inner {
     /// 17 panes of 120×40 at devicePixelRatio 2 held about 400 MB of the GPU process for 120 MB of pixels.
     /// Resizing the canvas drops them all; the same frame is drawn again at once, in the same task, so the page
     /// never paints the empty canvas and the pane keeps one buffer.
+    /// A canvas that takes frames by transfer has no buffers of its own: the shared surface lets go of its own
+    /// once every pane idles.
     fn compact_canvas(&mut self) {
+        if !self.present.has_buffers() {
+            gpu::trim(COMPACT_AFTER_MS);
+            return;
+        }
         let width = self.canvas.width();
         if !self.visible || self.collapsed || width == 0 || !self.can_redraw_last_frame() {
             return;
@@ -1164,6 +1174,12 @@ impl Inner {
         );
         set("liveAtlases", atlas::live_atlases().into());
         set("canvas", self.canvas.clone().into());
+        let present = if self.present.has_buffers() {
+            "copy"
+        } else {
+            "transfer"
+        };
+        set("present", present.into());
         set("focused", self.focused.into());
         set("visible", self.visible.into());
         set("draws", self.draws.into());
