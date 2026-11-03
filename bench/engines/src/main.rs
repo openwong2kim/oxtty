@@ -6,7 +6,7 @@
 //!   cargo run --release --manifest-path bench/engines/Cargo.toml [--features ghostty,rio,libvterm] -- <dir> [out.json]
 //!
 //! Every engine gets the same 64 KiB chunks at 120×40 with 10,000 lines of scrollback, and its visible screen text
-//! is compared with wongtty's at the end.
+//! is compared with wongtty's at the end (with the first selected engine's when the filter leaves wongtty out).
 //!
 //! Single-engine modes (one process each, for /usr/bin/time -l and scripts/cyc.py):
 //!   --one <engine> <case> <dir> <runs>        fresh engine per run after a warm-up: median MiB/s and every run
@@ -19,7 +19,8 @@
 //!   --screen <engine> <case> <dir>            the visible rows after the case
 //!
 //! Environment: SB=<lines> overrides the scrollback; BENCH_CASES (or CASES) and BENCH_ENGINES (or ENGINES) filter
-//! the default run by comma-separated names; BENCH_NOMEM skips its memory child processes.
+//! the default run by comma-separated names (an engine this build lacks exits 2; "null" is the no-op baseline);
+//! BENCH_NOMEM skips its memory child processes.
 //!
 //! Ghostty is libghostty-vt from ghostty-vt-rs-sys: by default its pinned prebuilt (4a4fc017). Ghostty main is
 //! selected at build time with GHOSTTY_VT_RS_SYS_PREBUILT_DIR=<dir with lib/libghostty-vt.a>; build it into its
@@ -493,7 +494,8 @@ mod rio {
 }
 
 /// libvterm keeps no scrollback itself: like Neovim, the host copies each line that scrolls off (sb_pushline) into
-/// a ring of 10,000 lines of libvterm cells, reusing the oldest line's buffer once the ring is full.
+/// a ring of 10,000 lines of libvterm cells, reusing the oldest line's buffer once the ring is full, and empties
+/// the ring when libvterm asks (sb_clear, on ED 3).
 #[cfg(feature = "libvterm")]
 mod libvterm {
     use std::collections::VecDeque;
@@ -531,7 +533,7 @@ mod libvterm {
         resize: Cb,
         sb_pushline: Option<unsafe extern "C" fn(c_int, *const Cell, *mut c_void) -> c_int>,
         sb_popline: Cb,
-        sb_clear: Cb,
+        sb_clear: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
     }
     unsafe extern "C" {
         fn vterm_new(rows: c_int, cols: c_int) -> *mut VTerm;
@@ -547,18 +549,35 @@ mod libvterm {
 
     struct Scrollback(VecDeque<Box<[Cell]>>);
 
+    impl Scrollback {
+        /// Keeps `src` as the newest line of at most `cap` lines; with `cap` 0 the line is dropped.
+        fn keep(&mut self, src: &[Cell], cap: usize) {
+            if cap == 0 {
+                return;
+            }
+            if self.0.len() >= cap {
+                if let Some(mut line) = self.0.pop_front() {
+                    if line.len() == src.len() {
+                        line.copy_from_slice(src);
+                        self.0.push_back(line);
+                        return;
+                    }
+                }
+            }
+            self.0.push_back(src.into());
+        }
+    }
+
     unsafe extern "C" fn push(cols: c_int, cells: *const Cell, user: *mut c_void) -> c_int {
         let sb = unsafe { &mut *(user as *mut Scrollback) };
         let src = unsafe { std::slice::from_raw_parts(cells, cols as usize) };
-        if sb.0.len() == super::scrollback() {
-            let mut line = sb.0.pop_front().unwrap();
-            if line.len() == src.len() {
-                line.copy_from_slice(src);
-                sb.0.push_back(line);
-                return 1;
-            }
-        }
-        sb.0.push_back(src.into());
+        sb.keep(src, super::scrollback());
+        1
+    }
+
+    /// ED 3 (and Neovim's :clear of the scrollback): libvterm asks the host to drop its lines.
+    unsafe extern "C" fn clear(user: *mut c_void) -> c_int {
+        unsafe { (*(user as *mut Scrollback)).0 = VecDeque::new() };
         1
     }
 
@@ -571,7 +590,7 @@ mod libvterm {
         resize: None,
         sb_pushline: Some(push),
         sb_popline: None,
-        sb_clear: None,
+        sb_clear: Some(clear),
     };
 
     pub struct Libvterm {
@@ -637,6 +656,36 @@ mod libvterm {
             self.sb.0.len()
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::Engine;
+        use super::*;
+
+        #[test]
+        fn ed3_empties_the_host_scrollback() {
+            let mut t = Libvterm::new();
+            for i in 0..100 {
+                t.feed(format!("line {i}\r\n").as_bytes());
+            }
+            assert!(t.history() > 0);
+            t.feed(b"\x1b[H\x1b[2J\x1b[3J");
+            assert_eq!(t.history(), 0);
+        }
+
+        #[test]
+        fn zero_capacity_keeps_no_lines() {
+            let cell: Cell = unsafe { std::mem::zeroed() };
+            let mut sb = Scrollback(VecDeque::new());
+            sb.keep(&[cell; 3], 0);
+            assert!(sb.0.is_empty());
+            sb.keep(&[cell; 3], 2);
+            sb.keep(&[cell; 3], 2);
+            sb.keep(&[cell; 4], 2);
+            assert_eq!(sb.0.len(), 2);
+            assert_eq!(sb.0.back().unwrap().len(), 4);
+        }
+    }
 }
 
 /// Reads nothing: the process baseline for /usr/bin/time counts.
@@ -672,10 +721,38 @@ fn engines() -> Vec<&'static str> {
     if cfg!(feature = "ghostty") {
         all.push("ghostty");
     }
-    if let Some(only) = env_list(&["BENCH_ENGINES", "ENGINES"]) {
-        all.retain(|e| only.iter().any(|o| o == e));
+    match env_list(&["BENCH_ENGINES", "ENGINES"]) {
+        Some(only) => select(&all, &only).unwrap_or_else(|unknown| {
+            eprintln!(
+                "BENCH_ENGINES/ENGINES: unknown engine(s) {} (this build has {}, null)",
+                unknown.join(","),
+                all.join(",")
+            );
+            std::process::exit(2)
+        }),
+        None => all,
     }
-    all
+}
+
+/// The engines of `all` (plus "null") named in `only`, in `all`'s order; Err with the names this build lacks.
+fn select(all: &[&'static str], only: &[String]) -> Result<Vec<&'static str>, Vec<String>> {
+    let unknown: Vec<String> = only
+        .iter()
+        .filter(|o| o.as_str() != "null" && !all.contains(&o.as_str()))
+        .cloned()
+        .collect();
+    if !unknown.is_empty() {
+        return Err(unknown);
+    }
+    let mut picked: Vec<&'static str> = all
+        .iter()
+        .copied()
+        .filter(|e| only.iter().any(|o| o == e))
+        .collect();
+    if only.iter().any(|o| o == "null") {
+        picked.push("null");
+    }
+    Ok(picked)
 }
 
 fn make(name: &str) -> Box<dyn Engine> {
@@ -733,6 +810,23 @@ fn footprint() -> usize {
             &mut info as *mut _ as *mut libc::rusage_info_t,
         );
         info.ri_phys_footprint as usize
+    }
+    #[cfg(not(target_os = "macos"))]
+    0
+}
+
+/// Largest physical footprint since the previous call, in bytes (ri_interval_max_phys_footprint, which each
+/// RUSAGE_INFO_V4 read resets); 0 off macOS.
+fn interval_max_footprint() -> usize {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut info: libc::rusage_info_v4 = std::mem::zeroed();
+        libc::proc_pid_rusage(
+            libc::getpid(),
+            libc::RUSAGE_INFO_V4,
+            &mut info as *mut _ as *mut libc::rusage_info_t,
+        );
+        info.ri_interval_max_phys_footprint as usize
     }
     #[cfg(not(target_os = "macos"))]
     0
@@ -835,7 +929,7 @@ struct Row {
 }
 
 /// Child process: `n` terminals of one engine through a life cycle: made (the empty floor), fed the scenario (after
-/// 10,000+ lines), the peak on the way, cleared (ED 2 + ED 3), reset (RIS). Footprint deltas over the start, per
+/// 10,000+ lines), the peak on the way (footprint: the kernel's interval maximum; heap: the counter's peak), cleared (ED 2 + ED 3), reset (RIS). Footprint deltas over the start, per
 /// terminal, and Rust heap live bytes per terminal (engines that allocate through Rust only).
 fn lifecycle(engine: &str, case: &str, dir: &str, n: usize) {
     let bytes = read_case(dir, case);
@@ -847,14 +941,15 @@ fn lifecycle(engine: &str, case: &str, dir: &str, n: usize) {
         footprint() as isize - f0,
         LIVE.load(Ordering::Relaxed) as isize - h0,
     );
-    let mut peak_fp = 0isize;
     PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+    // Starts a new footprint interval, so the read after the feeds is the peak during them.
+    interval_max_footprint();
     for t in ts.iter_mut() {
         for chunk in bytes.chunks(CHUNK) {
             t.feed(chunk);
         }
-        peak_fp = peak_fp.max(footprint() as isize - f0);
     }
+    let peak_fp = interval_max_footprint() as isize - f0;
     let fed = (
         footprint() as isize - f0,
         LIVE.load(Ordering::Relaxed) as isize - h0,
@@ -1014,17 +1109,21 @@ fn main() {
         for (e, name) in names.iter().enumerate() {
             let mut s = times[e].clone();
             s.sort_by(f64::total_cmp);
+            // Screens are compared with the first engine (wongtty unless the filter leaves it out).
             let differ: Vec<usize> = (0..ROWS as usize)
                 .filter(|&i| screens[e][i] != screens[0][i])
                 .collect();
-            let screen = if differ.is_empty() {
-                "same".to_string()
+            let screen = if e == 0 {
+                "reference".to_string()
+            } else if differ.is_empty() {
+                format!("same as {}", names[0])
             } else {
                 let i = differ[0];
                 format!(
-                    "{} rows differ; row {i}: {:?} vs wongtty {:?}",
+                    "{} rows differ; row {i}: {:?} vs {} {:?}",
                     differ.len(),
                     screens[e][i].chars().take(60).collect::<String>(),
+                    names[0],
                     screens[0][i].chars().take(60).collect::<String>()
                 )
             };
@@ -1094,5 +1193,45 @@ fn main() {
         }
         json.push_str("]\n");
         std::fs::write(out, json).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn select_keeps_build_order_and_rejects_unknown_names() {
+        let all = ["wongtty", "alacritty", "libvterm"];
+        assert_eq!(
+            select(&all, &names(&["libvterm", "wongtty"])),
+            Ok(vec!["wongtty", "libvterm"])
+        );
+        assert_eq!(
+            select(&all, &names(&["null", "libvterm"])),
+            Ok(vec!["libvterm", "null"])
+        );
+        assert_eq!(
+            select(&all, &names(&["wongty", "wongtty-wasm"])),
+            Err(names(&["wongty", "wongtty-wasm"]))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn interval_max_footprint_sees_a_freed_spike() {
+        interval_max_footprint();
+        let before = footprint();
+        // 64 MiB touched and freed between the two reads: gone from the footprint, kept in the interval maximum.
+        let spike = vec![1u8; 64 << 20];
+        std::hint::black_box(&spike);
+        drop(spike);
+        let peak = interval_max_footprint();
+        assert!(footprint() < before + (32 << 20));
+        assert!(peak >= before + (32 << 20), "peak {peak} before {before}");
     }
 }

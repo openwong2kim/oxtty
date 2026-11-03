@@ -121,6 +121,8 @@ if (process.argv[2] === '--one') {
   const wasmFill = globalThis.wongttyMemory?.buffer.byteLength ?? 0;
   const peakBefore = maxRss();
   const history = e.history();
+  // Scrolling needs a page of history (cursor-motion and scrolling-region leave none).
+  if (op.startsWith('scroll-') && history < ROWS) { process.stdout.write(JSON.stringify({ na: true, history })); process.exit(0); }
   let times = [], frames = 1, result = 0;
   const time = async (f) => { const s = performance.now(); await f(); times.push(performance.now() - s); };
   switch (op) {
@@ -180,6 +182,7 @@ for (const c of cases) for (const op of ops) {
   for (const name of ENGINES) {
     const r = res[name];
     if (!r.length) continue;
+    if (r[0].na) { console.log(`${c.padEnd(12)} ${op.padEnd(14)} ${name.padEnd(15)} | n/a: history ${r[0].history} < ${ROWS} rows`); continue; }
     const ms = r.map((x) => x.ms);
     console.log(`${c.padEnd(12)} ${op.padEnd(14)} ${name.padEnd(15)} | ${med(ms).toFixed(3).padStart(9)} [${Math.min(...ms).toFixed(3)}-${Math.max(...ms).toFixed(3)}] | ${mib(med(r.map((x) => x.peak)))} | ${mib(med(r.map((x) => x.kept)))} | ${mib(med(r.map((x) => x.fillRss)))} | ${mib(med(r.map((x) => x.wasmFill)))} | ${mib(med(r.map((x) => x.wasmGrow)))} | ${String(r[0].history).padStart(5)} | ${r[0].result}`);
   }

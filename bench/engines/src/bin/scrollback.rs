@@ -545,6 +545,11 @@ fn one(engine: &str, case: &str, op: &str, dir: &str) {
     let history = t.history();
     let (after_fill_fp, _, _, _) = usage();
     let live_after_fill = LIVE.load(Ordering::Relaxed) as i64;
+    // Scrolling needs a page of history (cursor-motion and scrolling-region leave none).
+    if op.starts_with("scroll-") && history < ROWS as usize {
+        println!("n/a {history}");
+        return;
+    }
     // Several timed repetitions of a repeatable operation, else one.
     let mut steps: Vec<Step> = Vec::new();
     let mut result = 0u64;
@@ -704,6 +709,7 @@ fn main() {
         for op in &ops {
             let mut rows: Vec<Vec<Vec<f64>>> = vec![Vec::new(); engines.len()];
             let mut meta: Vec<(u64, u64)> = vec![(0, 0); engines.len()];
+            let mut na: Vec<Option<String>> = vec![None; engines.len()];
             for run in 0..runs {
                 for k in 0..engines.len() {
                     let e = (run + k) % engines.len();
@@ -712,6 +718,10 @@ fn main() {
                         .output()
                         .unwrap();
                     let text = String::from_utf8_lossy(&out.stdout);
+                    if let Some(history) = text.strip_prefix("n/a ") {
+                        na[e] = Some(history.trim().to_string());
+                        continue;
+                    }
                     let w: Vec<f64> = text
                         .split_whitespace()
                         .map(|x| x.parse::<f64>().unwrap_or(f64::NAN))
@@ -732,6 +742,12 @@ fn main() {
             }
             for (e, name) in engines.iter().enumerate() {
                 let r = &rows[e];
+                if let Some(history) = &na[e] {
+                    println!(
+                        "{case:<12} {op:<14} {name:<19} | n/a: history {history} < {ROWS} rows"
+                    );
+                    continue;
+                }
                 if r.is_empty() {
                     continue;
                 }
