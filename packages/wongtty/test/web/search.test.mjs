@@ -114,3 +114,46 @@ test('a whole-word search takes only the first match of a line, like @xterm/addo
     assert.deepEqual(runs[0].slice(0, 2).map((r) => r.position?.start), [{ x: 4, y: 1 }, { x: 0, y: 2 }]);
   });
 });
+
+// Long enough output for the compressed scrollback: wrapped lines with matches on their later rows, a term that
+// overlaps itself, case variants, KELVIN SIGN (lowercases to `k`) and İ (to `i` and U+0307, a unit longer, which moves
+// the addon's matches after it on its line; those lines are searched in JS), wide and combining characters. The İ
+// line goes on past its last match: the built-in addon drops a match that ends a line after an İ, which
+// @xterm/addon-search keeps (as before the engine matched terms).
+const LONG = Array.from({ length: 400 }, (_, i) => [
+  `row ${i} foo`,
+  `${'-'.repeat(25)} aaaa wrapped foo ${'x'.repeat(i % 40)} FOO end`,
+  i % 50 === 7 ? '\u212a kelvin and k' : `plain ${i}`,
+  i % 97 === 3 ? 'İstanbul foo k i end' : `한글 é foo${i % 10}`,
+  i % 9 ? '' : 'no match here at all',
+].join('\r\n')).join('\r\n');
+
+test('plain ASCII terms, matched in the engine, find and count what @xterm/addon-search does', { timeout: 300000 }, async () => {
+  const decorations = { matchBackground: '#444444', activeMatchBackground: '#ffff00', matchOverviewRuler: '#888888', activeMatchColorOverviewRuler: '#ffff00' };
+  await withPage('search-parity.mjs', async (page) => {
+    await page.evaluate((s) => window.start(s), { cols: COLS, rows: ROWS, scrollback: 3000, highlightLimit: 700 });
+    await page.evaluate((t) => window.write(t), LONG);
+    const steps = [];
+    for (const term of ['foo', 'FOO', 'aa', 'k', 'i', 'wrapped foo', 'absent', 'x end', 'row 3']) {
+      for (const options of [{}, { caseSensitive: true }, { decorations }, { decorations, caseSensitive: true }]) {
+        // A new term is highlighted (and counted) again
+        steps.push(['clearDecorations']);
+        steps.push(...Array(3).fill(['findNext', term, options]), ...Array(4).fill(['findPrevious', term, options]));
+        steps.push(['findNext', term, options]);
+      }
+    }
+    // Starts inside wrapped lines (on their first and later rows) and at the top and bottom, with another term
+    for (const [col, row] of [[0, 0], [3, 40], [5, 41], [29, 77], [0, 900], [10, 1200], [0, 1599], [20, 1601], [0, 1605]]) {
+      for (const [method, term] of [['findNext', 'foo'], ['findPrevious', 'foo'], ['findPrevious', 'aa'], ['findNext', 'k'], ['findPrevious', 'i']]) {
+        steps.push(['select', col, row, 2], [method, term, {}], [method, term, {}]);
+      }
+    }
+    const runs = await page.evaluate((s) => window.run(s), steps);
+    assert.deepEqual(differences(runs), []);
+    assert.ok(runs[1].filter((r) => r.value === true).length > 300, 'mostly finds');
+    const events = await page.evaluate(() => window.results());
+    assert.deepEqual(events[0], events[1]);
+    assert.ok(events[1].some((e) => e.resultCount === 700), 'the highlight limit is reached');
+    assert.ok(events[1].some((e) => e.resultCount > 0 && e.resultCount < 700));
+  });
+});
