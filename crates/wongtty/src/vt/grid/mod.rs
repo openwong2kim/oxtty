@@ -393,7 +393,14 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
     fn increase_scroll_limit(&mut self, count: usize) {
         let count = min(count, self.max_scroll_limit - self.history_size());
         if count != 0 {
-            self.raw.initialize_up_to(count, self.columns, self.max_scroll_limit + self.lines);
+            // wongtty: while a compressed history is reflowed (rows held above), no spare rows: they are dropped
+            // again right after the resize.
+            let max_len = if self.history_above.is_some() {
+                self.raw.len() + count
+            } else {
+                self.max_scroll_limit + self.lines
+            };
+            self.raw.initialize_up_to(count, self.columns, max_len);
         }
     }
 

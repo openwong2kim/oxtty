@@ -91,6 +91,17 @@ impl<T> Storage<T> {
         self.visible_lines = next;
     }
 
+    /// wongtty: like [`Storage::grow_visible_lines`], without `MAX_CACHE_SIZE` spare rows.
+    pub fn grow_visible_lines_exact(&mut self, next: usize)
+    where
+        T: Default,
+    {
+        let additional_lines = next - self.visible_lines;
+        let columns = self[Line(0)].len();
+        self.initialize_up_to(additional_lines, columns, self.len + additional_lines);
+        self.visible_lines = next;
+    }
+
     /// Decrease the number of lines in the buffer.
     #[inline]
     pub fn shrink_visible_lines(&mut self, next: usize) {
