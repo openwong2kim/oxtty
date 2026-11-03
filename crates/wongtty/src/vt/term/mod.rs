@@ -17,7 +17,7 @@ use crate::vt::event::{Event, EventListener};
 use crate::vt::grid::{Dimensions, Grid, GridIterator, Scroll};
 use crate::vt::index::{self, Boundary, Column, Direction, Line, Point, Side};
 use crate::vt::selection::{Selection, SelectionRange, SelectionType};
-use crate::vt::term::cell::{Cell, Flags, ImageTile, LineLength};
+use crate::vt::term::cell::{Cell, Flags, ImageTile, LineLength, MAX_MARKS, intern};
 use crate::vt::term::color::Colors;
 use crate::vt::vi_mode::{ViModeCursor, ViMotion};
 use crate::vt::vte::ansi::{
@@ -1447,9 +1447,10 @@ impl<T> Term<T> {
         n
     }
 
-    /// wongtty: `input` for each of `text`'s characters one or two cells wide that fit on the cursor row, while
-    /// none needs the general path (as `input_ascii`, or a character the charset maps). Returns how many bytes
-    /// of `text` it wrote.
+    /// wongtty: `input` for each of `text`'s characters one or two cells wide that fit on the cursor row, and the
+    /// zerowidth characters after one (as one cluster), while none needs the general path (as `input_ascii`, a
+    /// character the charset maps, or zerowidth characters with the pen's extra). Returns how many bytes of `text`
+    /// it wrote.
     fn input_run(&mut self, text: &str) -> usize {
         let point = self.grid.cursor.point;
         let columns = self.columns();
@@ -1475,39 +1476,72 @@ impl<T> Term<T> {
         let wide_cell = |cell: &Cell| cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER);
         let (mut col, mut used) = (point.column.0, 0);
         let mut chars = text.chars();
-        while let Some(c) = chars.next() {
-            let width = match char_width(c) {
-                Some(width @ 1..=2) => width,
-                _ => break,
-            };
-            if col + width > columns || (mapped && c.is_ascii()) {
-                break;
-            }
-            if width == 1 {
-                let Some(cell) = cells.get_mut(col).filter(|cell| !wide_cell(cell)) else { break };
-                let flags = if c == ' ' && !spacer { flags | Flags::TYPED_SPACE } else { flags };
-                *cell = Cell { c, fg, bg, flags, extra: None };
-            } else {
-                let Some([wide, right]) = cells.get_mut(col..col + 2) else { break };
-                if wide_cell(wide) || wide_cell(right) {
+        let mut marked = false;
+        // The cell before the run that zerowidth characters at its start go on, as `input` damages it.
+        let mut before = None;
+        loop {
+            let mut zerowidth = None;
+            while let Some(c) = chars.next() {
+                let width = match char_width(c) {
+                    Some(width @ 1..=2) => width,
+                    Some(0) => {
+                        zerowidth = Some(c);
+                        break;
+                    },
+                    _ => break,
+                };
+                if col + width > columns || (mapped && c.is_ascii()) {
                     break;
                 }
-                *wide = Cell { c, fg, bg, flags: flags | Flags::WIDE_CHAR, extra: None };
-                *right = Cell { c: ' ', fg, bg, flags: flags | Flags::WIDE_CHAR_SPACER, extra: None };
+                if width == 1 {
+                    let Some(cell) = cells.get_mut(col).filter(|cell| !wide_cell(cell)) else { break };
+                    let flags = if c == ' ' && !spacer { flags | Flags::TYPED_SPACE } else { flags };
+                    *cell = Cell { c, fg, bg, flags, extra: None };
+                } else {
+                    let Some([wide, right]) = cells.get_mut(col..col + 2) else { break };
+                    if wide_cell(wide) || wide_cell(right) {
+                        break;
+                    }
+                    *wide = Cell { c, fg, bg, flags: flags | Flags::WIDE_CHAR, extra: None };
+                    *right = Cell { c: ' ', fg, bg, flags: flags | Flags::WIDE_CHAR_SPACER, extra: None };
+                }
+                col += width;
+                used = text.len() - chars.as_str().len();
             }
-            col += width;
-            used = text.len() - chars.as_str().len();
+            // The zerowidth characters after a cell this run wrote, or at its start after the cell before the cursor
+            // (an accent after ASCII text), go on it, then the run goes on: but for a stretch of ASCII text (words
+            // after an emoji), left to `input_ascii`. In WebAssembly, where the code size counts for more, `input`
+            // puts them.
+            match zerowidth {
+                Some(c) if cfg!(not(target_family = "wasm")) && col > 0 && extra.is_none() => {
+                    if col == point.column.0 {
+                        before = Some(col - 1 - cells[col - 1].flags.contains(Flags::WIDE_CHAR_SPACER) as usize);
+                    }
+                    put_marks(&mut cells[..col], c, &mut chars);
+                    marked = true;
+                    used = text.len() - chars.as_str().len();
+                    if ascii8(chars.as_str().as_bytes()) {
+                        break;
+                    }
+                },
+                _ => break,
+            }
         }
         // The pen's extra goes on afterwards, so the loop has no reference count to keep.
         if let Some(extra) = extra {
             cells[point.column.0..col].iter_mut().for_each(|cell| cell.extra = Some(extra.clone()));
         }
         row.occ = if used == 0 { occ } else { occ.max(col) } as u16;
-        row.plain = if used == 0 { was_plain } else { plain };
+        row.plain = if used == 0 { was_plain } else { plain & !marked };
         if used == 0 {
             return 0;
         }
-        self.damage.damage_line(point.line.0 as usize, point.column.0.saturating_sub(1), col - 1);
+        let (left, right) = match before {
+            Some(at) if col == point.column.0 => (at, at),
+            Some(at) => (at.min(point.column.0 - 1), col - 1),
+            None => (point.column.0.saturating_sub(1), col - 1),
+        };
+        self.damage.damage_line(point.line.0 as usize, left, right);
         if col < columns {
             self.grid.cursor.point.column = Column(col);
         } else {
@@ -1536,6 +1570,33 @@ impl<T> Term<T> {
         };
         trace!("Setting keyboard mode to {new_mode:?}");
         self.mode |= new_mode;
+    }
+}
+
+/// wongtty: whether the first 8 bytes of `text` are ASCII.
+#[inline(always)]
+fn ascii8(text: &[u8]) -> bool {
+    text.first_chunk::<8>().is_some_and(|b| u64::from_le_bytes(*b) & 0x8080_8080_8080_8080 == 0)
+}
+
+/// wongtty: puts zerowidth character `first` and those that follow it in `chars` on the last of `cells` (a wide
+/// character's left half), as `input` puts each, but interned once for the cluster.
+#[inline(never)]
+fn put_marks(cells: &mut [Cell], first: char, chars: &mut str::Chars<'_>) {
+    let mut marks = [first; MAX_MARKS];
+    let mut n = 1;
+    while n < MAX_MARKS {
+        let mut ahead = chars.clone();
+        match ahead.next() {
+            Some(m) if char_width(m) == Some(0) => (marks[n], n, *chars) = (m, n + 1, ahead),
+            _ => break,
+        }
+    }
+    let last = cells.len() - 1;
+    let cell = &mut cells[last - cells[last].flags.contains(Flags::WIDE_CHAR_SPACER) as usize];
+    match cell.extra.is_none().then(|| intern(&marks[..n])).flatten() {
+        Some(extra) => cell.extra = Some(extra),
+        None => marks[..n].iter().for_each(|&m| cell.push_zerowidth(m)),
     }
 }
 
@@ -3302,8 +3363,11 @@ mod tests {
     /// one character at a time.
     #[test]
     fn input_str_matches_input() {
-        let pieces: [&str; 32] = [
+        let pieces: [&str; 42] = [
             "abc", "hello world ", " ", "가", "漢字", "😀", "é", "e\u{301}", "\u{200b}", "\x7f", "\t", "\r", "\n", "\x08",
+            "\u{fe0f}", "\u{2764}\u{fe0f}", "1\u{fe0f}\u{20e3}", "\u{1f468}\u{200d}\u{1f469}", "\u{1f3f3}\u{fe0f}\u{200d}",
+            "a\u{300}\u{301}\u{302}\u{303}\u{304}\u{305}\u{306}\u{307}\u{308}\u{309}",
+            "\u{300}\u{301}\u{302}", "\u{1f3fd}", "a\u{300}\u{301}b\u{302}", "\u{1161}\u{11a8}",
             "\x1b(0", "\x1b(B", "\x0e", "\x0f", "\x1b[4h", "\x1b[4l", "\x1b[?7l", "\x1b[?7h", "\x1b[31m", "\x1b[0m",
             "\x1b[H", "\x1b[2;9H", "\x1b[K", "\x1b[3@", "\x1b[2P", "\x1b]8;id=a;x\x1b\\", "xxxxxxxxxxxxx", "가나다라마",
         ];
