@@ -10,14 +10,21 @@
 //   ro      the backing size comes from ResizeObserver's device-pixel-content-box, as xterm.js's addon-webgl does
 //   x1      the backing size is the CSS size (dpr 1 pixels) whatever the dpr
 //   clear   gl.clear before every pane draw
-// `xfer` presents the shared surface with transferToImageBitmap into 'bitmaprenderer' pane canvases.
-// `xtermlike` is xterm.js addon-webgl's setup: perpane+abs+late+ro+clear (its context attributes are perpane's:
-// antialias false, depth false, preserveDrawingBuffer false, alpha and premultipliedAlpha left at their defaults).
+//   nocompact  probe.compact() leaves the panes as they are (perpane is compacted as copy otherwise)
+//   swap    xfer only: probe.compact() replaces each pane canvas element instead of resizing it (Chromium frees what
+//           a 'bitmaprenderer' canvas showed only when the element goes, bench/memory/README.md, Busy)
+// `xfer` presents the shared surface with transferToImageBitmap into 'bitmaprenderer' pane canvases. gpu.rs and the
+// README record that losing the context of an OffscreenCanvas that has transferred a bitmap hung wongtty's page in
+// Chrome; this probe's own loss (probe.mjs LOSE=1) does not hang, so only the renderer-context web test against the
+// real renderer clears that.
+// `xtermlike` is xterm.js addon-webgl's setup: perpane+abs+late+ro+clear+nocompact (its context attributes are
+// perpane's: antialias false, depth false, preserveDrawingBuffer false, alpha and premultipliedAlpha left at their
+// defaults; it never resizes an idle canvas).
 window.runProbe = async ({ mode: spec, n, w, h, interval, dpr, cols, rows, busyN }) => {
   let [mode, ...flags] = spec.split('+');
   if (mode === 'xtermlike') {
     mode = 'perpane';
-    flags = ['abs', 'late', 'ro', 'clear', ...flags];
+    flags = ['abs', 'late', 'ro', 'clear', 'nocompact', ...flags];
   }
   const has = (f) => flags.includes(f);
   const counts = { draws: 0, presents: 0, frames: 0 };
@@ -89,11 +96,13 @@ window.runProbe = async ({ mode: spec, n, w, h, interval, dpr, cols, rows, busyN
     }
   }
   let present;
+  // The shared WebGL context of the modes that have one, for probe.lose().
+  let sharedGl = null;
   if (mode === 'batch') {
     // one big offscreen surface with a tile per pane: dirty panes draw into their tiles, then one snapshot feeds every drawImage
     const per = Math.ceil(Math.sqrt(n));
     const off = new OffscreenCanvas(W * per, H * Math.ceil(n / per));
-    const gl = off.getContext('webgl2', attrs(false));
+    const gl = (sharedGl = off.getContext('webgl2', attrs(false)));
     const g = setupGl(gl); gl.enable(gl.SCISSOR_TEST);
     panes.forEach((p, i) => { p.tx = (i % per) * W; p.ty = Math.floor(i / per) * H; });
     for (const p of panes) {
@@ -111,7 +120,7 @@ window.runProbe = async ({ mode: spec, n, w, h, interval, dpr, cols, rows, busyN
     window.batchSurface = { w: off.width, h: off.height };
   } else if (mode === 'copy' || mode === 'copy2' || mode === 'copyna' || mode === 'copyds' || mode === 'copyel' || mode === 'copycpu') {
     const off = mode === 'copyel' ? document.createElement('canvas') : new OffscreenCanvas(1, 1);
-    const gl = off.getContext('webgl2', attrs(false));
+    const gl = (sharedGl = off.getContext('webgl2', attrs(false)));
     const g = setupGl(gl);
     for (const p of panes) {
       const c = paneCanvas(p);
@@ -132,7 +141,7 @@ window.runProbe = async ({ mode: spec, n, w, h, interval, dpr, cols, rows, busyN
     // one shared WebGL surface as copy, presented with a zero-copy transferToImageBitmap into each pane's
     // 'bitmaprenderer' canvas instead of a 2D drawImage
     const off = new OffscreenCanvas(W, H);
-    const gl = off.getContext('webgl2', attrs(false));
+    const gl = (sharedGl = off.getContext('webgl2', attrs(false)));
     const g = setupGl(gl);
     for (const p of panes) {
       const c = paneCanvas(p);
@@ -140,6 +149,8 @@ window.runProbe = async ({ mode: spec, n, w, h, interval, dpr, cols, rows, busyN
       c.ready();
     }
     present = (p) => {
+      // transferToImageBitmap throws on a lost context
+      if (gl.isContextLost()) return;
       const cw = p.ctx.canvas.width, ch = p.ctx.canvas.height;
       if (off.width !== cw || off.height !== ch) { off.width = cw; off.height = ch; }
       gl.viewport(0, 0, cw, ch); gl.uniform2f(g.size, W, H);
@@ -260,6 +271,7 @@ window.runProbe = async ({ mode: spec, n, w, h, interval, dpr, cols, rows, busyN
   };
   requestAnimationFrame(loop);
   const p0ctx = () => !!panes[0].ctx;
+  let restored = 0, lostGls = [];
   window.probe = {
     start() { busy = true; timer = setInterval(() => { for (const p of panes.slice(0, busyN ?? n)) { fill(p); p.dirty = true; } }, interval); },
     stop() { busy = false; clearInterval(timer); for (const p of panes) p.dirty = true; },
@@ -273,6 +285,12 @@ window.runProbe = async ({ mode: spec, n, w, h, interval, dpr, cols, rows, busyN
     },
     // compaction: as wongtty, resize pane canvases to 0 and back and redraw once
     compact() {
+      if (has('nocompact')) return;
+      if (has('swap')) {
+        for (const p of panes) { p.ctx.canvas.remove(); const c = paneCanvas(p); p.ctx = c.getContext('bitmaprenderer'); c.ready(); present(p); }
+        return;
+      }
+      if (mode === 'perpane') { for (const p of panes) { const c = p.gl.canvas; const cw = c.width; c.width = 0; c.width = cw; present(p); } return; }
       if (present.webgpu && window.pageCompact) for (const p of panes) {
         if (window.pageCompact === 'unconf') { p.gctx.unconfigure(); p.gctx.configure(p.gctx.__cfg); present(p); }
         else { const c = p.canvas; const cw = c.width; c.width = 0; c.width = cw; present(p); }
@@ -280,6 +298,24 @@ window.runProbe = async ({ mode: spec, n, w, h, interval, dpr, cols, rows, busyN
       if (p0ctx()) { for (const p of panes) { const c = p.ctx.canvas; const cw = c.width; c.width = 0; c.width = cw; present(p); } if (present.flush) present.flush(); }
       if (present.page && window.pageCompact) { const c = window.pageEl; const cw = c.width; c.width = 0; c.width = cw; for (const p of panes) present(p); }
     },
+    // Loses every WebGL context of the probe, marks every pane for a redraw (presents run on the lost context), and
+    // restores the contexts after `ms`, as the renderer-context web test does; every pane redraws once restored.
+    // Returns how many contexts it lost; probe.restored() then says how many got `webglcontextrestored` and how many
+    // are still lost.
+    lose(ms) {
+      const gls = sharedGl ? [sharedGl] : panes.map((p) => p.gl).filter(Boolean);
+      for (const gl of gls) {
+        gl.canvas.addEventListener('webglcontextlost', (e) => e.preventDefault());
+        gl.canvas.addEventListener('webglcontextrestored', () => { restored++; for (const p of panes) p.dirty = true; });
+        const ext = gl.getExtension('WEBGL_lose_context');
+        ext.loseContext();
+        setTimeout(() => ext.restoreContext(), ms);
+      }
+      for (const p of panes) p.dirty = true;
+      lostGls = gls;
+      return gls.length;
+    },
+    restored: () => ({ restored, stillLost: lostGls.filter((gl) => gl.isContextLost()).length }),
   };
   // initial frames
   await new Promise((r) => { let k = 20; const f = () => (k-- > 0 ? requestAnimationFrame(f) : r()); f(); });

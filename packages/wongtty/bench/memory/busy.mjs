@@ -14,7 +14,9 @@
 // KINDS picks the engines (default wongtty,xterm); RUNS repeats them, interleaved (the kind order rotates per run), and
 // prints the medians at the end. Each run also reports the GPU process peak over samples every 2 s while busy, the
 // footprint of every browser process (all-process total), the WebGL contexts made and lost, and the load average.
-// ARGS adds Chrome switches (for example ARGS=--disable-features=SkiaGraphite).
+// ARGS adds Chrome switches to every kind (for example ARGS=--disable-features=SkiaGraphite). A kind may end in
+// `#<set>` for a named set of switches of its own, so a switch is compared with and without it in the same run:
+// `#nograph` is --disable-features=SkiaGraphite (KINDS=wongtty,wongtty#nograph).
 // The dpr is the screen scale factor of a 4500×4500 window (--force-device-scale-factor); SCALE=emulate emulates it in
 // the page instead, where xterm.js's WebGL canvas stays at dpr 1.
 import { chromium } from 'playwright-core';
@@ -29,17 +31,25 @@ const server = await serve();
 const RUNS = Number(process.env.RUNS ?? 1);
 const KINDS = process.env.KINDS?.split(',') ?? ['wongtty', 'xterm'];
 const ARGS = process.env.ARGS ? process.env.ARGS.split(' ') : [];
+const SWITCH_SETS = { nograph: ['--disable-features=SkiaGraphite'] };
+/** The engine and the Chrome switches of a kind such as `wongtty#nograph`. */
+function parseKind(kind) {
+  const [engine, set] = kind.split('#');
+  if (set && !SWITCH_SETS[set]) throw new Error(`unknown switch set #${set} (known: ${Object.keys(SWITCH_SETS).join(', ')})`);
+  return { engine, args: [...ARGS, ...(set ? SWITCH_SETS[set] : [])] };
+}
+KINDS.forEach(parseKind);
 // The device pixel ratio comes from a real screen scale factor by default. With page emulation (SCALE=emulate, the
 // old way) ResizeObserver's device-pixel-content-box still reports CSS pixels, so xterm.js's addon-webgl sizes its
 // drawing buffer at dpr 1 while devicePixelRatio says 2.
 const EMULATE = process.env.SCALE === 'emulate';
-const browserFor = () =>
-  EMULATE && !ARGS.length
+const browserFor = (args) =>
+  EMULATE && !args.length
     ? launch()
     : chromium.launch({
         channel: 'chrome',
         headless: true,
-        args: ['--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist', ...(EMULATE ? [] : [`--force-device-scale-factor=${dpr}`, '--window-size=4500,4500']), ...ARGS],
+        args: ['--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist', ...(EMULATE ? [] : [`--force-device-scale-factor=${dpr}`, '--window-size=4500,4500']), ...args],
       });
 // The GPU process of a fresh browser drops its startup surfaces about 5 s after launch; the empty page is read after.
 const SETTLE = Number(process.env.SETTLE ?? 6000);
@@ -48,9 +58,14 @@ const loadavg = () => execFileSync('sysctl', ['-n', 'vm.loadavg']).toString().tr
 /** Page init script: counts the WebGL contexts the page makes and the `webglcontextlost` events they get. */
 function countContexts() {
   window.glContexts = { made: 0, lost: 0 };
+  // Weak, so counting keeps no short-lived context (such as page.mjs's renderer-info one) alive and in the GPU process.
   const made = [];
   // Device pixels of every live WebGL drawing buffer, in millions.
-  window.glBufferMpx = () => made.reduce((a, gl) => a + (gl.isContextLost() ? 0 : gl.drawingBufferWidth * gl.drawingBufferHeight), 0) / 1e6;
+  window.glBufferMpx = () =>
+    made.reduce((a, ref) => {
+      const gl = ref.deref();
+      return a + (!gl || gl.isContextLost() ? 0 : gl.drawingBufferWidth * gl.drawingBufferHeight);
+    }, 0) / 1e6;
   for (const C of [globalThis.HTMLCanvasElement, globalThis.OffscreenCanvas]) {
     if (!C) continue;
     const getContext = C.prototype.getContext;
@@ -59,7 +74,7 @@ function countContexts() {
       if (ctx && /webgl/.test(type) && !this.glCounted) {
         this.glCounted = true;
         window.glContexts.made++;
-        made.push(ctx);
+        made.push(new WeakRef(ctx));
         this.addEventListener('webglcontextlost', () => window.glContexts.lost++);
       }
       return ctx;
@@ -68,7 +83,8 @@ function countContexts() {
 }
 
 async function measure(kind) {
-  const browser = await browserFor();
+  const { engine, args } = parseKind(kind);
+  const browser = await browserFor(args);
   try {
     const page = await browser.newPage(EMULATE ? { viewport: { width: 4500, height: 4500 }, deviceScaleFactor: dpr } : { viewport: null });
     await page.addInitScript(countContexts);
@@ -89,7 +105,7 @@ async function measure(kind) {
     await page.evaluate(([k, n, mixed]) => {
       window.mixed = mixed;
       return window.setup(k, n, 120, 40, 1000, false);
-    }, [kind, panes, !!process.env.MIXED]);
+    }, [engine, panes, !!process.env.MIXED]);
     await page.waitForTimeout(2000);
     const before = footprintDetail(await gpuPid());
     await page.evaluate(() => window.counts());
@@ -110,11 +126,13 @@ async function measure(kind) {
     }
     await page.waitForTimeout(Math.max(0, seconds * 1000 - (Date.now() - started)));
     const { frames, echoes } = await page.evaluate(() => window.stopBusy());
+    // The footprint reads under load can stretch the busy window past `seconds`; frames/s uses the real length.
+    const busyMs = Date.now() - started;
     const counts = await page.evaluate(() => window.counts());
     const contexts = await page.evaluate(() => ({ ...window.glContexts, mpx: window.glBufferMpx() }));
     await page.waitForTimeout(IDLE_MS);
     const after = footprintDetail(await gpuPid());
-    return { kind, errors, empty, before, busy, after, frames, echoes, counts, contexts, peak: Math.max(...samples), byType, load: loadavg() };
+    return { kind, errors, empty, before, busy, after, frames, busyMs, echoes, counts, contexts, peak: Math.max(...samples), byType, load: loadavg() };
   } finally {
     await browser.close();
   }
@@ -132,7 +150,8 @@ try {
     console.log(
       `${kind.padEnd(8)} errors=${r.errors.length} | GPU process footprint ${mb(r.busy.total)} MB busy, ${mb(r.before.total)} before ` +
         `(over empty page +${mb(r.busy.total - r.empty.total)}: IOSurface +${cat(r.busy, r.empty, 'IOSurface')}, ` +
-        `IOAccelerator (graphics) +${cat(r.busy, r.empty, 'IOAccelerator (graphics)')}) | ${r.frames} frames, ` +
+        `IOAccelerator (graphics) +${cat(r.busy, r.empty, 'IOAccelerator (graphics)')}) | ${r.frames} frames in ${(r.busyMs / 1000).toFixed(1)} s ` +
+        `(${((r.frames * 1000) / r.busyMs).toFixed(1)}/s), ` +
         `WebGL draws ${gl} (${(gl / r.frames).toFixed(1)}/frame), drawImage ${drawImage} (${(drawImage / r.frames).toFixed(1)}/frame), ` +
         `transferFromImageBitmap ${bitmap} | idle ${IDLE_MS / 1000} s after: ${mb(r.after.total)} MB (+${mb(r.after.total - r.empty.total)})`,
     );

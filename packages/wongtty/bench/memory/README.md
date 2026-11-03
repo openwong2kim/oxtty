@@ -139,6 +139,18 @@ printing; near the end of the window the GPU process's footprint is read, and
 the page counts WebGL draw calls, `drawImage` calls and animation frames. Then
 the footprint again after 5 s of idling.
 
+Since 2026-11-03 `busy.mjs` sets the dpr as a real screen scale factor of a
+4500×4500 window and reads the empty page after 6 s (a fresh GPU process drops
+its startup surfaces about 5 s after launch); `SCALE=emulate` gives the old
+page emulation. The table below and the breakdown tables above were taken with
+emulated dpr and a 1 s settle. Under emulation ResizeObserver's
+`device-pixel-content-box` reports CSS pixels, so xterm.js's addon-webgl draws
+at dpr 1 while `devicePixelRatio` says 2 (7.1 Mpx of drawing buffers for 15
+panes instead of 28.3): emulated dpr-2 xterm.js figures under-count it.
+wongtty sizes by `devicePixelRatio` and draws at full size either way, but a
+real scale factor also enlarges the window's own surfaces, so absolute dpr-2
+figures from the two modes do not compare. `breakdown.mjs` still emulates.
+
 17 panes of 120×40, dpr 1, 12 s (Apple M4, loaded machine, 2026-11-02; GPU
 process footprint while busy, three runs, and over the empty page):
 

@@ -5,6 +5,10 @@
 // run), and prints the medians at the end. The dpr is the screen scale factor of a 4500x4500 window
 // (--force-device-scale-factor); SCALE=emulate emulates it in the page instead, where ResizeObserver's
 // device-pixel-content-box reports CSS pixels. ARGS adds Chrome switches (ARGS=--disable-features=SkiaGraphite).
+// A mode may end in `#<set>` for Chrome switches of its own, compared in the same run: `#nograph` is
+// --disable-features=SkiaGraphite, `#swift` SwiftShader instead of the GPU (as the web tests run).
+// LOSE=1 then loses every WebGL context of the page, restores it 100 ms later and reports whether the page still
+// answers (a hang shows as `context loss: HUNG`).
 // Other env: N panes (17), BUSY ms (8000), INTERVAL ms (50), BUSYN busy panes (all), PAGE_COMPACT (page modes).
 import { footprintDetail, launch, mb, pids } from '../common.mjs';
 import { readFileSync } from 'node:fs';
@@ -17,6 +21,9 @@ const modes = (process.env.MODES ?? 'copy,page,pagep,perpane,copy2').split(',');
 const n = Number(process.env.N ?? 17), dpr = Number(process.env.DPR ?? 1), runs = Number(process.env.RUNS ?? 1);
 const BUSY = Number(process.env.BUSY ?? 8000), interval = Number(process.env.INTERVAL ?? 50);
 const extraArgs = process.env.ARGS ? process.env.ARGS.split(' ') : [];
+const SWITCH_SETS = { nograph: ['--disable-features=SkiaGraphite'], swift: ['--enable-unsafe-swiftshader', '--use-angle=swiftshader'] };
+for (const m of modes) if (m.includes('#') && !SWITCH_SETS[m.split('#')[1]]) throw new Error(`unknown switch set in ${m}`);
+const LOSE = !!process.env.LOSE;
 const EMULATE = process.env.SCALE === 'emulate';
 // The GPU process of a fresh browser drops its startup surfaces about 5 s after launch; the empty page is read after.
 const SETTLE = Number(process.env.SETTLE ?? 6000);
@@ -28,12 +35,14 @@ const results = [];
 console.log(`n=${n} dpr=${dpr} (${EMULATE ? 'emulated' : 'screen scale factor'}) busy ${BUSY} ms every ${interval} ms${extraArgs.length ? ` args ${extraArgs.join(' ')}` : ''}`);
 for (let run = 0; run < runs; run++) for (let i = 0; i < modes.length; i++) {
   const mode = modes[(run + i) % modes.length];
-  const browser = EMULATE && !extraArgs.length
+  const [spec, set] = mode.split('#');
+  const args = [...extraArgs, ...(set ? SWITCH_SETS[set] : [])];
+  const browser = EMULATE && !args.length
     ? await launch()
     : await chromium.launch({
         channel: 'chrome',
         headless: true,
-        args: ['--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist', ...(EMULATE ? [] : [`--force-device-scale-factor=${dpr}`, '--window-size=4500,4500']), ...extraArgs],
+        args: ['--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist', ...(EMULATE ? [] : [`--force-device-scale-factor=${dpr}`, '--window-size=4500,4500']), ...args],
       });
   try {
     const page = await browser.newPage(EMULATE ? { viewport: { width: 4500, height: 4500 }, deviceScaleFactor: dpr } : { viewport: null });
@@ -44,7 +53,7 @@ for (let run = 0; run < runs; run++) for (let i = 0; i < modes.length; i++) {
     await page.waitForTimeout(SETTLE);
     const empty = footprintDetail(await gpu());
     await page.evaluate((v) => { window.pageCompact = v; }, process.env.PAGE_COMPACT === 'unconf' ? 'unconf' : !!process.env.PAGE_COMPACT);
-    const info = await page.evaluate((o) => window.runProbe(o), { mode, n, w: 868, h: 560, interval, dpr, cols: 120, rows: 40, busyN: process.env.BUSYN ? Number(process.env.BUSYN) : undefined });
+    const info = await page.evaluate((o) => window.runProbe(o), { mode: spec, n, w: 868, h: 560, interval, dpr, cols: 120, rows: 40, busyN: process.env.BUSYN ? Number(process.env.BUSYN) : undefined });
     await page.waitForTimeout(1500);
     const before = footprintDetail(await gpu());
     await page.evaluate(() => window.probe.counts());
@@ -58,6 +67,19 @@ for (let run = 0; run < runs; run++) for (let i = 0; i < modes.length; i++) {
     await page.evaluate(() => window.probe.compact());
     await page.waitForTimeout(4000);
     const idle = footprintDetail(await gpu());
+    let lose = '';
+    if (LOSE) {
+      const errors = [];
+      page.on('pageerror', (e) => errors.push(e.message.slice(0, 80)));
+      const lost = await page.evaluate(() => { window.probe.counts(); return window.probe.lose(100); });
+      await page.waitForTimeout(1000);
+      // The page answers when an evaluate that waits for 10 animation frames returns within 10 s.
+      const answer = page.evaluate(() => new Promise((r) => { let k = 10; const f = () => (k-- > 0 ? requestAnimationFrame(f) : r(window.probe.counts())); f(); }));
+      const frames = await Promise.race([answer, new Promise((r) => setTimeout(() => r(null), 10000))]);
+      const back = frames === null ? null : await page.evaluate(() => window.probe.restored());
+      lose = ` | context loss (${lost} contexts): ${frames === null ? 'HUNG' : `answered, probe loop ${frames.frames} frames, ${frames.presents} presents, restored ${back.restored}, still lost ${back.stillLost}`}` +
+        `${errors.length ? `, page errors: ${[...new Set(errors)].join('; ')}` : ''}`;
+    }
     const load = execSync('sysctl -n vm.loadavg').toString().trim();
     results.push({ mode, empty, busy, idle });
     console.log(
@@ -66,7 +88,7 @@ for (let run = 0; run < runs; run++) for (let i = 0; i < modes.length; i++) {
         `IOAccel(gfx) ${mb(cat(busy, GFX))} +${mb(cat(busy, GFX) - cat(empty, GFX))}, IOAccel +${mb(cat(busy, ACC) - cat(empty, ACC))}) | ` +
         `idle +${mb(idle.total - empty.total)} (IOSurface +${mb(cat(idle, IOS) - cat(empty, IOS))}) | ` +
         `backing ${px.canvas.toFixed(1)} Mpx, GL buffers ${px.gl.toFixed(1)} Mpx, lost ${px.lost} | ` +
-        `frames ${c.frames} draws ${c.draws} presents ${c.presents}${info.pageCanvas ? ` page ${info.pageCanvas.w}x${info.pageCanvas.h}` : ''} | load ${load}`,
+        `frames ${c.frames} draws ${c.draws} presents ${c.presents}${info.pageCanvas ? ` page ${info.pageCanvas.w}x${info.pageCanvas.h}` : ''}${lose} | load ${load}`,
     );
   } finally { await browser.close(); }
 }
