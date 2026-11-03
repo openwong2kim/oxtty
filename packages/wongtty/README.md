@@ -5,12 +5,16 @@ xterm.js 6.x `Terminal` API over that engine, with a WebGL2 renderer, also in
 Rust. Built to keep memory low with many terminals open: all panes on a page
 share one engine module, one WebGL2 context and one glyph atlas.
 
-**Status: 0.0.1, experimental, not published to npm yet.**
+**Status: 0.0.1, experimental.**
 
 ## Install
 
-Until it is published, build it from the repository (Rust, the `wasm-bindgen`
-CLI and Node ≥ 18):
+```sh
+npm install wongtty
+```
+
+To build it from the repository instead (Rust, the `wasm-bindgen` CLI and
+Node ≥ 18):
 
 ```sh
 git clone https://github.com/openwong2kim/wongtty && cd wongtty

@@ -5,7 +5,7 @@
 | Document version | v0.5 |
 | Written | 2026-10-31 (v0.1·v0.2·v0.3), 2026-11-01 (v0.4), 2026-11-02 (v0.5) |
 | Repository | github.com/openwong2kim/wongtty (private) |
-| Current release | 0.0.1 — engine core, wasm, N-API, tests (not published to registries) |
+| Current release | 0.0.1 — engine core, wasm, N-API, tests (npm `wongtty`; not on crates.io) |
 | First customer | wmux |
 
 ### v0.5 change summary
@@ -193,7 +193,7 @@ xterm.js splits into an **engine layer** (`common`: bytes → screen state) and 
 
 - Renderer-agnostic API: feed, resize, rowText, rowCells(packed), rowWrapped, cellText, cursor, modes, takeDamage, takeReplies, takeTitle, takeBells, syncPending/flushSync
 - Scrollback uses negative line numbers (-1 is the most recent)
-- npm package `wongtty` (wasm 177KB, **not published**), N-API binding, CI (Windows, macOS, Linux)
+- npm package `wongtty` (wasm 177KB, published 0.0.1), N-API binding, CI (Windows, macOS, Linux)
 - Tests: Rust 15 + 1 doc example, npm 11, N-API 2
 - **Known blocker:** cannot publish to crates.io — `cargo publish` fetches the original Alacritty and the build breaks (resolved in M1)
 
