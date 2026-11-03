@@ -171,6 +171,16 @@ impl History {
         shape(self.bytes(i))
     }
 
+    /// Whether row `i`, at the width rows are read at, wraps (its last cell has WRAPLINE), from its bytes: a row
+    /// read at another width than it was stored at has a default blank there.
+    pub(crate) fn wrapped(&self, i: usize) -> bool {
+        let bytes = self.bytes(i);
+        let cols = take_varint(&mut &bytes[..]);
+        shape(bytes).is_some_and(|(cells, wraps)| {
+            wraps && Some(cells) == cols && (self.cols == 0 || Some(self.cols) == cols)
+        })
+    }
+
     /// Appends row `i`'s text as `Engine::row_string` gives it, read straight from its bytes. False, with nothing
     /// appended, when the row has extras or bytes `decode` would not read: the caller decodes it instead.
     pub(crate) fn row_text_into(&self, i: usize, trim_right: bool, out: &mut String) -> bool {
@@ -2304,6 +2314,10 @@ mod tests {
             let scan = scan_len(row);
             let wrapped = scan > 0 && row[Column(scan - 1)].flags.contains(Flags::WRAPLINE);
             assert_eq!(history.shape(i), Some((scan, wrapped)), "row {i}");
+            let last = row
+                .last()
+                .is_some_and(|c| c.flags.contains(Flags::WRAPLINE));
+            assert_eq!(history.wrapped(i), last, "row {i}");
             assert_text(&history, i, row);
         }
     }
@@ -2389,6 +2403,10 @@ mod tests {
             let scan = scan_len(row);
             let wrapped = scan > 0 && row[Column(scan - 1)].flags.contains(Flags::WRAPLINE);
             assert_eq!(history.shape(i), Some((scan, wrapped)), "row {i}");
+            let last = row
+                .last()
+                .is_some_and(|c| c.flags.contains(Flags::WRAPLINE));
+            assert_eq!(history.wrapped(i), last, "row {i}");
             assert_text(&history, i, row);
         }
     }
@@ -3163,10 +3181,10 @@ mod oracle {
         }
     }
 
-    /// `Engine::text_rows` reads history rows from their bytes as `row_string` reads them decoded: after any output
-    /// and resize (rows read at another width than they were stored at), past either end of the buffer.
+    /// `Engine::text_rows` and `row_wrapped` read history rows from their bytes as the decoded rows read: after any
+    /// output and resize (rows read at another width than they were stored at), past either end of the buffer.
     #[test]
-    fn text_rows_match_row_strings() {
+    fn reads_from_the_bytes_match_the_decoded_rows() {
         for seed in 1..=200u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
             let (cols, rows) = (rng.below(38) as u16 + 2, rng.below(8) as u16 + 1);
@@ -3191,6 +3209,15 @@ mod oracle {
                     let mut got = String::new();
                     t.text_rows(top - 3, bottom + 3, trim, &mut got);
                     assert_eq!(got, want, "seed {seed} step {step} trim {trim}");
+                }
+                // The wrap read from a history row's bytes is the decoded row's.
+                for l in top - 1..bottom {
+                    let last = t.with_row(l, |r| r.last().unwrap().flags.contains(Flags::WRAPLINE));
+                    assert_eq!(
+                        t.row_wrapped(l),
+                        last.unwrap_or(false),
+                        "seed {seed} step {step} line {l}"
+                    );
                 }
             }
         }
