@@ -15,7 +15,7 @@ use web_sys::{
 };
 
 use super::atlas::{is_powerline_glyph, TextureAtlas};
-use super::gl::{buffer_f32, create_program, PROJECTION_MATRIX};
+use super::gl::{buffer_f32, start_program, Linking, PROJECTION_MATRIX};
 use super::model::RenderModel;
 use super::Dimensions;
 
@@ -113,9 +113,14 @@ pub struct GlyphProgram {
 }
 
 impl GlyphProgram {
-    /// `units` texture units hold the atlas pages.
-    pub fn new(gl: &Gl, units: u32) -> Option<Self> {
-        let program = create_program(gl, &vertex_shader(), &fragment_shader(units))?;
+    /// Starts linking the program for `units` texture units holding the atlas pages.
+    pub fn start(gl: &Gl, units: u32) -> Option<Linking> {
+        start_program(gl, &vertex_shader(), &fragment_shader(units))
+    }
+
+    /// `units` as given to [`Self::start`].
+    pub fn new(gl: &Gl, linking: Linking, units: u32) -> Option<Self> {
+        let program = linking.finish(gl)?;
         let projection = gl.get_uniform_location(&program, "u_projection")?;
         let resolution_location = gl.get_uniform_location(&program, "u_resolution")?;
         let texture_location = gl.get_uniform_location(&program, "u_texture")?;

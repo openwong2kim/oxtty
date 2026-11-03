@@ -11,7 +11,7 @@ use web_sys::{
 
 use super::cell::{CM_MASK, CM_P16, CM_P256, CM_RGB, FG_INVERSE, PCOLOR_MASK, RGB_MASK};
 use super::color::{Color, ColorSet};
-use super::gl::{buffer_f32, create_program, PROJECTION_MATRIX};
+use super::gl::{buffer_f32, start_program, Linking, PROJECTION_MATRIX};
 use super::model::{CursorModel, RenderModel, RENDER_MODEL_BG_OFFSET, RENDER_MODEL_FG_OFFSET};
 use super::{CursorInactiveStyle, Dimensions};
 
@@ -97,8 +97,12 @@ pub struct RectProgram {
 }
 
 impl RectProgram {
-    pub fn new(gl: &Gl) -> Option<Self> {
-        let program = create_program(gl, &vertex_shader(), FRAGMENT_SHADER)?;
+    pub fn start(gl: &Gl) -> Option<Linking> {
+        start_program(gl, &vertex_shader(), FRAGMENT_SHADER)
+    }
+
+    pub fn new(gl: &Gl, linking: Linking) -> Option<Self> {
+        let program = linking.finish(gl)?;
         let projection_location = gl.get_uniform_location(&program, "u_projection")?;
         let vao = gl.create_vertex_array()?;
         gl.bind_vertex_array(Some(&vao));

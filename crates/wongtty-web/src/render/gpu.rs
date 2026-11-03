@@ -36,6 +36,7 @@ use web_sys::{
 
 use super::atlas::{self, TextureAtlas};
 use super::cursor_layer::Region;
+use super::gl::Linking;
 use super::glyphs::{GlyphProgram, GlyphVertices};
 use super::images::{self, ImageLayer, ImageProgram};
 use super::model::RenderModel;
@@ -163,6 +164,15 @@ struct AtlasTextures {
     pages: Vec<(WebGlTexture, Option<(u64, u32)>)>,
 }
 
+/// The programs being linked, for `pages` atlas pages: a new context starts them and its first draw finishes
+/// them, so the links run while the terminal measures its font and waits for the frame.
+struct Linkings {
+    pages: u32,
+    glyph: Linking,
+    rect: Linking,
+    image: Option<Linking>,
+}
+
 struct Programs {
     glyph: GlyphProgram,
     rect: RectProgram,
@@ -185,6 +195,7 @@ struct Gpu {
     /// New panes take frames by transfer (an `OffscreenCanvas` on a GPU).
     transfer: bool,
     live: bool,
+    linking: Option<Linkings>,
     programs: Option<Programs>,
     textures: Vec<AtlasTextures>,
     image_textures: Vec<ImageTexture>,
@@ -262,6 +273,7 @@ pub fn ensure(document: &Document) -> Result<(), JsValue> {
         surface,
         gl,
         live: true,
+        linking: None,
         programs: None,
         textures: Vec::new(),
         image_textures: Vec::new(),
@@ -293,8 +305,10 @@ pub fn release() {
 /// Whether panes can draw now.
 pub fn is_live() -> bool {
     GPU.with(|g| {
-        g.try_borrow()
-            .is_ok_and(|g| g.as_ref().is_some_and(|g| g.live && g.programs.is_some()))
+        g.try_borrow().is_ok_and(|g| {
+            g.as_ref()
+                .is_some_and(|g| g.live && (g.programs.is_some() || g.linking.is_some()))
+        })
     })
 }
 
@@ -353,9 +367,11 @@ pub fn image_textures() -> u32 {
 /// Shrinks the shared surface to a pixel once no pane drew for `idle_ms`: after transfers it keeps drawing
 /// buffers of the last frame's size that no canvas shows.
 pub fn trim(idle_ms: f64) {
-    with_gpu(move |gpu| {
-        if timer::now() - gpu.last_draw >= idle_ms {
-            gpu.surface.set_size(1, 1);
+    GPU.with(|g| {
+        if let Ok(Some(gpu)) = g.try_borrow().as_deref() {
+            if timer::now() - gpu.last_draw >= idle_ms {
+                gpu.surface.set_size(1, 1);
+            }
         }
     });
 }
@@ -403,7 +419,7 @@ impl Gpu {
             .push(Listener::new(&target, "webglcontextrestored", restored));
     }
 
-    /// Programs for the current context; atlas textures are uploaded again as they are used.
+    /// Starts linking the programs for the current context; atlas textures are uploaded again as they are used.
     fn build(&mut self) {
         let gl = &self.gl;
         let units = gl
@@ -419,6 +435,7 @@ impl Gpu {
         self.textures.clear();
         self.image_textures.clear();
         self.programs = None;
+        self.linking = None;
         if units < 1.0 || max_size < 1.0 {
             return;
         }
@@ -426,7 +443,28 @@ impl Gpu {
         let Some(pages) = atlas::max_atlas_pages() else {
             return;
         };
-        let (Some(glyph), Some(rect)) = (GlyphProgram::new(gl, pages), RectProgram::new(gl)) else {
+        // Links on the GPU process's worker threads where it has them
+        let _ = gl.get_extension("KHR_parallel_shader_compile");
+        let (Some(glyph), Some(rect)) = (GlyphProgram::start(gl, pages), RectProgram::start(gl))
+        else {
+            return;
+        };
+        self.linking = Some(Linkings {
+            pages,
+            glyph,
+            rect,
+            image: ImageProgram::start(gl),
+        });
+    }
+
+    /// The programs [`Self::build`] started, waiting for their links if they still run.
+    fn finish_build(&mut self) {
+        let Some(l) = self.linking.take() else { return };
+        let gl = &self.gl;
+        let (Some(glyph), Some(rect)) = (
+            GlyphProgram::new(gl, l.glyph, l.pages),
+            RectProgram::new(gl, l.rect),
+        ) else {
             return;
         };
         // Glyphs blend over the backgrounds
@@ -435,7 +473,7 @@ impl Gpu {
         self.programs = Some(Programs {
             glyph,
             rect,
-            image: ImageProgram::new(gl),
+            image: l.image.and_then(|image| ImageProgram::new(gl, image)),
         });
     }
 
@@ -537,6 +575,9 @@ impl Gpu {
     }
 
     fn draw(&mut self, frame: Frame<'_>) -> bool {
+        if self.live {
+            self.finish_build();
+        }
         if !self.live || self.programs.is_none() || frame.width < 1.0 || frame.height < 1.0 {
             return false;
         }
@@ -664,6 +705,7 @@ impl Gpu {
         self.live = false;
         // The context's objects are gone with it
         self.programs = None;
+        self.linking = None;
         self.textures.clear();
         self.image_textures.clear();
         self.restore_timeout = Some(Timeout::new(CONTEXT_RESTORE_TIMEOUT, || {
