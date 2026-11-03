@@ -248,22 +248,52 @@ pub(crate) fn ansi<T: EventListener>(
 // From here on, code ported from wmux native_serialize.rs. Changes: listener generic, rejection enum,
 // tab cells as spaces, DECOM before the cursor.
 
+/// Appends `n` in decimal without the `fmt` machinery (hot: once per colour per pen change).
+fn num(out: &mut String, n: u32) {
+    let mut buf = [0u8; 10];
+    let mut i = buf.len();
+    let mut n = n;
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    for &d in &buf[i..] {
+        out.push(d as char);
+    }
+}
+
 fn color(out: &mut String, value: Color, foreground: bool) {
     let base = if foreground { 38 } else { 48 };
     match value {
         Color::Spec(rgb) => {
-            let _ = write!(out, ";{base};2;{};{};{}", rgb.r, rgb.g, rgb.b);
+            out.push(';');
+            num(out, base);
+            out.push_str(";2;");
+            num(out, rgb.r as u32);
+            out.push(';');
+            num(out, rgb.g as u32);
+            out.push(';');
+            num(out, rgb.b as u32);
         }
         Color::Indexed(index) => {
-            let _ = write!(out, ";{base};5;{index}");
+            out.push(';');
+            num(out, base);
+            out.push_str(";5;");
+            num(out, index as u32);
         }
         Color::Named(NamedColor::Foreground | NamedColor::Background) => {}
         Color::Named(value) => {
             let index = value as u32;
             if index < 8 {
-                let _ = write!(out, ";{}", (if foreground { 30 } else { 40 }) + index);
+                out.push(';');
+                num(out, (if foreground { 30 } else { 40 }) + index);
             } else if index < 16 {
-                let _ = write!(out, ";{}", (if foreground { 90 } else { 100 }) + index - 8);
+                out.push(';');
+                num(out, (if foreground { 90 } else { 100 }) + index - 8);
             }
         }
     }
@@ -309,7 +339,8 @@ fn style(out: &mut String, cell: &Cell) {
         (Flags::STRIKEOUT, 9),
     ] {
         if cell.flags.contains(flag) {
-            let _ = write!(out, ";{code}");
+            out.push(';');
+            num(out, code);
         }
     }
     let underline = if cell.flags.contains(Flags::DOUBLE_UNDERLINE) {
@@ -326,7 +357,8 @@ fn style(out: &mut String, cell: &Cell) {
         None
     };
     if let Some(kind) = underline {
-        let _ = write!(out, ";4:{kind}");
+        out.push_str(";4:");
+        num(out, kind);
     }
     color(out, cell.fg, true);
     color(out, cell.bg, false);
@@ -459,10 +491,10 @@ struct Rows {
     /// The pen of the last SGR written; `None` writes the next one.
     previous_pen: Option<Pen>,
     previous_style: String,
-    /// Where the next SGR is built, to compare with the last one.
-    next_style: String,
     previous_link: Option<Hyperlink>,
     columns: usize,
+    /// A row written so far has a wide char missing one of its halves (as [`split_wide`] finds).
+    split: bool,
 }
 
 impl Rows {
@@ -472,12 +504,15 @@ impl Rows {
             return;
         }
         self.previous_pen = Some(pen);
-        // Pens can differ and still write the same SGR (colours it leaves out).
-        self.next_style.clear();
-        style(&mut self.next_style, cell);
-        if self.next_style != self.previous_style {
-            out.push_str(&self.next_style);
-            std::mem::swap(&mut self.next_style, &mut self.previous_style);
+        // Pens can differ and still write the same SGR (colours it leaves out): written in place, taken back when
+        // it repeats the last one.
+        let start = out.len();
+        style(out, cell);
+        if out[start..] == self.previous_style {
+            out.truncate(start);
+        } else {
+            self.previous_style.clear();
+            self.previous_style.push_str(&out[start..]);
         }
     }
 
@@ -504,8 +539,12 @@ impl Rows {
         // Erased cells not written yet, all with the same background
         let (mut gap, mut gap_bg) = (0, Color::Named(NamedColor::Background));
         let mut used = 0;
+        let mut leader = false;
         for cell in &line[..] {
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+            let spacer = cell.flags.contains(Flags::WIDE_CHAR_SPACER);
+            self.split |= spacer != leader;
+            leader = cell.flags.contains(Flags::WIDE_CHAR);
+            if spacer {
                 used += 1;
                 continue;
             }
@@ -533,6 +572,7 @@ impl Rows {
             glyph(out, cell);
             used += 1;
         }
+        self.split |= leader;
         let wrapped = line[Column(self.columns - 1)]
             .flags
             .contains(Flags::WRAPLINE);
@@ -577,13 +617,14 @@ impl Rows {
 
 /// `older` is the compressed history older than this grid (primary screen only); the oldest `skip` history rows
 /// are left out.
-fn screen(out: &mut String, grid: &Grid<Cell>, older: Option<&History>, skip: usize) {
+/// Returns whether a written row has a wide char missing one of its halves.
+fn screen(out: &mut String, grid: &Grid<Cell>, older: Option<&History>, skip: usize) -> bool {
     let mut rows = Rows {
         previous_pen: None,
         previous_style: String::new(),
-        next_style: String::new(),
         previous_link: None,
         columns: grid.columns(),
+        split: false,
     };
     let older_len = older.map_or(0, History::len);
     let total = older_len + grid.history_size() + grid.screen_lines();
@@ -606,6 +647,7 @@ fn screen(out: &mut String, grid: &Grid<Cell>, older: Option<&History>, skip: us
     if rows.previous_link.is_some() {
         link(out, None);
     }
+    rows.split
 }
 
 /// Whether a wide char in `row` lacks one of its halves.
@@ -655,11 +697,6 @@ fn serialize<T: EventListener>(
             }
         }
     }
-    if let Some(older) = older {
-        if (skip.min(older_len)..older_len).any(|i| split_wide(&older.row(i))) {
-            return Err(SnapshotRefusal::WideEdge);
-        }
-    }
     let mut out = String::new();
     let modes = term.mode();
     let alt = modes.contains(TermMode::ALT_SCREEN);
@@ -673,7 +710,9 @@ fn serialize<T: EventListener>(
     }
     out.push_str("\x1b[0m\x1b[?6l\x1b[?7h\x1b[4l\x1b[H");
     if alt {
-        screen(&mut out, term.inactive_grid(), older, skip);
+        if screen(&mut out, term.inactive_grid(), older, skip) {
+            return Err(SnapshotRefusal::WideEdge);
+        }
         cursor(&mut out, term.inactive_grid());
         // Each screen's cursor has its own charsets. While the alternate screen is shown, the primary one's saved
         // cursor is its cursor (1049 saves it on entering).
@@ -697,8 +736,8 @@ fn serialize<T: EventListener>(
     }
     if alt {
         screen(&mut out, term.grid(), None, 0);
-    } else {
-        screen(&mut out, term.grid(), older, skip);
+    } else if screen(&mut out, term.grid(), older, skip) {
+        return Err(SnapshotRefusal::WideEdge);
     }
     if options.exclude_modes {
         cursor(&mut out, term.grid());
