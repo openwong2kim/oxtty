@@ -291,12 +291,13 @@ impl std::ops::Deref for HeldRow<'_> {
 const ROW_CACHE_SPARE: usize = 8;
 
 /// A history row in the row cache: its cells as [`Engine::row_packed`] gives them (16 bytes a cell, not the 24 of a
-/// decoded cell), and the decoded row only when a cell has an extra, as a renderer reads [`Engine::row_extras`] of
-/// those rows alone.
+/// decoded cell), or, for a row with extras, the decoded row instead, as a renderer reads [`Engine::row_extras`] of
+/// those rows too (`row_packed` packs it on each read).
 struct CachedRow {
     id: u64,
     /// When it was last read (`RowCache::reads`).
     read: u64,
+    /// Empty when `row` is kept.
     packed: Vec<u32>,
     row: Option<Row<AlacCell>>,
 }
@@ -699,8 +700,12 @@ impl Engine {
                 entry.row = None;
                 if cfg!(target_arch = "wasm32") || !read_packed(stored, i, &mut entry.packed) {
                     let row = decode(stored, i);
-                    pack_row(&row, &mut entry.packed);
-                    entry.row = row[..].iter().any(|c| c.extra.is_some()).then_some(row);
+                    if row[..].iter().any(|c| c.extra.is_some()) {
+                        entry.packed = Vec::new();
+                        entry.row = Some(row);
+                    } else {
+                        pack_row(&row, &mut entry.packed);
+                    }
                 }
                 at
             }
@@ -1002,8 +1007,14 @@ impl Engine {
     pub fn row_packed(&self, line: i32, out: &mut Vec<u32>) -> bool {
         // A scrolled-back view redraws the same history rows every frame: they are copied from the row cache
         if let Some((stored, i)) = self.history_row(line).filter(|_| self.display_offset() > 0) {
-            out.clear();
-            out.extend_from_slice(&self.cached(stored, i).packed);
+            let cached = self.cached(stored, i);
+            match &cached.row {
+                Some(row) => pack_row(row, out),
+                None => {
+                    out.clear();
+                    out.extend_from_slice(&cached.packed);
+                }
+            }
             return true;
         }
         let found = self.with_row(line, |row| pack_row(row, out)).is_some();
