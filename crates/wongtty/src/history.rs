@@ -47,7 +47,6 @@ const WIDE: u8 = 1 << 5;
 const DEFAULT_FG: Color = Color::Named(NamedColor::Foreground);
 const DEFAULT_BG: Color = Color::Named(NamedColor::Background);
 
-#[derive(Debug)]
 struct Block {
     /// Absolute number of the block's first row.
     first: u64,
@@ -77,7 +76,6 @@ impl Block {
 
 type Extras = Box<[(u16, Arc<CellExtra>)]>;
 
-#[derive(Debug)]
 pub(crate) struct History {
     limit: usize,
     blocks: VecDeque<Block>,
@@ -97,6 +95,16 @@ pub(crate) struct History {
     /// changes none of as they are stored (`Above`) and sets this instead: their cells past the width they are
     /// read at are default blanks, as are the cells a wider read adds.
     cols: usize,
+}
+
+/// The counts only: the rows are bytes (`HistorySink` asks for `Debug`).
+impl std::fmt::Debug for History {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("History")
+            .field("first", &self.first)
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
 }
 
 impl History {
