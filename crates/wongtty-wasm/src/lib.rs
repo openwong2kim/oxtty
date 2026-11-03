@@ -141,10 +141,11 @@ pub extern "C" fn wongtty_out_len() -> u32 {
     OUT.with_borrow(|out| out.len() as u32)
 }
 
-/// Frees OUT, once the host has copied a large result (a snapshot) out of it.
+/// Frees OUT and OUT32, once the host has copied a large result (a snapshot, many rows' text or matches) out of them.
 #[no_mangle]
 pub extern "C" fn wongtty_out_release() {
     OUT.with_borrow_mut(|out| *out = Vec::new());
+    OUT32.with_borrow_mut(|out| *out = Vec::new());
 }
 
 #[no_mangle]
@@ -631,8 +632,8 @@ pub extern "C" fn wongtty_set_windows_pty(h: u32, backend: u32, build: f64) {
 // which the engine matches without case tables (`Engine::search_rows_ascii`); a regex engine and the Unicode case
 // tables stay out of the wasm to keep it small.
 
-/// `Engine::search_rows_ascii` of the query staged at `ptr`: `first`, `last` (i32) and `limit` (u32), little-endian,
-/// then the UTF-8 query, `len` bytes in all. `flags` bit 0: case-sensitive, bit 1: whole word, bit 2: -2 instead of
+/// `Engine::search_rows_ascii` of the query staged at `ptr`: `first`, `last` (i32), `limit` (u32) and the cell
+/// matches start at or after, line (i32) and col (u32), little-endian, then the UTF-8 query, `len` bytes in all. `flags` bit 0: case-sensitive, bit 1: whole word, bit 2: -2 instead of
 /// matches when a line with one folds longer (U+0130). Returns the match count with `[start line, start col, end
 /// line, end col]` per match in OUT32, or -1 for a query that is not ASCII (the host matches it itself). Four
 /// parameters, as the host's export wrapper passes.
@@ -642,7 +643,7 @@ pub extern "C" fn wongtty_set_windows_pty(h: u32, backend: u32, build: f64) {
 #[no_mangle]
 pub unsafe extern "C" fn wongtty_search_rows(h: u32, ptr: *const u8, len: u32, flags: u32) -> i32 {
     let staged = std::slice::from_raw_parts(ptr, len as usize);
-    let Some((head, query)) = staged.split_first_chunk::<12>() else {
+    let Some((head, query)) = staged.split_first_chunk::<20>() else {
         return -1;
     };
     let word = |i: usize| i32::from_le_bytes([head[i], head[i + 1], head[i + 2], head[i + 3]]);
@@ -656,7 +657,8 @@ pub unsafe extern "C" fn wongtty_search_rows(h: u32, ptr: *const u8, len: u32, f
     with(h, -1, |t| {
         let mut found = Vec::new();
         let limit = word(8) as u32 as usize;
-        match t.search_rows_ascii(query, options, word(0), word(4), limit, &mut found) {
+        let from = (word(12), word(16).clamp(0, u16::MAX as i32) as u16);
+        match t.search_rows_ascii(query, options, word(0), word(4), from, limit, &mut found) {
             None => return -1,
             Some(true) if flags & 4 != 0 => return -2,
             Some(_) => {}

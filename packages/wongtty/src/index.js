@@ -106,6 +106,8 @@ const wordsOut = (n) => (n <= 0 ? new Uint32Array(0) : new Uint32Array(wasm.memo
 
 /** Rows `textRows` asks the engine for at a time, so the text it holds in its memory stays small. */
 const TEXT_BLOCK = 1024;
+/** Matches `searchRows` asks the engine for at a time (16 bytes each in its memory), so a common query does not grow it. */
+const MATCH_PAGE = 4096;
 
 /** `@xterm/addon-search` `NON_WORD_CHARACTERS`: what ends a word for `wholeWord`. */
 const NON_WORD = ' ~!@#$%^&*()+`-=[]{}|\\;:"\',./<>?';
@@ -722,11 +724,18 @@ export class Terminal {
   searchRows(query, options = {}, first, last) {
     const out = [];
     if (!query) return out;
-    const m = options.regex ? null : this.searchRowsView(query, options, first, last);
-    if (m) {
+    // Page by page, each from just after the last match
+    for (let line = -0x80000000, col = 0; !options.regex; ) {
+      const m = this.#searchRowsAt(query, options, first, last, MATCH_PAGE, line, col);
+      if (!m) break;
       for (let i = 0; i < m.length; i += 4) out.push({ startLine: m[i], startCol: m[i + 1], endLine: m[i + 2], endCol: m[i + 3] });
-      return out;
+      if (m.length < MATCH_PAGE * 4) {
+        wasm.wongtty_out_release();
+        return out;
+      }
+      [line, col] = [m[m.length - 4], m[m.length - 3] + 1];
     }
+    out.length = 0;
     const re = this.#matcher(query, options);
     last = Math.min(last, this.rows - 1);
     let found = this.searchLine(Math.max(first, -this.historyLength));
@@ -747,17 +756,29 @@ export class Terminal {
    * match holds U+0130 (İ): ignoring case it lowercases to two characters, where a host that lowercases whole lines
    * (`@xterm/addon-search`) places matches differently. @returns {Int32Array | null}
    */
-  searchRowsView(query, { caseSensitive = false, wholeWord = false, keepLength = false } = {}, first, last, limit = 0xffffffff) {
+  searchRowsView(query, options = {}, first, last, limit = 0xffffffff) {
+    return this.#searchRowsAt(query, options, first, last, limit, -0x80000000, 0);
+  }
+
+  // `searchRowsView` of the matches starting at or after cell (`line`, `col`).
+  #searchRowsAt(query, { caseSensitive = false, wholeWord = false, keepLength = false }, first, last, limit, line, col) {
     const h = this.#handle();
+    // Bounds past the buffer (±Infinity too) are its ends, as the RegExp path reads them; NaN finds nothing
+    first = Math.max(first, -this.historyLength);
+    last = Math.min(last, this.rows - 1);
+    if (!(first <= last)) return new Int32Array(0);
     const bytes = encoder.encode(query);
-    const ptr = this.#reserve(12 + bytes.length);
-    const head = new DataView(wasm.memory.buffer, ptr, 12);
+    const ptr = this.#reserve(20 + bytes.length);
+    const head = new DataView(wasm.memory.buffer, ptr, 20);
     head.setInt32(0, first, true);
     head.setInt32(4, last, true);
     head.setUint32(8, Math.min(limit, 0xffffffff), true);
-    new Uint8Array(wasm.memory.buffer, ptr + 12, bytes.length).set(bytes);
+    head.setInt32(12, line, true);
+    head.setUint32(16, col, true);
+    new Uint8Array(wasm.memory.buffer, ptr + 20, bytes.length).set(bytes);
     const flags = (caseSensitive ? 1 : 0) | (wholeWord ? 2 : 0) | (keepLength ? 4 : 0);
-    const n = wasm.wongtty_search_rows(h, ptr, 12 + bytes.length, flags);
+    const n = wasm.wongtty_search_rows(h, ptr, 20 + bytes.length, flags);
+    this.#shrinkInput();
     return n < 0 ? null : new Int32Array(wasm.memory.buffer, wasm.wongtty_out32_ptr(), n * 4);
   }
 

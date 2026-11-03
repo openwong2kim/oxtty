@@ -424,6 +424,27 @@ test('searchRows of a plain ASCII query, matched in the engine, finds what the p
   assert.ok(matches > 5000, `${matches}`);
 });
 
+test('searchRows pages through many matches and reads bounds past the buffer as its ends', () => {
+  const t = new Terminal({ cols: 50, rows: 4, scrollback: 1000 });
+  // 1,003 lines of 20 matches each, wrapped: more than one page of engine matches
+  for (let i = 0; i < 1003; i++) t.write(`${'e'.repeat(37)} ee E${'e'.repeat(13)}e\r\n`);
+  const at = (m) => [m.startLine, m.startCol, m.endLine, m.endCol];
+  const [top, bottom] = [-t.historyLength, t.rows - 1];
+  for (const q of ['ee', 'e']) {
+    const want = t.searchRows(q, { regex: true }, top, bottom).map(at);
+    assert.ok(want.length > 9000, `${want.length}`);
+    assert.deepEqual(t.searchRows(q, {}, top, bottom).map(at), want, q);
+    for (const [first, last] of [[-Infinity, Infinity], [Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER], [-(2 ** 31) - 5, 2 ** 31 + 5]]) {
+      assert.deepEqual(t.searchRows(q, {}, first, last).map(at), want, `${q} ${first} ${last}`);
+      assert.equal(t.searchRowsView(q, {}, first, last, 3).length, 12);
+    }
+  }
+  assert.deepEqual(t.searchRows('e', {}, NaN, 0), []);
+  assert.deepEqual(t.searchRows('e', {}, 0, NaN), []);
+  assert.equal(t.searchRowsView('e', {}, NaN, NaN).length, 0);
+  t.dispose();
+});
+
 test('searchRows folds case as the N-API binding does; searchRowsView refuses lines that fold longer on request', () => {
   const t = new Terminal({ cols: 20, rows: 3, scrollback: 10 });
   t.write('K x\r\nx İx\r\nKX');
