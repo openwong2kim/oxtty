@@ -158,7 +158,7 @@ does, 17 terminals take 5.1 MiB of engine memory instead of 41.1 MiB
 
 | Module | Bytes | gzip | Budget |
 | --- | ---: | ---: | --- |
-| Engine `wongtty.wasm` | 342,597 | 127,977 | 340 KiB |
+| Engine `wongtty.wasm` | 342,597 | 127,977 | 360 KiB raw, 135 KiB gzip |
 | Front end `xterm_web_bg.wasm` (`wongtty/xterm` only) | 781,162 | 295,833 | 800 KiB raw, 300 KiB gzip |
 
 One instance of each serves every terminal on a page, so the code is paid

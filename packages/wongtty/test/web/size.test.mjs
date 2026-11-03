@@ -5,9 +5,10 @@ import { readFile } from 'node:fs/promises';
 import { gzipSync } from 'node:zlib';
 
 const KiB = 1024;
-// Raw limits are the PRD's; gzip limits keep the ratio both modules have today (about 0.36) with room to grow.
+// Raw limits are the PRD's; gzip limits keep the ratio both modules have today (about 0.36) with room to grow. The
+// owner raised the engine's on 2026-11-03, from 340 KiB raw and 125 KiB gzipped, for its textRows and searchRows exports.
 const LIMITS = {
-  'wongtty.wasm': { bytes: 340 * KiB, gzip: 125 * KiB },
+  'wongtty.wasm': { bytes: 360 * KiB, gzip: 135 * KiB },
   'xterm_web_bg.wasm': { bytes: 800 * KiB, gzip: 300 * KiB },
 };
 
