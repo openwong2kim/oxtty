@@ -186,6 +186,13 @@ impl History {
             return;
         }
         let abs = self.first + self.len as u64;
+        // Rows are read at `cols`: one stored at another width would read back cut or padded.
+        debug_assert!(
+            self.cols == 0 || row.len() == self.cols,
+            "row of {} cells, history at {}",
+            row.len(),
+            self.cols
+        );
         let scan = scan_len(row);
         // A wrapped row ends with `WRAPLINE`. One that a resize without reflow grew keeps it where it was, at its
         // last cell that is not a default blank: a read at that width would end with it.
@@ -378,7 +385,7 @@ impl HistorySink<Cell> for History {
     }
 
     fn clear(&mut self) {
-        let freed = !self.blocks.is_empty();
+        let freed = !self.blocks.is_empty() || self.spare.is_some();
         self.drop_all();
         // The next row gets a block when it comes: none is kept for it.
         self.spare = None;
@@ -391,7 +398,7 @@ impl HistorySink<Cell> for History {
 
 impl Drop for History {
     fn drop(&mut self) {
-        if !self.blocks.is_empty() {
+        if !self.blocks.is_empty() || self.spare.is_some() {
             self.blocks.clear();
             self.spare = None;
             release_freed();
@@ -399,10 +406,18 @@ impl Drop for History {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The `release_freed` calls on this thread, for the tests.
+    static RELEASES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Has the system allocator hand back the memory of the blocks just freed
 /// (native builds): the macOS allocator keeps freed blocks of `BLOCK_BYTES` in
 /// the footprint otherwise, which then stays as large as the history was.
 fn release_freed() {
+    #[cfg(test)]
+    RELEASES.with(|n| n.set(n.get() + 1));
     #[cfg(target_os = "macos")]
     {
         unsafe extern "C" {
@@ -803,7 +818,10 @@ fn shrink_row(
 /// this before feeding it: the primary grid then keeps the newest `RECENT`
 /// history rows and hands older ones here. Rows are numbered oldest first and
 /// sit above the grid's own history; they belong to the primary screen. Resize
-/// through [`TermHistory::resize`] so that reflow sees the whole history.
+/// through [`TermHistory::resize`] so that reflow sees the whole history: a
+/// column change records the width rows are read at, which has to stay the
+/// primary grid's width, so a [`Term::resize`] past this would have rows
+/// stored at the new width read back at the old one.
 #[derive(Clone)]
 pub struct TermHistory {
     inner: Arc<Mutex<History>>,
@@ -879,6 +897,8 @@ impl TermHistory {
         let mut stored = self.lock();
         let sink = grid.set_history_sink(None);
         let (next, cleared, limit) = (stored.id(stored.len()), stored.cleared, stored.limit);
+        let blocks = stored.blocks.len() + stored.spare.is_some() as usize;
+        let columns_change = columns != grid.columns();
 
         // The rows the grid takes back, newest first: two screens' worth (old
         // and new height), and the rest of the cursor paragraph if it reaches
@@ -972,10 +992,18 @@ impl TermHistory {
         while rows.len() > limit {
             rows.pop_oldest();
         }
+        // A block a column change emptied is kept as the spare, which only a full history (`pop_oldest`) needs.
+        if rows.len() < limit {
+            rows.spare = None;
+        }
+        let freed = rows.blocks.len() + (rows.spare.is_some() as usize) < blocks;
         *stored = rows;
         drop(stored);
-        // The rows the grid took back and reflowed were freed again.
-        release_freed();
+        // A column change frees the rows the grid took back and reflowed (about 0.6 MiB at 120x40 that the
+        // allocator keeps otherwise); a row change frees them too, but no more than the next one takes again.
+        if freed || (columns_change && n > 0) {
+            release_freed();
+        }
         offset
     }
 
@@ -2195,6 +2223,35 @@ mod tests {
         assert_eq!(offset, 0);
     }
 
+    /// Rows are read at the width of the last column change, so one stored at another width is a misuse.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "history at 100")]
+    fn a_row_at_another_width_than_rows_are_read_at_panics() {
+        let mut history = History::new(10);
+        history.cols = 100;
+        history.push(&mut Row::<Cell>::new(160));
+    }
+
+    /// A history holding only its spare block frees it on a clear and on drop, and has the allocator hand it back.
+    #[test]
+    fn a_spare_block_alone_is_released() {
+        let releases = || RELEASES.with(|n| n.get());
+        let before = releases();
+        let mut history = History::new(10);
+        history.spare = Some(Block::new(BLOCK_BYTES));
+        history.clear();
+        assert!(history.spare.is_none());
+        assert_eq!(releases(), before + 1);
+        history.clear();
+        assert_eq!(releases(), before + 1, "nothing to free");
+        history.spare = Some(Block::new(BLOCK_BYTES));
+        drop(history);
+        assert_eq!(releases(), before + 2);
+        drop(History::new(10));
+        assert_eq!(releases(), before + 2, "nothing to free");
+    }
+
     /// A row too large for a `BLOCK_BYTES` block gets a block of its own and leaves the kept spare block in place.
     #[test]
     fn large_row_keeps_the_spare() {
@@ -2606,10 +2663,13 @@ mod oracle {
             .unwrap_or(default)
     }
 
-    fn run(seed: u64, seen: &mut Seen, logs: bool) {
+    /// One run of resizes after output. `wide` takes widths up to 250 columns, and every other engine run behaves
+    /// as with a Windows PTY that does not reflow (`Engine::set_windows_pty`).
+    fn run(seed: u64, seen: &mut Seen, logs: bool, wide: bool) {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         let engine = seed % 3 != 0;
-        let (mut cols, mut rows) = (rng.below(38) as usize + 2, rng.below(8) as usize + 1);
+        let max_cols = if wide { 248 } else { 38 };
+        let (mut cols, mut rows) = (rng.below(max_cols) as usize + 2, rng.below(8) as usize + 1);
         let scrollback = if logs {
             [2000, 5000, 12000][rng.below(3) as usize]
         } else {
@@ -2617,6 +2677,12 @@ mod oracle {
         };
         let mut a = Side::new(engine, cols, rows, scrollback);
         let mut b = Side::new(engine, cols, rows, scrollback);
+        if wide && engine && seed % 2 == 0 {
+            // Conpty before 21376 marks rows as wrapped by its heuristic; another backend does not.
+            let heuristic = seed % 4 == 0;
+            a.term.set_windows_pty(false, false, heuristic);
+            b.term.set_windows_pty(false, false, heuristic);
+        }
         let mut offset = 0;
         for step in 0..10 {
             let tokens = rng.below(400);
@@ -2644,10 +2710,10 @@ mod oracle {
             };
             let (old_cols, old_rows) = (cols, rows);
             match rng.below(4) {
-                0 => cols = rng.below(38) as usize + 2,
+                0 => cols = rng.below(max_cols) as usize + 2,
                 1 => rows = rng.below(10) as usize + 1,
                 _ => {
-                    cols = rng.below(38) as usize + 2;
+                    cols = rng.below(max_cols) as usize + 2;
                     rows = rng.below(10) as usize + 1;
                 }
             }
@@ -2756,7 +2822,7 @@ mod oracle {
     fn reflow_matches_the_whole_history_in_the_grid() {
         let mut seen = Seen::default();
         for seed in 1..=cases(600) {
-            run(seed, &mut seen, false);
+            run(seed, &mut seen, false, false);
         }
         // The cases the reflow has to get right all came up.
         assert!(seen.split > 1000, "{seen:?}");
@@ -2774,9 +2840,58 @@ mod oracle {
     fn reflow_keeps_unchanged_blocks_as_the_whole_history_in_the_grid() {
         let mut seen = Seen::default();
         for seed in 1..=cases(600) / 15 {
-            run(seed, &mut seen, true);
+            run(seed, &mut seen, true, false);
         }
         assert!(seen.kept > 100 && seen.stored > 100, "{seen:?}");
+        eprintln!("{seen:?}");
+    }
+
+    /// A resize has the allocator hand memory back only after a column change of rows held here, or one that
+    /// drops blocks; a history that is not full keeps no spare block after it.
+    #[test]
+    fn reflow_releases_only_after_a_column_change() {
+        let releases = || RELEASES.with(|n| n.get());
+        let resize = |side: &mut Side, cols: usize, rows: usize| {
+            let before = releases();
+            side.history
+                .reflow(&mut side.term, TermSize::new(cols, rows), 0);
+            releases() - before
+        };
+        let mut side = Side::new(true, 120, 40, 10_000);
+        assert_eq!(resize(&mut side, 100, 40), 0, "empty history");
+        let mut log = String::new();
+        for n in 0..6000 {
+            if n % 150 == 149 {
+                log.push_str(&"L".repeat(158));
+            } else {
+                log.push_str(&format!("{n} line of a log {}", "x".repeat(n % 40)));
+            }
+            log.push_str("\r\n");
+        }
+        side.feed(log.as_bytes());
+        assert!(side.history.len() > 5000);
+        assert_eq!(resize(&mut side, 100, 30), 0, "rows only");
+        assert_eq!(resize(&mut side, 100, 40), 0, "rows only");
+        for (i, cols) in [120, 100, 120, 100, 120].into_iter().enumerate() {
+            assert_eq!(resize(&mut side, cols, 40), 1, "column change {i}");
+            assert!(side.history.lock().spare.is_none(), "column change {i}");
+        }
+    }
+
+    /// The same at widths up to 250 columns, and without reflow (a Windows PTY).
+    #[test]
+    fn reflow_matches_at_wide_columns_and_without_reflow() {
+        let mut seen = Seen::default();
+        for seed in 1..=cases(600) / 10 {
+            run(seed, &mut seen, false, true);
+        }
+        for seed in 1..=cases(600) / 60 {
+            run(seed, &mut seen, true, true);
+        }
+        assert!(
+            seen.split > 100 && seen.kept > 100 && seen.stored > 100,
+            "{seen:?}"
+        );
         eprintln!("{seen:?}");
     }
 }
