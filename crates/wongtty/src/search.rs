@@ -569,25 +569,42 @@ impl Engine {
         last: i32,
         out: &mut Vec<SearchMatch>,
     ) {
-        if !self.search_rows_ascii(query, options, first, last, out) {
+        if self
+            .search_rows_ascii(query, options, first, last, usize::MAX, out)
+            .is_none()
+        {
             let needle = Self::query(query, options);
-            self.search_rows_with(&needle, options, first, last, None, out);
+            self.search_rows_with(
+                &needle,
+                options,
+                (first, last),
+                None,
+                Text::fold,
+                usize::MAX,
+                out,
+            );
         }
     }
 
-    /// [`Engine::search_rows`] of an ASCII query, which needs no case tables; false, finding nothing, for any other
-    /// query. History lines whose text lacks a character of the query are skipped without being read.
-    fn search_rows_ascii(
+    /// The first `limit` matches of [`Engine::search_rows`] for an ASCII query, which needs no case tables (a
+    /// WebAssembly host links only this); `None`, finding nothing, for any other query. History lines whose text
+    /// lacks a character of the query are skipped without being read.
+    ///
+    /// `Some(true)` when, ignoring case, a line with a match holds U+0130 (İ), which lowercases to two characters:
+    /// a host that lowercases a whole line and reads match positions in the original text (`@xterm/addon-search`)
+    /// places that line's matches elsewhere, so it must match there itself.
+    pub fn search_rows_ascii(
         &self,
         query: &str,
         options: SearchOptions,
         first: i32,
         last: i32,
+        limit: usize,
         out: &mut Vec<SearchMatch>,
-    ) -> bool {
+    ) -> Option<bool> {
         out.clear();
         if !query.is_ascii() {
-            return false;
+            return None;
         }
         let needle: Vec<char> = if options.case_sensitive {
             query.chars().collect()
@@ -595,25 +612,37 @@ impl Engine {
             query.chars().map(|c| c.to_ascii_lowercase()).collect()
         };
         let required = Self::required(&needle, options);
-        self.search_rows_with(&needle, options, first, last, Some(required), out);
-        true
+        Some(self.search_rows_with(
+            &needle,
+            options,
+            (first, last),
+            Some(required),
+            Text::fold_ascii,
+            limit,
+            out,
+        ))
     }
 
-    /// `search_rows` of a folded `needle`, ASCII when `required` holds the bytes its lines need (`lacks`).
+    /// `search_rows` of a folded `needle` over rows `first..=last`, ASCII when `required` holds the bytes its lines
+    /// need (`lacks`), with lines lowercased by `fold` when ignoring case (`Text::fold_ascii` links in no case
+    /// tables), up to `limit` matches; whether a line with a match grew when folded (U+0130, `search_rows_ascii`).
+    #[allow(clippy::too_many_arguments)]
     fn search_rows_with(
         &self,
         needle: &[char],
         options: SearchOptions,
-        first: i32,
-        last: i32,
+        (first, last): (i32, i32),
         required: Option<u128>,
+        fold: impl Fn(Text) -> Text,
+        limit: usize,
         out: &mut Vec<SearchMatch>,
-    ) {
+    ) -> bool {
         out.clear();
         let last = last.min(self.rows() as i32 - 1);
-        if needle.is_empty() || last < first.max(self.top_line()) {
-            return;
+        if needle.is_empty() || last < first.max(self.top_line()) || limit == 0 {
+            return false;
         }
+        let mut grew = false;
         let cols = self.cols() as u32;
         let mut line = self.line_start(first.max(self.top_line()));
         let (mut chars, mut cells) = (Vec::new(), Vec::new());
@@ -624,8 +653,9 @@ impl Engine {
                 continue;
             }
             let Some(rows) = self.read_line_into(line, &mut chars, &mut cells) else {
-                return;
+                return grew;
             };
+            let read = chars.len();
             let mut text = Text {
                 first: line,
                 rows,
@@ -633,23 +663,24 @@ impl Engine {
                 cells: std::mem::take(&mut cells),
             };
             if !options.case_sensitive {
-                text = if required.is_some() {
-                    text.fold_ascii()
-                } else {
-                    text.fold()
-                };
+                text = fold(text);
             }
             let mut at = 0;
             while let Some(s) = text.next(needle, at, options.whole_word) {
                 let found = text.found(s, needle.len(), cols);
                 if found.end_line >= first && found.start_line <= last {
+                    grew |= text.chars.len() != read;
                     out.push(found);
+                    if out.len() >= limit {
+                        return grew;
+                    }
                 }
                 at = s + needle.len();
             }
             line += text.rows;
             (chars, cells) = (text.chars, text.cells);
         }
+        grew
     }
 
     /// The logical line row `line` belongs to, as search reads it; `None` outside the buffer.
@@ -811,7 +842,15 @@ mod tests {
                     };
                     let (mut got, mut full, mut want) = (Vec::new(), Vec::new(), Vec::new());
                     packed.search_rows(q, o, top, bottom, &mut got);
-                    packed.search_rows_with(&Engine::query(q, o), o, top, bottom, None, &mut full);
+                    packed.search_rows_with(
+                        &Engine::query(q, o),
+                        o,
+                        (top, bottom),
+                        None,
+                        Text::fold,
+                        usize::MAX,
+                        &mut full,
+                    );
                     plain.search_rows(q, o, top, bottom, &mut want);
                     assert_eq!(got, full, "round {round} {q:?} {o:?}");
                     assert_eq!(got, want, "round {round} {q:?} {o:?}");
@@ -832,6 +871,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ascii_rows_stop_at_the_limit_and_flag_lines_that_fold_longer() {
+        let mut t = Engine::new(20, 4, 100);
+        t.feed(b"foo foo\r\nx\xc4\xb0 foo\r\nFOO");
+        let o = SearchOptions::default();
+        let (mut all, mut some) = (Vec::new(), Vec::new());
+        t.search_rows("foo", o, -9, 9, &mut all);
+        assert_eq!(all.len(), 4);
+        assert_eq!(
+            t.search_rows_ascii("foo", o, -9, 9, 2, &mut some),
+            Some(false)
+        );
+        assert_eq!(some, all[..2]);
+        // The line with İ has a match: lowercased, it is a character longer
+        assert_eq!(
+            t.search_rows_ascii("foo", o, -9, 9, 3, &mut some),
+            Some(true)
+        );
+        assert_eq!(some, all[..3]);
+        assert_eq!(t.search_rows_ascii("x", o, -9, 9, 9, &mut some), Some(true));
+        // Case-sensitive, nothing is lowercased; the second row matches nothing
+        let cs = SearchOptions {
+            case_sensitive: true,
+            whole_word: false,
+        };
+        assert_eq!(
+            t.search_rows_ascii("FOO", cs, -9, 9, 9, &mut some),
+            Some(false)
+        );
+        assert_eq!(some.len(), 1);
+        assert_eq!(t.search_rows_ascii("한", o, -9, 9, 9, &mut some), None);
+        assert_eq!(
+            t.search_rows_ascii("foo", o, -9, 9, 0, &mut some),
+            Some(false)
+        );
+        assert!(some.is_empty());
     }
 
     #[test]

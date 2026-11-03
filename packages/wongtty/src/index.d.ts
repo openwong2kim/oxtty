@@ -86,12 +86,16 @@ export interface Hook {
 
 /** How `searchNext` and friends compare text. */
 export interface SearchOptions {
-  /** Off: matched with the RegExp `i` flag. */
+  /**
+   * Off: matched with the RegExp `i` flag, but by `searchRows` of a plain ASCII query, which the engine matches
+   * with each line lowercased as the N-API binding does (U+212A KELVIN SIGN reads as `k`, U+0130 as `i` + U+0307).
+   */
   caseSensitive?: boolean;
   /** A match needs a non-word character (`@xterm/addon-search`'s set, so not `_`) or a line end on both sides. */
   wholeWord?: boolean;
-  /** `query` is a JavaScript regular expression (flag `g`); otherwise it is matched as plain text. Either way the
-   * matching runs in JS over each logical line's text (`searchLine`). */
+  /** `query` is a JavaScript regular expression (flag `g`); otherwise it is matched as plain text. Regular
+   * expressions, and plain queries but for `searchRows` of an ASCII one, are matched in JS over each logical line's
+   * text (`searchLine`). */
   regex?: boolean;
 }
 
@@ -141,6 +145,11 @@ export class Terminal {
    */
   readonly trimmedLines: number;
   rowText(line: number): string | null;
+  /**
+   * `translateToString(trimRight)` of lines `first`…`last` (clamped to the buffer; by default all of it), each
+   * followed by `\n`, in one call. `trimRight` defaults to true.
+   */
+  textRows(first?: number, last?: number, trimRight?: boolean): string;
   /** `[codepoint, fg, bg, attrs]` per cell. */
   rowCells(line: number): Uint32Array | null;
   /**
@@ -238,6 +247,19 @@ export class Terminal {
   searchPrevious(query: string, options?: SearchOptions, line?: number, col?: number): SearchMatch | null;
   /** Every match in the logical lines rows `first`…`last` belong to (each search goes on from the end of the previous match), keeping those that touch the rows. */
   searchRows(query: string, options: SearchOptions | undefined, first: number, last: number): SearchMatch[];
+  /**
+   * The engine's matching of a plain `query` over rows `first`…`last` (`searchRows` without `regex`): at most
+   * `limit` matches as `[startLine, startCol, endLine, endCol]` each, a view into WebAssembly memory valid only until
+   * the next call into any terminal. Null for a query that is not ASCII and, with `keepLength`, when a line with a
+   * match holds U+0130 (İ), which lowercases to two characters (for hosts that lowercase whole lines themselves).
+   */
+  searchRowsView(
+    query: string,
+    options: { caseSensitive?: boolean; wholeWord?: boolean; keepLength?: boolean } | undefined,
+    first: number,
+    last: number,
+    limit?: number,
+  ): Int32Array | null;
   /** The logical line row `line` belongs to, as search reads it, for matching the text yourself; null outside the buffer. */
   searchLine(line: number): SearchLine | null;
   /**
