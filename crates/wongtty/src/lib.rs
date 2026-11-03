@@ -20,7 +20,7 @@
 //! [`alacritty_terminal`](https://crates.io/crates/alacritty_terminal) 0.26
 //! built into this crate as [`vt`] (see `src/vt/PATCHES.md`).
 
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -266,9 +266,29 @@ const DECSTR_HOOK: u32 = (b'!' as u32) << 8 | b'p' as u32;
 /// foreground, background and cursor, as `0xRRGGBB`.
 pub const COLOR_SLOTS: usize = 259;
 
-/// Decoded compressed-history rows kept for repeated reads (a scrolled-back
-/// view redraws the same rows every frame).
-const ROW_CACHE: usize = 64;
+/// A row [`Engine::with_row`] hands out: one of the grid's, a history row decoded for this read, or a cached one.
+enum HeldRow<'a> {
+    Grid(&'a Row<AlacCell>),
+    Decoded(Row<AlacCell>),
+    Cached(Ref<'a, Row<AlacCell>>),
+}
+
+impl std::ops::Deref for HeldRow<'_> {
+    type Target = Row<AlacCell>;
+
+    fn deref(&self) -> &Row<AlacCell> {
+        match self {
+            Self::Grid(row) => row,
+            Self::Decoded(row) => row,
+            Self::Cached(row) => row,
+        }
+    }
+}
+
+/// Decoded compressed-history rows kept for repeated reads beyond the screen's
+/// rows (a scrolled-back view redraws the same rows every frame). Nothing is
+/// kept while the view is at the bottom.
+const ROW_CACHE_SPARE: usize = 8;
 
 /// Unanswered clipboard reads and untaken writes kept at most (oldest dropped first).
 const CLIPBOARD_QUEUE: usize = 16;
@@ -417,7 +437,7 @@ pub struct Engine {
     decstr_owed: bool,
     // Host colours that answer colour queries; none means queries go unanswered.
     colors: Option<Box<[u32; COLOR_SLOTS]>>,
-    // Recently decoded history rows by their History::id, newest last.
+    // Recently decoded history rows by their History::id, newest last; empty while the view is at the bottom.
     row_cache: RefCell<VecDeque<(u64, Row<AlacCell>)>>,
     markers: markers::Markers,
 }
@@ -494,7 +514,7 @@ impl Engine {
             decstr: DecstrScan::default(),
             decstr_owed: false,
             colors: None,
-            row_cache: RefCell::new(VecDeque::with_capacity(ROW_CACHE)),
+            row_cache: RefCell::new(VecDeque::new()),
             markers: Default::default(),
         }
     }
@@ -538,6 +558,14 @@ impl Engine {
             self.offset = (self.offset + delta).min(self.scrollback);
             self.view_moved = true;
         }
+        self.release_row_cache();
+    }
+
+    /// Frees the decoded history rows once the view is back at the bottom.
+    fn release_row_cache(&mut self) {
+        if self.display_offset() == 0 {
+            *self.row_cache.get_mut() = VecDeque::new();
+        }
     }
 
     /// Adds the lines that left the top of the primary scrollback since the last call: a full history dropping
@@ -558,27 +586,44 @@ impl Engine {
 
     /// Hands the row at `line` to `f`, decoding a compressed history row on the spot.
     fn with_row<R>(&self, line: i32, f: impl FnOnce(&Row<AlacCell>) -> R) -> Option<R> {
+        let row = self.held_row(line)?;
+        Some(f(&row))
+    }
+
+    /// The row at `line` for [`Engine::with_row`]; not generic, so its callers stay small.
+    #[inline(never)]
+    fn held_row(&self, line: i32) -> Option<HeldRow<'_>> {
         let grid = self.term.grid();
         let recent = grid.history_size() as i32;
         if (-recent..self.rows() as i32).contains(&line) {
-            return Some(f(&grid[Line(line)]));
+            return Some(HeldRow::Grid(&grid[Line(line)]));
         }
         let stored = self.stored()?;
         let older = stored.len() as i32;
-        if line < -recent && line >= -(recent + older) {
-            let i = (older + recent + line) as usize;
-            let id = stored.id(i);
-            let mut cache = self.row_cache.borrow_mut();
-            if let Some((_, row)) = cache.iter().find(|(at, _)| *at == id) {
-                return Some(f(row));
-            }
-            if cache.len() == ROW_CACHE {
-                cache.pop_front();
-            }
-            cache.push_back((id, stored.row(i)));
-            return Some(f(&cache.back()?.1));
+        if line >= -recent || line < -(recent + older) {
+            return None;
         }
-        None
+        let i = (older + recent + line) as usize;
+        // At the bottom only searches and copies read history, each row once: nothing is cached
+        if self.display_offset() == 0 {
+            return Some(HeldRow::Decoded(stored.row(i)));
+        }
+        let id = stored.id(i);
+        let mut cache = self.row_cache.borrow_mut();
+        let at = match cache.iter().position(|(at, _)| *at == id) {
+            Some(at) => at,
+            None => {
+                while cache.len() >= self.rows() as usize + ROW_CACHE_SPARE {
+                    cache.pop_front();
+                }
+                cache.push_back((id, stored.row(i)));
+                cache.len() - 1
+            }
+        };
+        drop(cache);
+        Some(HeldRow::Cached(Ref::map(self.row_cache.borrow(), |c| {
+            &c[at].1
+        })))
     }
 
     /// Interprets bytes written by the program (UTF-8 and escape sequences
@@ -765,6 +810,7 @@ impl Engine {
         self.place_markers(anchors, reflow);
         self.place_alt_markers(alt_anchors);
         self.extend_images(old_cols);
+        self.release_row_cache();
     }
 
     /// Lines that have left the top of the primary screen's scrollback so far (a full history dropping its oldest
@@ -852,14 +898,20 @@ impl Engine {
     /// Cells of one row as `[ch, fg, bg, attrs]` words — the form handed to
     /// WebAssembly and N-API hosts. Returns `false` if `line` is out of range.
     pub fn row_packed(&self, line: i32, out: &mut Vec<u32>) -> bool {
-        out.clear();
-        self.with_row(line, |row| {
-            out.reserve(row.len() * Cell::PACKED_WORDS);
-            for cell in row[..].iter().map(flatten) {
-                out.extend([cell.ch as u32, cell.fg, cell.bg, cell.attrs]);
+        // Every word is overwritten, so a buffer as long as the last row is not cleared first
+        let found = self.with_row(line, |row| {
+            out.resize(row.len() * Cell::PACKED_WORDS, 0);
+            for (cell, o) in row[..].iter().zip(out.chunks_exact_mut(Cell::PACKED_WORDS)) {
+                o[0] = cell.c as u32;
+                o[1] = pack_color(cell.fg);
+                o[2] = pack_color(cell.bg);
+                o[3] = attrs(cell);
             }
-        })
-        .is_some()
+        });
+        if found.is_none() {
+            out.clear();
+        }
+        found.is_some()
     }
 
     /// Cells of one row that carry combining marks, an underline colour or a
@@ -951,6 +1003,7 @@ impl Engine {
         } else {
             self.term.scroll_display(Scroll::Delta(delta));
         }
+        self.release_row_cache();
     }
 
     /// Returns the view to the newest output.
@@ -1297,48 +1350,57 @@ impl DecstrScan {
     }
 }
 
+/// The [`attr`] bits of the cell flags, moved bit by bit (`flag_attrs_match_each_flag` checks every flag).
+fn flag_attrs(f: Flags) -> u32 {
+    let b = f.bits();
+    // ITALIC and UNDERLINE sit at the same bits in both
+    (b & 0b1100)
+        // BOLD 1 -> 0, DIM 7 -> 1
+        | (b >> 1 & 1)
+        | (b >> 6 & 2)
+        // INVERSE 0 -> 8
+        | (b & 1) << 8
+        // HIDDEN, STRIKEOUT 8-9 -> 9-10
+        | (b << 1 & 0x600)
+        // WIDE_CHAR, WIDE_CHAR_SPACER 5-6 -> 12-13; LEADING_WIDE_CHAR_SPACER 10 -> 17
+        | (b << 7 & (0x3000 | 1 << 17))
+        // DOUBLE_UNDERLINE, UNDERCURL, DOTTED_UNDERLINE, DASHED_UNDERLINE 11-14 -> 4-7
+        | (b >> 7 & 0xf0)
+        // BLINK 15 -> 11
+        | (b >> 4 & 0x800)
+        // TYPED_SPACE 16 -> 18
+        | (b << 2 & 1 << 18)
+}
+
 fn flatten(cell: &AlacCell) -> Cell {
-    let f = cell.flags;
-    let pairs = [
-        (Flags::BOLD, attr::BOLD),
-        (Flags::DIM, attr::DIM),
-        (Flags::ITALIC, attr::ITALIC),
-        (Flags::UNDERLINE, attr::UNDERLINE),
-        (Flags::DOUBLE_UNDERLINE, attr::DOUBLE_UNDERLINE),
-        (Flags::UNDERCURL, attr::CURLY_UNDERLINE),
-        (Flags::DOTTED_UNDERLINE, attr::DOTTED_UNDERLINE),
-        (Flags::DASHED_UNDERLINE, attr::DASHED_UNDERLINE),
-        (Flags::INVERSE, attr::INVERSE),
-        (Flags::HIDDEN, attr::HIDDEN),
-        (Flags::STRIKEOUT, attr::STRIKEOUT),
-        (Flags::BLINK, attr::BLINK),
-        (Flags::WIDE_CHAR, attr::WIDE),
-        (Flags::WIDE_CHAR_SPACER, attr::WIDE_SPACER),
-        (Flags::LEADING_WIDE_CHAR_SPACER, attr::LEADING_WIDE_SPACER),
-        (Flags::TYPED_SPACE, attr::TYPED_SPACE),
-    ];
-    let mut attrs = pairs
-        .iter()
-        .filter(|(a, _)| f.contains(*a))
-        .fold(0, |acc, (_, b)| acc | b);
-    if cell.zerowidth().is_some_and(|z| !z.is_empty()) {
-        attrs |= attr::COMBINING;
-    }
-    if cell.underline_color().is_some() {
-        attrs |= attr::UNDERLINE_COLOR;
-    }
-    if cell.hyperlink().is_some() {
-        attrs |= attr::HYPERLINK;
-    }
-    if cell.image().is_some() {
-        attrs |= attr::IMAGE;
-    }
     Cell {
         ch: cell.c,
         fg: pack_color(cell.fg),
         bg: pack_color(cell.bg),
-        attrs,
+        attrs: attrs(cell),
     }
+}
+
+/// The [`attr`] bits of a cell.
+#[inline]
+fn attrs(cell: &AlacCell) -> u32 {
+    let mut attrs = flag_attrs(cell.flags);
+    // Most cells have no extras
+    if cell.extra.is_some() {
+        if cell.zerowidth().is_some_and(|z| !z.is_empty()) {
+            attrs |= attr::COMBINING;
+        }
+        if cell.underline_color().is_some() {
+            attrs |= attr::UNDERLINE_COLOR;
+        }
+        if cell.hyperlink().is_some() {
+            attrs |= attr::HYPERLINK;
+        }
+        if cell.image().is_some() {
+            attrs |= attr::IMAGE;
+        }
+    }
+    attrs
 }
 
 /// Packs an Alacritty colour into the [`color`] format.
@@ -1353,6 +1415,39 @@ pub fn pack_color(c: Color) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::DecstrScan;
+    use crate::attr;
+    use crate::vt::term::cell::Flags;
+
+    #[test]
+    fn flag_attrs_match_each_flag() {
+        let pairs = [
+            (Flags::BOLD, attr::BOLD),
+            (Flags::DIM, attr::DIM),
+            (Flags::ITALIC, attr::ITALIC),
+            (Flags::UNDERLINE, attr::UNDERLINE),
+            (Flags::DOUBLE_UNDERLINE, attr::DOUBLE_UNDERLINE),
+            (Flags::UNDERCURL, attr::CURLY_UNDERLINE),
+            (Flags::DOTTED_UNDERLINE, attr::DOTTED_UNDERLINE),
+            (Flags::DASHED_UNDERLINE, attr::DASHED_UNDERLINE),
+            (Flags::INVERSE, attr::INVERSE),
+            (Flags::HIDDEN, attr::HIDDEN),
+            (Flags::STRIKEOUT, attr::STRIKEOUT),
+            (Flags::BLINK, attr::BLINK),
+            (Flags::WIDE_CHAR, attr::WIDE),
+            (Flags::WIDE_CHAR_SPACER, attr::WIDE_SPACER),
+            (Flags::LEADING_WIDE_CHAR_SPACER, attr::LEADING_WIDE_SPACER),
+            (Flags::TYPED_SPACE, attr::TYPED_SPACE),
+        ];
+        // Every combination of the 17 flag bits, WRAPLINE (no attribute) among them
+        for bits in 0..1u32 << 17 {
+            let flags = Flags::from_bits_retain(bits);
+            let want = pairs
+                .iter()
+                .filter(|(f, _)| flags.contains(*f))
+                .fold(0, |acc, (_, a)| acc | a);
+            assert_eq!(super::flag_attrs(flags), want, "flags {bits:#x}");
+        }
+    }
 
     /// The byte-at-a-time scanner `DecstrScan::find` must agree with.
     fn find_bytewise(state: &mut DecstrScan, bytes: &[u8]) -> Option<usize> {

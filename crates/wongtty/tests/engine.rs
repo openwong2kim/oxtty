@@ -668,6 +668,30 @@ fn cached_history_rows_follow_a_reflow() {
 }
 
 #[test]
+fn history_rows_read_at_the_bottom_or_after_scrolling_back_match() {
+    let mut packed = Engine::new(30, 4, 300);
+    let mut plain = Engine::new_uncompressed(30, 4, 300);
+    for i in 0..120 {
+        let line = format!("\x1b[3{}m{i:03}\x1b[0m {}\r\n", i % 8, "ab ".repeat(i % 9));
+        packed.feed(line.as_bytes());
+        plain.feed(line.as_bytes());
+    }
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    // At the bottom (no row cache), scrolled back (cached), then at the bottom again
+    for offset in [0, 37, 0] {
+        packed.scroll_to_bottom();
+        packed.scroll_display(offset);
+        for line in -(packed.history_len() as i32)..4 {
+            assert!(packed.row_packed(line, &mut a));
+            assert!(plain.row_packed(line, &mut b));
+            assert_eq!(a, b, "line {line} at offset {offset}");
+        }
+    }
+    assert!(!packed.row_packed(4, &mut a));
+    assert!(a.is_empty());
+}
+
+#[test]
 fn a_wide_char_over_a_wide_spacer_leaves_a_narrow_blank() {
     let mut t = term();
     t.feed("漢字\x08🚀".as_bytes());
