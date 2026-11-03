@@ -634,7 +634,9 @@ fn screen(out: &mut String, grid: &Grid<Cell>, older: Option<&History>, skip: us
     };
     // One row ahead: a wrapped row looks at how the next one starts
     let mut next = (skip < total).then(|| fetch(skip));
+    let start = out.len();
     for i in skip..total {
+        reserve(out, out.len() - start, i - skip, total - i);
         let Some(line) = next.take() else { break };
         next = (i + 1 < total).then(|| fetch(i + 1));
         rows.row(
@@ -648,6 +650,20 @@ fn screen(out: &mut String, grid: &Grid<Cell>, older: Option<&History>, skip: us
         link(out, None);
     }
     rows.split
+}
+
+/// Room [`reserve`] keeps for the next row.
+const ROW_ROOM: usize = 16 << 10;
+
+/// Makes room for the next row before `out` runs out, without doubling: in WebAssembly linear memory never shrinks,
+/// so the largest snapshot buffer stays as memory for good. Once 16 rows are written, the `left` rows are taken to
+/// need what the `done` ones took per row (`written` bytes), a sixteenth more; past that it grows by an eighth.
+fn reserve(out: &mut String, written: usize, done: usize, left: usize) {
+    if out.capacity() - out.len() >= ROW_ROOM {
+        return;
+    }
+    let estimate = if done >= 16 { written / done * left } else { 0 };
+    out.reserve_exact((estimate + estimate / 16).max(out.capacity() / 8) + ROW_ROOM);
 }
 
 /// Whether a wide char in `row` lacks one of its halves.
@@ -797,4 +813,29 @@ fn serialize<T: EventListener>(
         "\x1b[?25l"
     });
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ROW_ROOM, reserve};
+
+    #[test]
+    fn reserve_stays_close_to_what_the_rows_need() {
+        // Rows of one size, then rows twice as long (the estimate runs short and growth goes on by eighths)
+        for (rows, short, long) in [(2000, 300, 300), (2000, 100, 200), (40, 50, 50)] {
+            let mut out = String::new();
+            for i in 0..rows {
+                let written = out.len();
+                reserve(&mut out, written, i, rows - i);
+                let len = if i < rows / 2 { short } else { long };
+                out.push_str(&"x".repeat(len));
+            }
+            assert!(
+                out.capacity() <= out.len() + out.len() / 6 + 2 * ROW_ROOM,
+                "{rows} rows of {short}/{long}: capacity {} for {}",
+                out.capacity(),
+                out.len()
+            );
+        }
+    }
 }
