@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use crate::vt::event::EventListener;
 use crate::vt::grid::{Dimensions, HistoryAbove, HistorySink, Row};
 use crate::vt::index::{Column, Line};
-use crate::vt::term::cell::{Cell, CellExtra, Flags};
+use crate::vt::term::cell::{Cell, Extra, Flags};
 use crate::vt::term::{Term, TermMode};
 use crate::vt::vte::ansi::{Color, NamedColor, Rgb};
 
@@ -74,7 +74,7 @@ impl Block {
     }
 }
 
-type Extras = Box<[(u16, Arc<CellExtra>)]>;
+type Extras = Box<[(u16, Extra)]>;
 
 pub(crate) struct History {
     limit: usize,
@@ -1361,7 +1361,7 @@ fn encode(
     scan: usize,
     buf: &mut [u8],
     at: usize,
-    extras: &mut Vec<(u16, Arc<CellExtra>)>,
+    extras: &mut Vec<(u16, Extra)>,
 ) -> usize {
     let cells = &row[..];
     let mut out = Out { buf, at };
@@ -1405,7 +1405,7 @@ fn encode_take(
     scan: usize,
     buf: &mut [u8],
     at: usize,
-    extras: &mut Vec<(u16, Arc<CellExtra>)>,
+    extras: &mut Vec<(u16, Extra)>,
 ) -> usize {
     if !row.plain {
         return encode(row, scan, buf, at, extras);
@@ -1514,12 +1514,7 @@ fn plain(cells: &[Cell], mut at: usize, out: &mut Out) -> (usize, usize) {
 /// `encode` for the other rows: the runs of `cells` from cell `start` on,
 /// written from `out.at` on.
 #[inline(never)]
-fn runs(
-    cells: &[Cell],
-    mut start: usize,
-    mut out: Out,
-    extras: &mut Vec<(u16, Arc<CellExtra>)>,
-) -> usize {
+fn runs(cells: &[Cell], mut start: usize, mut out: Out, extras: &mut Vec<(u16, Extra)>) -> usize {
     let scan = cells.len();
     let mut prev = (DEFAULT_FG, DEFAULT_BG, Flags::empty());
     while start < scan {
@@ -1828,7 +1823,7 @@ fn shape(mut bytes: &[u8]) -> Option<(usize, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vt::term::cell::Hyperlink;
+    use crate::vt::term::cell::{CellExtra, Hyperlink};
 
     fn encoded(row: &Row<Cell>) -> Vec<u8> {
         let scan = scan_len(row);
@@ -1943,7 +1938,7 @@ mod tests {
             '\u{10ffff}',
         ];
         let flags = [Flags::empty(), Flags::BOLD, Flags::INVERSE | Flags::ITALIC];
-        let link = Arc::new(CellExtra::default());
+        let link = Extra::from(Arc::new(CellExtra::default()));
         let mut history = History::new(usize::MAX);
         let mut rows = Vec::new();
         for _ in 0..3000 {
@@ -2111,7 +2106,8 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        let extras: Extras = vec![(9999, Arc::new(CellExtra::default()))].into_boxed_slice();
+        let extras: Extras =
+            vec![(9999, Extra::from(Arc::new(CellExtra::default())))].into_boxed_slice();
         for _ in 0..20_000 {
             let mut bytes = rows[next() as usize % rows.len()].clone();
             match next() % 3 {
