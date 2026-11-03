@@ -799,15 +799,22 @@ fn is_plain(cells: &[Cell]) -> bool {
     true
 }
 
-/// The cells `encode` looks at: past the last cell that is not a default blank,
-/// all are default blanks, and those at the end of the row are left out. Cells
-/// past `occ` all equal the last cell (the Row::reset invariant), so with a
-/// default blank last the scan can stop there.
+/// The cells `encode` looks at: up to the last cell that is not a default
+/// blank, past which all are default blanks, left out at the end of the row.
+/// Cells past `occ` all equal the last cell (the Row::reset invariant), so
+/// with a default blank last the scan can start back from there. A decoded or
+/// grown row counts all its cells as occupied, so the blank tail is not
+/// counted in: a plain row takes the one-run path of `encode`, and a block's
+/// `max_scan` tells which narrower widths change none of its rows.
 #[inline]
 fn scan_len(row: &Row<Cell>) -> usize {
     let cells = &row[..];
     if cells.last().is_some_and(is_default) {
-        (row.occ as usize).min(cells.len())
+        let occ = (row.occ as usize).min(cells.len());
+        cells[..occ]
+            .iter()
+            .rposition(|c| !is_default(c))
+            .map_or(0, |i| i + 1)
     } else {
         cells.len()
     }
