@@ -290,6 +290,19 @@ impl std::ops::Deref for HeldRow<'_> {
 /// kept while the view is at the bottom.
 const ROW_CACHE_SPARE: usize = 8;
 
+#[cfg(test)]
+thread_local! {
+    /// Compressed history rows [`Engine::held_row`] decoded on this thread.
+    static DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Row `i` of the compressed history, decoded.
+fn decode(stored: &History, i: usize) -> Row<AlacCell> {
+    #[cfg(test)]
+    DECODES.with(|n| n.set(n.get() + 1));
+    stored.row(i)
+}
+
 /// Unanswered clipboard reads and untaken writes kept at most (oldest dropped first).
 const CLIPBOARD_QUEUE: usize = 16;
 
@@ -437,7 +450,7 @@ pub struct Engine {
     decstr_owed: bool,
     // Host colours that answer colour queries; none means queries go unanswered.
     colors: Option<Box<[u32; COLOR_SLOTS]>>,
-    // Recently decoded history rows by their History::id, newest last; empty while the view is at the bottom.
+    // Recently read history rows by their History::id, most recently read last; empty while the view is at the bottom.
     row_cache: RefCell<VecDeque<(u64, Row<AlacCell>)>>,
     markers: markers::Markers,
 }
@@ -606,17 +619,23 @@ impl Engine {
         let i = (older + recent + line) as usize;
         // At the bottom only searches and copies read history, each row once: nothing is cached
         if self.display_offset() == 0 {
-            return Some(HeldRow::Decoded(stored.row(i)));
+            return Some(HeldRow::Decoded(decode(&stored, i)));
         }
         let id = stored.id(i);
         let mut cache = self.row_cache.borrow_mut();
+        // Least recently used goes first: a view scrolling back k lines a frame reads k new rows above rows it
+        // still shows, which must not push those out
         let at = match cache.iter().position(|(at, _)| *at == id) {
-            Some(at) => at,
+            Some(at) => {
+                let hit = cache.remove(at).expect("position is in range");
+                cache.push_back(hit);
+                cache.len() - 1
+            }
             None => {
                 while cache.len() >= self.rows() as usize + ROW_CACHE_SPARE {
                     cache.pop_front();
                 }
-                cache.push_back((id, stored.row(i)));
+                cache.push_back((id, decode(&stored, i)));
                 cache.len() - 1
             }
         };
@@ -1471,6 +1490,41 @@ mod tests {
                 .filter(|(f, _)| flags.contains(*f))
                 .fold(0, |acc, (_, a)| acc | a);
             assert_eq!(super::flag_attrs(flags), want, "flags {bits:#x}");
+        }
+    }
+
+    fn decodes() -> usize {
+        super::DECODES.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn scrolling_back_decodes_each_row_that_comes_into_view_once() {
+        let rows = 24;
+        let mut t = super::Engine::new(80, rows, 3000);
+        for i in 0..3000 {
+            t.feed(format!("\x1b[3{}mline {i}\x1b[0m\r\n", i % 8).as_bytes());
+        }
+        let mut packed = Vec::new();
+        let mut frame = |t: &super::Engine| {
+            for y in 0..rows as i32 {
+                assert!(t.row_packed(y - t.display_offset() as i32, &mut packed));
+            }
+        };
+        // Up by lines (a wheel), down by lines, then up by pages
+        for step in [1, 3, -3, rows as i32] {
+            t.scroll_to_bottom();
+            t.scroll_display(if step < 0 { 2500 } else { 100 });
+            frame(&t);
+            let before = decodes();
+            for _ in 0..60 {
+                t.scroll_display(step);
+                frame(&t);
+            }
+            assert_eq!(
+                decodes() - before,
+                60 * step.unsigned_abs() as usize,
+                "step {step}"
+            );
         }
     }
 
