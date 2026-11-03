@@ -546,8 +546,9 @@ impl Engine {
     }
 
     /// The compressed history; `None` on the alternate screen, where history is not visible.
-    fn stored(&self) -> Option<MutexGuard<'_, History>> {
-        Some(self.history.as_ref().filter(|_| !self.alt_screen())?.lock())
+    fn stored(&self) -> Option<&History> {
+        let history = self.history.as_ref().filter(|_| !self.alt_screen())?;
+        Some(history.stored(&self.term))
     }
 
     /// Moves a scrolled-back view up as far as the primary screen scrolled (as Alacritty's `display_offset` does).
@@ -561,7 +562,7 @@ impl Engine {
         let cleared = self
             .history
             .as_ref()
-            .is_some_and(|h| std::mem::take(&mut h.lock().cleared));
+            .is_some_and(|h| std::mem::take(&mut h.stored_mut(&mut self.term).cleared));
         // Alacritty returns the view to the bottom when history is cleared (without damage).
         if cleared {
             self.offset = 0;
@@ -594,7 +595,11 @@ impl Engine {
 
     // Unlike `history_len`, also while the alternate screen is up.
     fn primary_history_len(&self) -> usize {
-        self.primary().history_size() + self.history.as_ref().map_or(0, |h| h.lock().len())
+        self.primary().history_size()
+            + self
+                .history
+                .as_ref()
+                .map_or(0, |h| h.stored(&self.term).len())
     }
 
     /// Hands the row at `line` to `f`, decoding a compressed history row on the spot.
@@ -619,7 +624,7 @@ impl Engine {
         let i = (older + recent + line) as usize;
         // At the bottom only searches and copies read history, each row once: nothing is cached
         if self.display_offset() == 0 {
-            return Some(HeldRow::Decoded(decode(&stored, i)));
+            return Some(HeldRow::Decoded(decode(stored, i)));
         }
         let id = stored.id(i);
         let mut cache = self.row_cache.borrow_mut();
@@ -635,7 +640,7 @@ impl Engine {
                 while cache.len() >= self.rows() as usize + ROW_CACHE_SPARE {
                     cache.pop_front();
                 }
-                cache.push_back((id, decode(&stored, i)));
+                cache.push_back((id, decode(stored, i)));
                 cache.len() - 1
             }
         };
@@ -1299,12 +1304,12 @@ impl Engine {
     /// [`Engine::ansi_snapshot`] with less history or without the modes, as `@xterm/addon-serialize` offers
     /// (`{ scrollback: 0, excludeModes: true }` paints just the screen the terminal shows).
     pub fn ansi_snapshot_with(&self, options: SnapshotOptions) -> Result<Vec<u8>, SnapshotRefusal> {
-        let history = self.history.as_ref().map(TermHistory::lock);
+        let history = self.history.as_ref().map(|h| h.stored(&self.term));
         snapshot::ansi(
             &self.term,
             self.sync_pending(),
             &self.tail,
-            history.as_deref(),
+            history,
             options,
         )
     }

@@ -293,8 +293,8 @@ fn primary_rows(term: &Term<VoidListener>, older: Option<&TermHistory>) -> Vec<V
             })
             .collect()
     };
-    let mut rows: Vec<_> = (0..older.map_or(0, TermHistory::len))
-        .map(|i| cells(&older.unwrap().row(i)))
+    let mut rows: Vec<_> = (0..older.map_or(0, |h| h.len(term)))
+        .map(|i| cells(&older.unwrap().row(term, i)))
         .collect();
     for y in -(grid.history_size() as i32)..grid.screen_lines() as i32 {
         rows.push(cells(&grid[Line(y)]));

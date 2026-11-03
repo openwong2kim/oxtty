@@ -15,10 +15,11 @@
 //! the encoder writes into room it has made sure of, by index, rather than
 //! growing a `Vec` byte by byte.
 
+use std::any::Any;
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::mem;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::vt::event::EventListener;
 use crate::vt::grid::{Dimensions, HistoryAbove, HistorySink, Row};
@@ -421,6 +422,14 @@ impl HistorySink<Cell> for History {
         if freed {
             release_freed();
         }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -852,7 +861,6 @@ fn shrink_row(
 /// stored at the new width read back at the old one.
 #[derive(Clone)]
 pub struct TermHistory {
-    inner: Arc<Mutex<History>>,
     scrollback: usize,
 }
 
@@ -865,30 +873,42 @@ impl TermHistory {
     /// Attaches to the primary grid of `term`, keeping `scrollback` history
     /// rows in all.
     pub fn attach<T>(term: &mut Term<T>, scrollback: usize) -> Self {
-        let inner = Arc::new(Mutex::new(History::new(
-            scrollback.saturating_sub(Self::RECENT),
-        )));
-        let sink: Arc<Mutex<dyn HistorySink<Cell>>> = inner.clone();
-        term.grid_mut().set_history_sink(Some(sink));
-        Self { inner, scrollback }
+        let history = History::new(scrollback.saturating_sub(Self::RECENT));
+        term.grid_mut().set_history_sink(Some(Box::new(history)));
+        Self { scrollback }
     }
 
-    pub(crate) fn lock(&self) -> MutexGuard<'_, History> {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    /// The rows held for `term`: its primary grid owns them, as its history sink.
+    pub(crate) fn stored<'a, T>(&self, term: &'a Term<T>) -> &'a History {
+        let grid = if term.mode().contains(TermMode::ALT_SCREEN) {
+            term.inactive_grid()
+        } else {
+            term.grid()
+        };
+        held(grid.history_sink())
+    }
+
+    pub(crate) fn stored_mut<'a, T>(&self, term: &'a mut Term<T>) -> &'a mut History {
+        let grid = if term.mode().contains(TermMode::ALT_SCREEN) {
+            term.inactive_grid_mut()
+        } else {
+            term.grid_mut()
+        };
+        held_mut(grid.history_sink_mut())
     }
 
     /// Rows held here, above the grid's history.
-    pub fn len(&self) -> usize {
-        self.lock().len()
+    pub fn len<T>(&self, term: &Term<T>) -> usize {
+        self.stored(term).len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    pub fn is_empty<T>(&self, term: &Term<T>) -> bool {
+        self.len(term) == 0
     }
 
     /// Row `i`, 0 being the oldest.
-    pub fn row(&self, i: usize) -> Row<Cell> {
-        self.lock().row(i)
+    pub fn row<T>(&self, term: &Term<T>, i: usize) -> Row<Cell> {
+        self.stored(term).row(i)
     }
 
     /// Resizes `term`, reflowing these rows with the grid's.
@@ -922,8 +942,9 @@ impl TermHistory {
         } else {
             term.grid_mut()
         };
-        let mut stored = self.lock();
-        let sink = grid.set_history_sink(None);
+        // The history leaves the grid for the resize, which then has no sink.
+        let mut sink = grid.set_history_sink(None);
+        let stored = held_mut(sink.as_deref_mut());
         let (next, cleared, limit) = (stored.id(stored.len()), stored.cleared, stored.limit);
         let blocks = stored.blocks.len() + stored.spare.is_some() as usize;
         let columns_change = columns != grid.columns();
@@ -1011,7 +1032,6 @@ impl TermHistory {
             grid.prepend_history(back, self.scrollback);
         }
         let mut older = grid.split_off_history(Self::RECENT);
-        grid.set_history_sink(sink);
         rows.limit = limit;
         rows.cleared = cleared;
         for row in &mut older {
@@ -1026,7 +1046,7 @@ impl TermHistory {
         }
         let freed = rows.blocks.len() + (rows.spare.is_some() as usize) < blocks;
         *stored = rows;
-        drop(stored);
+        grid.set_history_sink(sink);
         // A column change also frees the rows the grid took back and reflowed: about 0.6 MiB at 120x40 that the
         // macOS allocator keeps in the footprint otherwise, while those of a row change are fewer and taken again.
         // Elsewhere only freed blocks are worth a release: glibc's `malloc_trim` walks every arena.
@@ -1046,14 +1066,14 @@ impl TermHistory {
         size: impl Dimensions,
         offset: usize,
     ) -> usize {
-        let older = self.lock().take_all();
         let alt = term.mode().contains(TermMode::ALT_SCREEN);
         let grid = if alt {
             term.inactive_grid_mut()
         } else {
             term.grid_mut()
         };
-        let sink = grid.set_history_sink(None);
+        let mut sink = grid.set_history_sink(None);
+        let older = held_mut(sink.as_deref_mut()).take_all();
         grid.prepend_history(older, self.scrollback);
         grid.set_display_offset(offset);
         term.resize(size);
@@ -1064,13 +1084,26 @@ impl TermHistory {
         };
         let offset = grid.display_offset();
         let mut older = grid.split_off_history(Self::RECENT);
-        grid.set_history_sink(sink);
-        let mut stored = self.lock();
+        let stored = held_mut(sink.as_deref_mut());
         for row in &mut older {
             stored.push_row(row);
         }
+        grid.set_history_sink(sink);
         offset
     }
+}
+
+/// The `History` a primary grid keeps as its sink (`TermHistory::attach`).
+#[inline(never)]
+fn held(sink: Option<&dyn HistorySink<Cell>>) -> &History {
+    sink.and_then(|s| s.as_any().downcast_ref())
+        .expect("the history is attached to the primary grid")
+}
+
+#[inline(never)]
+fn held_mut<'a>(sink: Option<&'a mut (dyn HistorySink<Cell> + 'static)>) -> &'a mut History {
+    sink.and_then(|s| s.as_any_mut().downcast_mut())
+        .expect("the history is attached to the primary grid")
 }
 
 /// A wide character cell and the cell right after it (a blank with the same
@@ -1832,26 +1865,7 @@ fn text_into(mut bytes: &[u8], width: usize, trim_right: bool, out: &mut String)
         while left > 0 {
             let (&b, rest) = bytes.split_first()?;
             let mut unit_at = cells;
-            if b >= UNIT_2 {
-                let c = if b < UNIT_3 {
-                    let (&low, rest) = rest.split_first()?;
-                    bytes = rest;
-                    ((b & 0x1f) as u32) << 8 | low as u32
-                } else {
-                    let ([mid, low], rest) = rest.split_first_chunk()?;
-                    bytes = rest;
-                    ((b & 0x1f) as u32) << 16 | (*mid as u32) << 8 | *low as u32
-                };
-                let c = char::from_u32(c)?;
-                if cells < end {
-                    out.push(c);
-                    if c != ' ' {
-                        content = out.len();
-                    }
-                }
-                cells += 1 + (b & WIDE != 0) as usize;
-                left -= 1;
-            } else if b >= 0x20 {
+            if (0x20..0x80).contains(&b) {
                 // A stretch of printable ASCII (typed spaces too, all content) goes in one copy.
                 let stretch = 1 + rest[..(left - 1).min(rest.len())]
                     .iter()
@@ -1870,15 +1884,29 @@ fn text_into(mut bytes: &[u8], width: usize, trim_right: bool, out: &mut String)
                 cells += stretch;
                 left -= stretch;
             } else {
-                // 0 an erased blank, the rest controls (a tab reads as a space but is content).
+                // 0 an erased blank, other ASCII a control (a tab reads as a space but is content), the rest a
+                // unit of two or three bytes.
+                let (c, len) = match b {
+                    0 | b'\t' => (' ' as u32, 1),
+                    0x01..0x80 => (b as u32, 1),
+                    ..UNIT_3 => (((b & 0x1f) as u32) << 8 | *rest.first()? as u32, 2),
+                    _ => {
+                        let [mid, low] = *rest.first_chunk()?;
+                        (
+                            ((b & 0x1f) as u32) << 16 | (mid as u32) << 8 | low as u32,
+                            3,
+                        )
+                    }
+                };
+                let c = char::from_u32(c)?;
                 if cells < end {
-                    out.push(if b == 0 || b == b'\t' { ' ' } else { b as char });
-                    if b != 0 {
+                    out.push(c);
+                    if b != 0 && (c != ' ' || b < 0x80) {
                         content = out.len();
                     }
                 }
-                bytes = rest;
-                cells += 1;
+                bytes = &bytes[len..];
+                cells += 1 + (b >= UNIT_2 && b & WIDE != 0) as usize;
                 left -= 1;
             }
             // The zerowidth characters of the last unit, which `decode` puts on its (first) cell.
@@ -2940,7 +2968,7 @@ mod oracle {
     }
 
     fn state(side: &Side) -> State {
-        let stored = side.history.lock();
+        let stored = side.history.stored(&side.term);
         let grid = |g: &crate::vt::grid::Grid<Cell>| GridState {
             rows: (-(g.history_size() as i32)..g.screen_lines() as i32)
                 .map(|l| g[Line(l)].clone())
@@ -2998,7 +3026,7 @@ mod oracle {
         while line > g.topmost_line() && g[Line(line.0 - 1)][last].flags.contains(Flags::WRAPLINE) {
             line -= 1;
         }
-        line == g.topmost_line() && !side.history.is_empty()
+        line == g.topmost_line() && !side.history.is_empty(&side.term)
     }
 
     #[derive(Default, Debug)]
@@ -3060,7 +3088,7 @@ mod oracle {
             let what = format!("seed {seed} step {step}");
             assert_same(&a, &b, &format!("{what} before the resize"));
 
-            let total = a.history.len() + a.primary().history_size();
+            let total = a.history.len(&a.term) + a.primary().history_size();
             offset = match rng.below(5) {
                 0 => 0,
                 1 => offset,
@@ -3078,7 +3106,7 @@ mod oracle {
                 }
             }
             seen.resizes += 1;
-            let n = a.history.len();
+            let n = a.history.len(&a.term);
             if cols != old_cols && n > 2 * (old_rows + rows) + 20 {
                 seen.split += 1;
             }
@@ -3102,7 +3130,7 @@ mod oracle {
                 continue;
             }
             let (next, blocks) = {
-                let stored = a.history.lock();
+                let stored = a.history.stored(&a.term);
                 // A block taken again for other rows (the spare) has other row starts.
                 let blocks: Vec<_> = (stored.blocks.iter())
                     .map(|b| (b.bytes.as_ptr(), b.starts.clone()))
@@ -3112,7 +3140,7 @@ mod oracle {
             let size = TermSize::new(cols, rows);
             let got = a.history.reflow(&mut a.term, size, offset);
             {
-                let stored = a.history.lock();
+                let stored = a.history.stored(&a.term);
                 let kept = (stored.blocks.iter())
                     .filter(|b| {
                         blocks.iter().any(|(at, starts)| {
@@ -3130,7 +3158,7 @@ mod oracle {
             assert_same(&a, &b, &what);
             assert_eq!(got, want, "{what}: returned offset");
             // Every row stored again has a new id, so cached rows cannot come back.
-            assert!(a.history.lock().id(0) >= next, "{what}: row ids");
+            assert!(a.history.stored(&a.term).id(0) >= next, "{what}: row ids");
             offset = got;
         }
     }
@@ -3196,12 +3224,11 @@ mod oracle {
                         .map(|l| g[Line(l)].clone())
                         .collect::<Vec<_>>()
                 };
-                let stored = side.history.lock();
+                let stored = side.history.stored(&side.term);
                 let got: Vec<_> = (0..stored.len())
                     .map(|i| stored.row(i))
                     .chain(grid(&side.term))
                     .collect();
-                drop(stored);
                 let want = grid(&whole);
                 assert_eq!(got.len(), want.len(), "seed {seed} step {step}: rows");
                 for (i, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -3262,13 +3289,16 @@ mod oracle {
             log.push_str("\r\n");
         }
         side.feed(log.as_bytes());
-        assert!(side.history.len() > 5000);
+        assert!(side.history.len(&side.term) > 5000);
         assert_eq!(resize(&mut side, 100, 30), 0, "rows only");
         assert_eq!(resize(&mut side, 100, 40), 0, "rows only");
         let reflowed = cfg!(target_os = "macos") as usize;
         for (i, cols) in [120, 100, 120, 100, 120].into_iter().enumerate() {
             assert_eq!(resize(&mut side, cols, 40), reflowed, "column change {i}");
-            assert!(side.history.lock().spare.is_none(), "column change {i}");
+            assert!(
+                side.history.stored(&side.term).spare.is_none(),
+                "column change {i}"
+            );
         }
     }
 

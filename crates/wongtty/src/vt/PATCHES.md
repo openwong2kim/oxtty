@@ -157,6 +157,9 @@ single crate.
 - History kept outside the grid: `grid::HistorySink` receives the rows a full
   history drops, oldest first (`Grid::set_history_sink`; `scroll_up` hands
   them over before rotating, `clear_history` calls `HistorySink::clear`).
+  The grid owns its sink (a `Box`, no lock: one thread drives a terminal);
+  `Grid::history_sink` and `HistorySink::as_any` let its owner read the rows
+  it keeps, and a clone of the grid has no sink.
   `Grid::scrolled_lines` counts scrolled lines under the same condition that
   moves `display_offset`. `Grid::prepend_history` / `split_off_history` move
   history rows in and out (wongtty puts its compressed history back for a

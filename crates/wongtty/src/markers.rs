@@ -123,7 +123,7 @@ impl Engine {
             return last(&grid[Line(line)]);
         }
         self.history.as_ref().is_some_and(|history| {
-            let history = history.lock();
+            let history = history.stored(&self.term);
             let i = history.len() as i32 + recent + line;
             i >= 0 && i < history.len() as i32 && last(&history.row(i as usize))
         })
