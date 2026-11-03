@@ -1507,9 +1507,10 @@ impl<T> Term<T> {
                 used = text.len() - chars.as_str().len();
             }
             // The zerowidth characters after a cell this run wrote go on it, then the run goes on: but for a stretch
-            // of ASCII text (words after an emoji), left to `input_ascii`.
+            // of ASCII text (words after an emoji), left to `input_ascii`. In WebAssembly, where the code size counts
+            // for more, `input` puts them.
             match zerowidth {
-                Some(c) if col > point.column.0 && extra.is_none() => {
+                Some(c) if cfg!(not(target_family = "wasm")) && col > point.column.0 && extra.is_none() => {
                     put_mark(&mut cells[..col], c);
                     marked = true;
                     used = text.len() - chars.as_str().len();

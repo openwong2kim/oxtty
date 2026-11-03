@@ -1516,8 +1516,9 @@ fn plain(cells: &[Cell], mut at: usize, out: &mut Out) -> (usize, usize) {
     let (mut end, mut end_units, mut end_out) = (at, at, out.at);
     while at < scan {
         let cell = &cells[at];
-        // Narrow ASCII text, as `ascii` writes it (the text between clusters).
-        if (cell.c as u32 >= 0x21) & (cell.c as u32 <= 0x7e) {
+        // Narrow ASCII text, as `ascii` writes it (the text between clusters). Not in WebAssembly, where the code
+        // size counts for more.
+        if cfg!(not(target_family = "wasm")) & (cell.c as u32 >= 0x21) & (cell.c as u32 <= 0x7e) {
             let n = default_ascii(&cells[at..], out);
             if n > 0 {
                 (at, units) = (at + n, units + n);
