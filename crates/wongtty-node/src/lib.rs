@@ -202,6 +202,16 @@ impl Terminal {
         self.inner.row_text(line)
     }
 
+    /// `translateToString(trimRight)` of lines `first`…`last` (clamped to the buffer), each followed by `\n`, in one
+    /// call. `trimRight` defaults to true.
+    #[napi]
+    pub fn text_rows(&self, first: i32, last: i32, trim_right: Option<bool>) -> String {
+        let mut text = String::new();
+        self.inner
+            .text_rows(first, last, trim_right.unwrap_or(true), &mut text);
+        text
+    }
+
     /// `[ch, fg, bg, attrs]` per cell, or `null` if out of range.
     #[napi]
     pub fn row_cells(&self, line: i32) -> Option<Uint32Array> {

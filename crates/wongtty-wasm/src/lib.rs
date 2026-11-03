@@ -227,6 +227,16 @@ pub extern "C" fn wongtty_row_text(h: u32, line: i32) -> i32 {
     })
 }
 
+/// `Engine::text_rows` of lines `first..=last` (`trim_right` unless 0) into OUT; returns its byte length.
+#[no_mangle]
+pub extern "C" fn wongtty_text_rows(h: u32, first: i32, last: i32, trim_right: u32) -> u32 {
+    with(h, 0, |t| {
+        let mut text = String::new();
+        t.text_rows(first, last, trim_right != 0, &mut text);
+        set_out(text.into_bytes())
+    })
+}
+
 /// `[ch, fg, bg, attrs]` × cols into OUT32; returns the cell count, or -1.
 #[no_mangle]
 pub extern "C" fn wongtty_row_cells(h: u32, line: i32) -> i32 {
