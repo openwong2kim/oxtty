@@ -253,6 +253,32 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         }
     }
 
+    /// wongtty: keeps one blank row of `columns` cells, for a grid not in use (the alternate screen while the
+    /// primary one is up) whose screen is `lines` × `columns`. Its settings and counters stay, and its cursors
+    /// are where a resize to that screen leaves them in a grid without history (clamped where it shrinks).
+    /// Nothing reads its rows until `unpark`.
+    pub fn park(&mut self, lines: usize, columns: usize)
+    where
+        T: Default,
+    {
+        self.unpark(1, columns);
+        for cursor in [&mut self.cursor, &mut self.saved_cursor] {
+            cursor.point.line = min(cursor.point.line, Line(lines as i32 - 1));
+            cursor.point.column = min(cursor.point.column, Column(columns - 1));
+        }
+    }
+
+    /// wongtty: a screen of `lines` blank rows of `columns` cells, for a parked grid that comes into use.
+    pub fn unpark(&mut self, lines: usize, columns: usize)
+    where
+        T: Default,
+    {
+        self.raw = Storage::with_capacity(lines, columns);
+        self.lines = lines;
+        self.columns = columns;
+        self.display_offset = 0;
+    }
+
     /// wongtty: starts or stops logging how screen rows move (`take_row_moves`).
     pub fn track_row_moves(&mut self, on: bool) {
         if on != self.row_moves.is_some() {
