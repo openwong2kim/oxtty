@@ -83,6 +83,8 @@ impl BufferView {
     /// `f` over the engine while this buffer is the one on screen; `None` otherwise or after dispose. `f` runs
     /// under the core borrow, so it may call the engine but nothing else.
     fn read<T>(&self, f: impl FnOnce(&LocalEngineView) -> T) -> Option<T> {
+        // A resize waiting for the frame reflows first: the buffer has the rows `term.rows` reports.
+        self.shared.apply_pending_resize_logged();
         let core = self.shared.core.try_borrow().ok()?;
         if core.disposed {
             return None;

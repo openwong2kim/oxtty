@@ -105,8 +105,12 @@ const VSYNC_MS: f64 = 1000.0 / 60.0;
 /// What drawing the terminals a run gave a turn may cost the frame after it: when each costs more (truecolor
 /// glyphs), fewer get a turn per run.
 const DRAW_MS: f64 = 8.0;
-/// The longest run, under the 50 ms of a long task.
+/// The longest run while frames come, under the 50 ms of a long task.
 const MAX_RUN_MS: f64 = 45.0;
+/// The longest run per busy terminal: what each had in its own task before. One busy terminal gets a frame after
+/// at most this much parsing; without frames (a hidden page wakes up about once a second) a run parses as long as
+/// the terminals' own tasks did.
+const TURN_MS: f64 = 12.0;
 /// The shortest turn: each ends with the terminal's events, `onWriteParsed` and a frame request.
 const MIN_TURN_MS: f64 = 0.25;
 /// What frame callbacks may parse in all before the scheduler runs again.
@@ -210,10 +214,15 @@ fn run() {
             w.draw_ms = (drawn / w.served.max(1) as f64).max(w.draw_ms * 0.75);
         }
         w.frame_at = 0.0;
-        // Turns at most double from run to run: the first frame after a burst draws a few terminals, not all.
-        let quota = ((DRAW_MS / w.draw_ms).max(1.0) as usize).min(w.served.max(2) * 2);
-        let run = (drawn * RUN_PER_DRAW).max(VSYNC_MS + 1.0 - drawn);
-        (quota, start + run.min(MAX_RUN_MS))
+        let jobs = w.jobs.len() as f64 * TURN_MS;
+        let (quota, run) = if w.no_frames {
+            (usize::MAX, jobs)
+        } else {
+            // Turns at most double from run to run: the first frame after a burst draws a few terminals, not all.
+            let quota = ((DRAW_MS / w.draw_ms).max(1.0) as usize).min(w.served.max(2) * 2);
+            (quota, (drawn * RUN_PER_DRAW).min(MAX_RUN_MS).min(jobs))
+        };
+        (quota, start + run.max(VSYNC_MS + 1.0 - drawn))
     });
     let mut served = 0;
     loop {

@@ -365,10 +365,14 @@ impl Terminal {
         let shared = &self.shared;
         let open = shared.core.borrow().element.is_some();
         if open && shared.resized.get() {
-            let applied = shared.core.borrow().size();
+            let core = shared.core.borrow();
+            let applied = core.size();
             shared
                 .resize_pending
                 .set(((cols, rows) != applied).then_some((cols, rows)));
+            // `options` answers like `cols`/`rows`, so `options.cols = term.cols` stays a no-op.
+            set_size(&core.options, cols, rows)?;
+            drop(core);
             shared.schedule_frame();
             return Ok(());
         }
@@ -397,7 +401,7 @@ impl Terminal {
         if core.disposed {
             return;
         }
-        core.disposed_size = core.size();
+        core.disposed_size = self.shared.resize_pending.take().unwrap_or(core.size());
         core.disposed = true;
         core.queue.clear();
         // Hook: input, mouse, selection and accessibility remove their listeners here.
@@ -457,7 +461,10 @@ impl Shared {
 
     /// A turn of the write scheduler ([`timer::schedule`]): parses until `until`; returns whether writes are left.
     pub(crate) fn drain_turn(self: Rc<Self>, until: f64) -> bool {
-        self.drain(until);
+        // The frame drain may have parsed everything: nothing to report again.
+        if self.writes_queued() {
+            self.drain(until);
+        }
         // A paused parser queues the terminal again when it resumes; a disposed one keeps nothing queued.
         let more = !crate::parser::paused(&self) && self.writes_queued();
         self.drain_queued.set(more);
@@ -476,9 +483,10 @@ impl Shared {
         if crate::parser::paused(self) {
             return;
         }
-        self.apply_pending_resize_logged();
         let mut paused = false;
         loop {
+            // Also a resize a write callback just deferred: the next chunk parses at the size `cols` reports.
+            self.apply_pending_resize_logged();
             let (slice, rest) = {
                 let core = self.core.borrow();
                 if core.disposed {
@@ -781,8 +789,7 @@ impl Shared {
             engine.resize(cols, rows)?;
             let (cols, rows) = (engine.cols(), engine.rows());
             core.view.resized();
-            Reflect::set(&core.options, &"cols".into(), &cols.into())?;
-            Reflect::set(&core.options, &"rows".into(), &rows.into())?;
+            set_size(&core.options, cols, rows)?;
             if let Some(renderer) = core.renderer.as_mut() {
                 renderer.resize(cols, rows);
             }
@@ -795,15 +802,19 @@ impl Shared {
         self.sync_screen_size();
         let (cols, rows) = self.core.borrow().size();
         let size = Object::new();
-        Reflect::set(&size, &"cols".into(), &cols.into())?;
-        Reflect::set(&size, &"rows".into(), &rows.into())?;
+        set_size(&size, cols, rows)?;
         self.events.resize.fire(&[&size]);
         self.after_change();
         Ok(())
     }
 
-    /// [`Self::apply_pending_resize`] where nobody takes its error.
-    fn apply_pending_resize_logged(self: &Rc<Self>) {
+    /// [`Self::apply_pending_resize`] where nobody takes its error; also before reads of the buffer, so they see
+    /// the size `cols`/`rows` report. Not under a borrow of the core (a read from a parser handler).
+    #[inline(never)]
+    pub(crate) fn apply_pending_resize_logged(self: &Rc<Self>) {
+        if self.resize_pending.get().is_none() || self.core.try_borrow_mut().is_err() {
+            return;
+        }
         if let Err(error) = self.apply_pending_resize() {
             web_sys::console::error_1(&error);
         }
@@ -822,6 +833,10 @@ impl Shared {
         // The resize and the drain asked for the frame being drawn now.
         if pending || deadline.is_some() {
             self.frame.borrow_mut().take();
+            // A listener or write callback in this frame resized again: that size needs the next frame.
+            if self.resize_pending.get().is_some() {
+                self.schedule_frame();
+            }
         }
         self.handle_renderer_requests();
         self.apply_scroll_requests();
@@ -920,6 +935,13 @@ fn split_chunk(data: &JsValue) -> (JsValue, Option<JsValue>) {
         text.slice(0, n).into(),
         Some(text.slice(n, text.length()).into()),
     )
+}
+
+/// `{ cols, rows }` on `target`.
+fn set_size(target: &Object, cols: u32, rows: u32) -> Result<(), JsValue> {
+    Reflect::set(target, &"cols".into(), &cols.into())?;
+    Reflect::set(target, &"rows".into(), &rows.into())?;
+    Ok(())
 }
 
 fn is_high_surrogate(unit: u16) -> bool {

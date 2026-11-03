@@ -134,3 +134,94 @@ test('a second resize before the frame reflows once, at the frame; writes after 
     assert.equal(r.resizes, '30x6,32x7,40x7');
   });
 });
+
+test('a resize from an onResize listener of a frame-applied resize still lands, one frame later', async () => {
+  await withPage('scheduler.mjs', async (page) => {
+    await page.waitForFunction(() => window.ready);
+    const r = await page.evaluate(async () => {
+      const frame = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const t = new window.Terminal({ cols: 20, rows: 6 });
+      t.open(document.getElementById('terminal'));
+      await frame();
+      const resizes = [];
+      t.onResize((e) => {
+        resizes.push(`${e.cols}x${e.rows}`);
+        if (e.cols < 32) t.resize(e.cols + 1, 6);
+      });
+      t.resize(30, 6);
+      for (let i = 0; i < 6; i++) await frame();
+      return { cols: t.cols, rows: t.rows, width: t.buffer.active.getLine(0).length, resizes: resizes.join() };
+    });
+    assert.deepEqual(r, { cols: 32, rows: 6, width: 32, resizes: '30x6,31x6,32x6' });
+  });
+});
+
+test('a resize from a write callback applies before the next chunk of the same drain', async () => {
+  await withPage('scheduler.mjs', async (page) => {
+    await page.waitForFunction(() => window.ready);
+    const r = await page.evaluate(async () => {
+      const frame = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const t = new window.Terminal({ cols: 20, rows: 6 });
+      t.open(document.getElementById('terminal'));
+      await frame();
+      return new Promise((resolve) => {
+        t.write('a', () => t.resize(30, 6));
+        t.write('b', () => t.resize(40, 6));
+        t.write('\r\n\x1b[999CZ', () => resolve({ cols: t.cols, cursorX: t.buffer.active.cursorX, line: t.buffer.active.getLine(1).translateToString(true).length }));
+      });
+    });
+    assert.deepEqual(r, { cols: 40, cursorX: 39, line: 40 });
+  });
+});
+
+test('while a resize waits for the frame, the buffer, options and snapshot already have its size', async () => {
+  await withPage('scheduler.mjs', async (page) => {
+    await page.waitForFunction(() => window.ready);
+    const r = await page.evaluate(async () => {
+      const frame = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const t = new window.Terminal({ cols: 20, rows: 6 });
+      t.open(document.getElementById('terminal'));
+      await frame();
+      const resizes = [];
+      t.onResize((e) => resizes.push(`${e.cols}x${e.rows}`));
+      t.resize(20, 8);
+      t.resize(24, 12);
+      const options = `${t.options.cols}x${t.options.rows}`;
+      // An INIT_ONLY option set to the value it has is a no-op.
+      t.options.cols = t.cols;
+      const buffer = t.buffer.active;
+      const length = buffer.length;
+      let lines = 0;
+      for (let y = 0; y < t.rows; y++) lines += buffer.getLine(buffer.viewportY + y).length === t.cols ? 1 : 0;
+      t.resize(30, 12);
+      t.ansiSnapshot();
+      const snapshot = resizes.join();
+      t.resize(31, 13);
+      t.dispose();
+      return { options, length, lines, snapshot, disposed: `${t.cols}x${t.rows}` };
+    });
+    assert.deepEqual(r, { options: '24x12', length: 12, lines: 12, snapshot: '20x8,24x12,30x12', disposed: '31x13' });
+  });
+});
+
+test('one write fires onWriteParsed once, also when the frame drain parsed it', async () => {
+  await withPage('scheduler.mjs', async (page) => {
+    await page.waitForFunction(() => window.ready);
+    const counts = await page.evaluate(async () => {
+      const terms = [0, 1, 2, 3, 4].map(() => new window.Terminal({ cols: 40, rows: 8 }));
+      const counts = terms.map(() => 0);
+      terms.forEach((t, i) => t.onWriteParsed(() => counts[i]++));
+      // This frame callback runs before the ones `open` asks for, so the terminals' frame drain parses the write.
+      const written = new Promise((resolve) =>
+        requestAnimationFrame(() => Promise.all(terms.map((t) => new Promise((done) => t.write('user@host:~$ ', done)))).then(resolve)),
+      );
+      for (const t of terms) t.open(document.getElementById('terminal'));
+      await written;
+      // A second onWriteParsed would come from the scheduler's next run, before these frames.
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return counts;
+    });
+    assert.deepEqual(counts, [1, 1, 1, 1, 1]);
+  });
+});
