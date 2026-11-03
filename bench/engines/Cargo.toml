@@ -12,6 +12,11 @@ publish = false
 [features]
 # Ghostty's libghostty-vt through ghostty-vt-rs-sys, which downloads a prebuilt static library (SHA-256 pinned).
 ghostty = ["dep:ghostty-vt-rs-sys"]
+# libvterm (MIT; Neovim's and Emacs vterm's engine), linked from a system install (LIBVTERM_DIR, default Homebrew's).
+libvterm = []
+# Rio's core. With `ghostty` too, both carry simdutf and the linker keeps one copy of its symbols (a linker
+# warning); Ghostty's instruction counts on light-cells and scrolling-region are the same as in a ghostty-only build.
+rio = ["dep:rio-vt"]
 
 [dependencies]
 wongtty = { path = "../../crates/wongtty" }
@@ -25,6 +30,8 @@ avt = "=0.19.0"
 wezterm-term = { package = "zeughaus-wezterm-term", version = "=0.1.0" }
 # libghostty-vt bindings with prebuilt static libraries (MIT; Ghostty is MIT).
 ghostty-vt-rs-sys = { version = "=0.2.0", optional = true }
+# Rio's embeddable terminal core (MIT), no PTY.
+rio-vt = { version = "=0.5.29", default-features = false, optional = true }
 libc = "0.2"
 
 # Same as the root workspace's release profile, for every engine.

@@ -74,7 +74,9 @@ async function engine(name) {
   };
 }
 
-const ENGINES = ['wongtty-wasm', 'ghostty-web', 'xterm-headless'];
+// ENGINES and CASES (comma-separated) pick the engines and scenarios; by default all of them.
+const ENGINES = (process.env.ENGINES ?? 'wongtty-wasm,ghostty-web,xterm-headless').split(',');
+const RUN_CASES = process.env.CASES ? process.env.CASES.split(',') : CASES;
 
 function load(dir, name) {
   const bytes = readFileSync(join(dir, `${name}.vt`));
@@ -106,18 +108,27 @@ const engines = {};
 for (const name of ENGINES) engines[name] = await engine(name);
 
 const results = [];
-for (const caseName of CASES) {
+for (const caseName of RUN_CASES) {
   const { bytes, chunks } = load(dir, caseName);
   const mib = bytes.length / 1048576;
   const times = Object.fromEntries(ENGINES.map((n) => [n, []]));
+  const crashed = {};
   // Run 0 is warm-up. Each run starts with a different engine, so drift from other load spreads over all.
   for (let run = 0; run <= RUNS; run++) {
     for (let k = 0; k < ENGINES.length; k++) {
       const name = ENGINES[(run + k) % ENGINES.length];
+      if (crashed[name]) continue;
       const e = engines[name];
       const t = e.make();
       const start = performance.now();
-      await e.feed(t, chunks);
+      try {
+        await e.feed(t, chunks);
+      } catch (err) {
+        // ghostty-web 0.4.0 traps on some grapheme scenarios; its instance is not reused after that.
+        crashed[name] = String(err.message ?? err).slice(0, 80);
+        engines[name] = await engine(name);
+        continue;
+      }
       const ms = performance.now() - start;
       if (run > 0) times[name].push(mib / (ms / 1000));
       e.dispose(t);
@@ -125,12 +136,18 @@ for (const caseName of CASES) {
   }
   const screens = {};
   for (const name of ENGINES) {
+    if (crashed[name]) {
+      results.push({ case: caseName, engine: name, crashed: crashed[name] });
+      console.log(`${caseName.padEnd(17)} ${name.padEnd(15)} crashed: ${crashed[name]}`);
+      continue;
+    }
     const s = times[name].sort((a, b) => a - b);
     const child = spawnSync(process.execPath, ['--expose-gc', fileURLToPath(import.meta.url), '--memory', name, caseName, dir], { encoding: 'utf8', maxBuffer: 1 << 24 });
     const memory = child.status === 0 ? JSON.parse(child.stdout) : { screen: [] };
     screens[name] = memory.screen;
-    const differ = screens[name].flatMap((row, i) => (row === screens[ENGINES[0]][i] ? [] : [i]));
-    const screen = differ.length === 0 ? 'same' : `${differ.length} rows differ; row ${differ[0]}: ${JSON.stringify(screens[name][differ[0]].slice(0, 60))} vs wongtty ${JSON.stringify(screens[ENGINES[0]][differ[0]].slice(0, 60))}`;
+    const first = screens[ENGINES[0]] ?? [];
+    const differ = screens[name].flatMap((row, i) => (row === first[i] ? [] : [i]));
+    const screen = differ.length === 0 ? 'same' : `${differ.length} rows differ; row ${differ[0]}: ${JSON.stringify(screens[name][differ[0]].slice(0, 60))} vs wongtty ${JSON.stringify((first[differ[0]] ?? '').slice(0, 60))}`;
     const row = { case: caseName, engine: name, mibPerSec: +s[s.length >> 1].toFixed(1), min: +s[0].toFixed(1), max: +s.at(-1).toFixed(1), peakBytes: memory.peak ?? null, retainedBytes: memory.retained ?? null, history: memory.history ?? null, screen };
     results.push(row);
     const m = (b) => (b === null ? '?' : (b / 1048576).toFixed(1).padStart(6));
