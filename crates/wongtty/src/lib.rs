@@ -290,6 +290,9 @@ impl std::ops::Deref for HeldRow<'_> {
 /// kept while the view is at the bottom.
 const ROW_CACHE_SPARE: usize = 8;
 
+/// Rows the row cache decodes without trying a direct read after one with extras (`RowCache::decode_next`).
+const DECODE_RUN: u8 = 16;
+
 /// A history row in the row cache: its cells as [`Engine::row_packed`] gives them (16 bytes a cell, not the 24 of a
 /// decoded cell), or, for a row with extras, the decoded row instead, as a renderer reads [`Engine::row_extras`] of
 /// those rows too (`row_packed` packs it on each read).
@@ -306,12 +309,19 @@ struct CachedRow {
 struct RowCache {
     rows: Vec<CachedRow>,
     reads: u64,
+    /// Rows still to put in decoded without a direct read first, as one of the last [`DECODE_RUN`] put in had
+    /// extras: in text with zerowidth characters most rows have them, and the direct read gives up at the first.
+    /// WebAssembly decodes every row (`Engine::cached`).
+    #[cfg(not(target_arch = "wasm32"))]
+    decode_next: u8,
 }
 
 #[cfg(test)]
 thread_local! {
     /// Compressed history rows [`Engine::held_row`] decoded on this thread.
     static DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Direct reads of compressed history rows (`read_packed`) tried on this thread, whether they read or not.
+    static DIRECT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Row `i` of the compressed history, decoded.
@@ -327,6 +337,8 @@ fn read_packed(stored: &History, i: usize, out: &mut Vec<u32>) -> bool {
     let read = stored.row_packed_into(i, out);
     #[cfg(test)]
     DECODES.with(|n| n.set(n.get() + read as usize));
+    #[cfg(test)]
+    DIRECT_READS.with(|n| n.set(n.get() + 1));
     read
 }
 
@@ -693,14 +705,33 @@ impl Engine {
                 } else {
                     (0..room).min_by_key(|&k| cache.rows[k].read).unwrap_or(0)
                 };
-                let entry = &mut cache.rows[at];
+                // WebAssembly has no `decode_next`: it decodes every row
+                #[cfg(not(target_arch = "wasm32"))]
+                let RowCache {
+                    rows, decode_next, ..
+                } = &mut *cache;
+                #[cfg(target_arch = "wasm32")]
+                let (RowCache { rows, .. }, decode_next) = (&mut *cache, &mut 1u8);
+                let entry = &mut rows[at];
                 entry.id = id;
                 // The buffer of the row that went takes this one. Natively most rows are read from their bytes,
                 // the rest decoded (WebAssembly decodes them all: the direct read is 2.3 KB of code).
                 entry.row = None;
-                if cfg!(target_arch = "wasm32") || !read_packed(stored, i, &mut entry.packed) {
+                if cfg!(target_arch = "wasm32")
+                    || *decode_next > 0
+                    || !read_packed(stored, i, &mut entry.packed)
+                {
                     let row = decode(stored, i);
-                    if row[..].iter().any(|c| c.extra.is_some()) {
+                    let extras = row[..].iter().any(|c| c.extra.is_some());
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        *decode_next = if extras {
+                            DECODE_RUN
+                        } else {
+                            decode_next.saturating_sub(1)
+                        };
+                    }
+                    if extras {
                         entry.packed = Vec::new();
                         entry.row = Some(row);
                     } else {
@@ -1692,6 +1723,40 @@ mod tests {
             assert!(t.row_packed(*line, &mut packed) && t.row_extras(*line, &mut extras));
             assert_eq!((&packed, &extras), (cells, cell_extras), "line {line}");
         }
+    }
+
+    /// Paging back through rows that end in a combining mark tries the direct read once, not once a row (it gives up
+    /// only at the mark); plain rows past them go back to direct reads after `DECODE_RUN` rows.
+    #[test]
+    fn rows_with_marks_are_decoded_without_a_direct_read_first() {
+        let rows = 10;
+        let mut t = super::Engine::new(40, rows, 500);
+        // Older rows end in a combining mark, newer ones are plain
+        for i in 0..200 {
+            t.feed(format!("line {i} e\u{301}\r\n").as_bytes());
+        }
+        for i in 0..200 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        let mut packed = Vec::new();
+        // The direct reads and decodes of a frame at `offset`, and whether every row has a combining mark
+        let mut frame = |t: &mut super::Engine, offset: usize| {
+            t.scroll_display(offset as i32 - t.display_offset() as i32);
+            let before = (super::DIRECT_READS.with(std::cell::Cell::get), decodes());
+            let mut marked = true;
+            for y in 0..rows as i32 {
+                assert!(t.row_packed(y - offset as i32, &mut packed));
+                marked &= packed.chunks(4).any(|c| c[3] & crate::attr::COMBINING != 0);
+            }
+            let after = (super::DIRECT_READS.with(std::cell::Cell::get), decodes());
+            (after.0 - before.0, after.1 - before.1, marked)
+        };
+        assert_eq!(frame(&mut t, 100), (rows as usize, rows as usize, false));
+        assert_eq!(frame(&mut t, 300), (1, rows as usize, true));
+        let run = super::DECODE_RUN as usize;
+        assert_eq!(frame(&mut t, 150).0, 0);
+        assert_eq!(frame(&mut t, 140).0, 2 * rows as usize - run);
+        assert_eq!(frame(&mut t, 130).0, rows as usize);
     }
 
     /// The byte-at-a-time scanner `DecstrScan::find` must agree with.
