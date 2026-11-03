@@ -1993,6 +1993,33 @@ fn packed_into(mut bytes: &[u8], width: usize, out: &mut Vec<u32>) -> Option<()>
     Some(())
 }
 
+/// `String::push` without a branch on the length: in mixed text it changes from one character to the next.
+#[inline(always)]
+fn push_char(out: &mut String, c: char) {
+    let n = c as u32;
+    let len = c.len_utf8();
+    let tail = |shift: u32| 0x80 | (n >> shift & 0x3f);
+    let words = [
+        n,
+        (0xc0 | n >> 6) | tail(0) << 8,
+        (0xe0 | n >> 12) | tail(6) << 8 | tail(0) << 16,
+        (0xf0 | n >> 18) | tail(12) << 8 | tail(6) << 16 | tail(0) << 24,
+    ];
+    let bytes = words[len - 1].to_le_bytes();
+    // SAFETY: the first `len` bytes of `bytes` are the UTF-8 of `c` (the four forms above, as `char::encode_utf8`
+    // writes them), written into room reserved for them, so the string stays UTF-8.
+    unsafe {
+        let v = out.as_mut_vec();
+        v.reserve(4);
+        let at = v.len();
+        v.as_mut_ptr()
+            .add(at)
+            .cast::<[u8; 4]>()
+            .write_unaligned(bytes);
+        v.set_len(at + len);
+    }
+}
+
 /// `Engine::row_string` of what `decode` gives at `width` cells (0: as stored), without the cells, appended to `out`:
 /// wide characters once, with the zerowidth characters that follow their unit, blanks as spaces, and with
 /// `trim_right` the empty cells that end the row dropped. For a row without extras; `None` (with part of the text
@@ -2068,7 +2095,7 @@ fn text_into(mut bytes: &[u8], width: usize, trim_right: bool, out: &mut String)
                 };
                 let c = char::from_u32(c)?;
                 if cells < end {
-                    out.push(c);
+                    push_char(out, c);
                     if b != 0 && (c != ' ' || b < 0x80) {
                         content = out.len();
                     }
