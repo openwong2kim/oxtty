@@ -1583,7 +1583,7 @@ fn put_marks(cells: &mut [Cell], first: char, chars: &mut str::Chars<'_>) {
     }
     let last = cells.len() - 1;
     let cell = &mut cells[last - cells[last].flags.contains(Flags::WIDE_CHAR_SPACER) as usize];
-    match intern(&marks[..n]).filter(|_| cell.extra.is_none()) {
+    match cell.extra.is_none().then(|| intern(&marks[..n])).flatten() {
         Some(extra) => cell.extra = Some(extra),
         None => marks[..n].iter().for_each(|&m| cell.push_zerowidth(m)),
     }

@@ -159,7 +159,7 @@ thread_local! {
 }
 
 /// wongtty: the interned cluster of `marks` (1 to `MAX_MARKS` characters), `None` when the table has no room left.
-pub fn intern(marks: &[char]) -> Option<Arc<CellExtra>> {
+pub(crate) fn intern(marks: &[char]) -> Option<Arc<CellExtra>> {
     if marks.is_empty() || marks.len() > MAX_MARKS {
         return None;
     }
