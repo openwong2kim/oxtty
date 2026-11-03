@@ -5,7 +5,7 @@ xterm.js 6.x `Terminal` API over that engine, with a WebGL2 renderer, also in
 Rust. Built to keep memory low with many terminals open: all panes on a page
 share one engine module, one WebGL2 context and one glyph atlas.
 
-**Status: 0.0.1, experimental.**
+**Status: 0.0.2, experimental.**
 
 ## Install
 

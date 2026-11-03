@@ -11,7 +11,7 @@ Or use `wongtty/xterm`, the xterm.js API with a WebGL2 renderer, also in Rust.
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE-APACHE)
 ![rust](https://img.shields.io/badge/rust-1.85%2B-orange)
 ![wasm](https://img.shields.io/badge/engine%20wasm-348%20KiB%20%C2%B7%20131%20KiB%20gzip-654ff0)
-![status](https://img.shields.io/badge/status-0.0.1%20experimental-lightgrey)
+![status](https://img.shields.io/badge/status-0.0.2%20experimental-lightgrey)
 
 [Measurements](#measurements) · [Quick start](#quick-start) · [xterm.js API](#wongttyxterm-the-xtermjs-api) · [The model](#the-model) · [xterm.js parity](#xtermjs-parity) · [Roadmap](#roadmap)
 
@@ -19,7 +19,7 @@ Or use `wongtty/xterm`, the xterm.js API with a WebGL2 renderer, also in Rust.
 
 ---
 
-wongtty (**ox**ide + **tty**) parses the bytes a program writes to its PTY and
+wongtty parses the bytes a program writes to its PTY and
 holds everything a terminal knows: characters, colours, cursor, modes and
 scrollback. The engine does not draw anything. Your renderer asks which rows
 changed and redraws only those.
@@ -113,20 +113,31 @@ use. Apple M4, 2026-11-02, same bench.
 | Blink off | 217 MB | 315 MB |
 | WebGL draw calls in 10 s, blink on | 0 (60 before) | 43 |
 
-**In wmux** — wmux (Electron) with 17 panes and 10,000 lines of scrollback,
-the xterm.js renderer against wongtty, three alternating runs, macOS footprint
-figures. Apple M4, 2026-11-01/02.
+**In wmux** — wmux (Electron) with 17 panes, each filled with 12,000 lines
+and keeping 10,000, the xterm.js renderer against wongtty, idle after the
+fill. macOS physical footprint in MB, the median of 3 alternating rounds,
+read about 9 s after the fill. Ghostty 1.4, a native app, ran the same panes
+at the same font size as a reference, with its default scrollback limit
+(capped at 10,000 lines it used the same memory). Shells are left out on both
+sides. Apple M4, 2026-11-03/04.
 
-| | xterm.js | wongtty | |
-| --- | ---: | ---: | ---: |
-| Renderer process footprint | 297 MB | 139 MB | −53% |
-| App footprint | 695 MB | 546 MB | −21% |
-| JS heap | 82.5 MB | 21.0 MB | |
-| WebAssembly memory | 7.9 MB | 54.0 MB | |
-| GPU process footprint | 259 MB | 276 MB | +17 MB, not yet attributed |
+| | wmux + xterm.js | wmux + wongtty | | Ghostty 1.4 |
+| --- | ---: | ---: | ---: | ---: |
+| Renderer process | 272 | 135 | −50% | |
+| GPU process | 267 | 202 | | |
+| App (all wmux processes) | 665 | 475 | −29% | 281 |
+| App + pty daemon | 762 | 579 | −24% | 281 |
+| Each pane past the first, app + daemon | 17.5 | 9.9 | | 10.9 |
+| 1 pane, app + daemon | 482 | 420 | | 106 |
 
-The cells and scrollback move from the JS heap into WebAssembly memory, where
-they take less room.
+Per pane, wongtty in wmux costs about what Ghostty does; the gap to Ghostty is
+Electron's fixed cost, about 310 MB before the first pane. These are best
+cases: wmux was read after a forced GC, with its GPU process idle. That
+process grows by 52–75 MB while panes draw, and with input wmux + wongtty
+ran at 567–600 MB (peak about 740 MB plus 84 MB for the daemon, against
+Ghostty's fill peak of 377–499 MB). Busy panes were not measured, and the
+fill compresses far better than real agent output, which flatters wongtty
+and Ghostty, both of which compress history.
 
 **Viewport-only mode** — the same bench with each pane keeping 200 lines of
 scrollback and reading older lines from a history provider
@@ -613,7 +624,11 @@ live in `history`, above the grid's own history.
 
 ### Installing
 
-wongtty is not on crates.io or npm yet. Until then, depend on it from git:
+```sh
+npm install wongtty    # the wasm engine and wongtty/xterm
+```
+
+The crate is not on crates.io yet. Until then, depend on it from git:
 
 ```toml
 wongtty = { git = "https://github.com/openwong2kim/wongtty", rev = "<commit>" }
@@ -898,16 +913,25 @@ system Chrome. Format with
 - [x] **Engine core** — rows, cells, cursor, damage with scroll, replies,
       synchronized output, ANSI snapshots, wasm and N-API bindings.
 - [x] **Differential tests against xterm.js** — 91 fixtures, two proofs.
-- [ ] **Publish to crates.io and npm.** The patched Alacritty fork is built
-      into the `wongtty` crate as `wongtty::vt`, so `wongtty` publishes as a single crate.
+- [x] **Publish to npm** — [`wongtty`](https://www.npmjs.com/package/wongtty)
+      0.0.2: the wasm engine and `wongtty/xterm`.
+- [ ] **Publish to crates.io.** The patched Alacritty fork is built into the
+      `wongtty` crate as `wongtty::vt`, so `wongtty` publishes as a single crate.
 - [x] **`wongtty/xterm`, the xterm.js API in Rust** — WebGL2 renderer with one
       context per page, built-in fit, search, web links and images; 104 of
       the 115 members on the [API checklist](#api-support) supported.
 - [x] **Input in Rust** — keyboard (including the kitty protocol), mouse,
       paste and focus encoding in the engine crate, ported from xterm.js.
 - [x] **Selection, search and link detection in Rust** — in `wongtty/xterm`.
-- [ ] **Adopted in wmux** — the 17-pane trial is [measured](#measurements);
-      the renderer swap is next.
+- [ ] **Adopted in wmux** — measured in the app with 17 panes
+      ([measurements](#measurements)); next is an off-by-default Labs switch
+      that moves every open terminal between xterm.js and wongtty, then
+      dogfooding.
+- [ ] **Less memory per pane in wmux** — the GPU process while panes draw
+      (52–75 MB) and the daemon's 2.6 MB per pane, measured with busy panes
+      and peaks as well as idle, against Ghostty too.
+- [ ] **Faster common-match search from WebAssembly** — 4.43 ms against
+      xterm.js's 1.47 on log lines.
 - [x] **Host policy hooks** — OSC 52 clipboard and OSC 4/10/11/12 colour
       queries, off until the host opts in.
 - [ ] **Prebuilt N-API binaries** for Windows, macOS and Linux.

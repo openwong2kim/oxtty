@@ -5,7 +5,7 @@
 | Document version | v0.5 |
 | Written | 2026-10-31 (v0.1·v0.2·v0.3), 2026-11-01 (v0.4), 2026-11-02 (v0.5) |
 | Repository | github.com/openwong2kim/wongtty (private) |
-| Current release | 0.0.1 — engine core, wasm, N-API, tests (npm `wongtty`; not on crates.io) |
+| Current release | 0.0.2 — engine, `wongtty/xterm`, N-API, tests (npm `wongtty`; not on crates.io) |
 | First customer | wmux |
 
 ### v0.5 change summary
