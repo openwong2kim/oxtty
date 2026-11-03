@@ -11,7 +11,7 @@ use web_sys::{
     WebGlVertexArrayObject,
 };
 
-use super::gl::{buffer_f32, start_program, Linking, PROJECTION_MATRIX};
+use super::gl::{buffer_f32, create_program, PROJECTION_MATRIX};
 use super::Dimensions;
 use crate::engine::Viewport;
 use crate::image::{self, Pixels};
@@ -77,12 +77,8 @@ pub struct ImageProgram {
 }
 
 impl ImageProgram {
-    pub fn start(gl: &Gl) -> Option<Linking> {
-        start_program(gl, &vertex_shader(), FRAGMENT_SHADER)
-    }
-
-    pub fn new(gl: &Gl, linking: Linking) -> Option<Self> {
-        let program = linking.finish(gl)?;
+    pub fn new(gl: &Gl) -> Option<Self> {
+        let program = create_program(gl, &vertex_shader(), FRAGMENT_SHADER)?;
         let projection = gl.get_uniform_location(&program, "u_projection")?;
         let texture = gl.get_uniform_location(&program, "u_texture")?;
         let placeholder = gl.get_uniform_location(&program, "u_placeholder")?;
