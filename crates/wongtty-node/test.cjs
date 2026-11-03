@@ -2,6 +2,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const fs = require('node:fs');
 const { Terminal } = require(path.join(__dirname, 'wongtty.node'));
 
 test('native binding mirrors the wasm API', () => {
@@ -217,7 +218,9 @@ test('index.d.ts declares every method and getter the binding exports', () => {
   assert.deepEqual(exported.filter((n) => !declared.has(n)), []);
 });
 
-test('textRows and searchRows of the wasm build give what the native ones give on the same output', async () => {
+// Needs the wasm build (scripts/build-wasm.sh); CI runs it in the wasm job, where that build exists.
+const wasmBuilt = fs.existsSync(path.join(__dirname, '../../packages/wongtty/dist/index.js'));
+test('textRows and searchRows of the wasm build give what the native ones give on the same output', { skip: !wasmBuilt && 'no wasm build' }, async () => {
   const wasm = await import('../../packages/wongtty/dist/index.js');
   await wasm.init();
   let seed = 11;

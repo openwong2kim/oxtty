@@ -42,7 +42,8 @@ const WAIT_ALL = `async (panes, ms) => {
 
 const gpu = await inPage(() => {
   const p = new T.Pane(4, 1);
-  const present = p.debug.present;
+  // Read the renderer directly: where Chrome gives no GPU context there may be no renderer state to read.
+  const present = p.term._rendererDebug()?.present;
   p.dispose();
   return present;
 });

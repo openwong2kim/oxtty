@@ -41,6 +41,8 @@ jobs:
         working-directory: packages/wongtty
       - run: npm run test:web
         working-directory: packages/wongtty
+      - run: bash scripts/build-node.sh
+      - run: node --test crates/wongtty-node/test.cjs
 
   node-binding:
     strategy:
