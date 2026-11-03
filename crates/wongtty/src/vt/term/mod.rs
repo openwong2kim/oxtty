@@ -1477,51 +1477,44 @@ impl<T> Term<T> {
         let (mut col, mut used) = (point.column.0, 0);
         let mut chars = text.chars();
         let mut marked = false;
-        while let Some(c) = chars.next() {
-            let width = match char_width(c) {
-                Some(width @ 1..=2) => width,
-                // The zerowidth characters after a cell this run wrote go on it (on a wide character's left half),
-                // interned once for all of them.
-                Some(0) if col > point.column.0 && extra.is_none() => {
-                    let mut marks = [c; MAX_MARKS];
-                    let mut n = 1;
-                    while n < MAX_MARKS {
-                        let mut ahead = chars.clone();
-                        match ahead.next() {
-                            Some(m) if char_width(m) == Some(0) => (marks[n], n, chars) = (m, n + 1, ahead),
-                            _ => break,
-                        }
-                    }
-                    let at = if cells[col - 1].flags.contains(Flags::WIDE_CHAR_SPACER) { col - 2 } else { col - 1 };
-                    let cell = &mut cells[at];
-                    if cell.extra.is_none() {
-                        cell.set_zerowidth(&marks[..n]);
-                    } else {
-                        marks[..n].iter().for_each(|&m| cell.push_zerowidth(m));
-                    }
-                    marked = true;
-                    used = text.len() - chars.as_str().len();
-                    continue;
-                },
-                _ => break,
-            };
-            if col + width > columns || (mapped && c.is_ascii()) {
-                break;
-            }
-            if width == 1 {
-                let Some(cell) = cells.get_mut(col).filter(|cell| !wide_cell(cell)) else { break };
-                let flags = if c == ' ' && !spacer { flags | Flags::TYPED_SPACE } else { flags };
-                *cell = Cell { c, fg, bg, flags, extra: None };
-            } else {
-                let Some([wide, right]) = cells.get_mut(col..col + 2) else { break };
-                if wide_cell(wide) || wide_cell(right) {
+        loop {
+            let mut zerowidth = None;
+            while let Some(c) = chars.next() {
+                let width = match char_width(c) {
+                    Some(width @ 1..=2) => width,
+                    Some(0) => {
+                        zerowidth = Some(c);
+                        break;
+                    },
+                    _ => break,
+                };
+                if col + width > columns || (mapped && c.is_ascii()) {
                     break;
                 }
-                *wide = Cell { c, fg, bg, flags: flags | Flags::WIDE_CHAR, extra: None };
-                *right = Cell { c: ' ', fg, bg, flags: flags | Flags::WIDE_CHAR_SPACER, extra: None };
+                if width == 1 {
+                    let Some(cell) = cells.get_mut(col).filter(|cell| !wide_cell(cell)) else { break };
+                    let flags = if c == ' ' && !spacer { flags | Flags::TYPED_SPACE } else { flags };
+                    *cell = Cell { c, fg, bg, flags, extra: None };
+                } else {
+                    let Some([wide, right]) = cells.get_mut(col..col + 2) else { break };
+                    if wide_cell(wide) || wide_cell(right) {
+                        break;
+                    }
+                    *wide = Cell { c, fg, bg, flags: flags | Flags::WIDE_CHAR, extra: None };
+                    *right = Cell { c: ' ', fg, bg, flags: flags | Flags::WIDE_CHAR_SPACER, extra: None };
+                }
+                col += width;
+                used = text.len() - chars.as_str().len();
             }
-            col += width;
-            used = text.len() - chars.as_str().len();
+            // The zerowidth characters after a cell this run wrote go on it, then the run goes on.
+            match zerowidth {
+                Some(c) if col > point.column.0 && extra.is_none() => {
+                    put_marks(&mut cells[..col], c, &mut chars);
+                    marked = true;
+                    used = text.len() - chars.as_str().len();
+                },
+                _ => break,
+            }
         }
         // The pen's extra goes on afterwards, so the loop has no reference count to keep.
         if let Some(extra) = extra {
@@ -1561,6 +1554,29 @@ impl<T> Term<T> {
         };
         trace!("Setting keyboard mode to {new_mode:?}");
         self.mode |= new_mode;
+    }
+}
+
+/// wongtty: puts zerowidth character `first` and those that follow it in `chars` on the last of `cells` (a wide
+/// character's left half), interned once for all of them, as `input` puts each.
+#[inline(never)]
+fn put_marks(cells: &mut [Cell], first: char, chars: &mut str::Chars<'_>) {
+    let mut marks = [first; MAX_MARKS];
+    let mut n = 1;
+    while n < MAX_MARKS {
+        let mut ahead = chars.clone();
+        match ahead.next() {
+            Some(m) if char_width(m) == Some(0) => (marks[n], n, *chars) = (m, n + 1, ahead),
+            _ => break,
+        }
+    }
+    let last = cells.len() - 1;
+    let at = if cells[last].flags.contains(Flags::WIDE_CHAR_SPACER) { last - 1 } else { last };
+    let cell = &mut cells[at];
+    if cell.extra.is_none() {
+        cell.set_zerowidth(&marks[..n]);
+    } else {
+        marks[..n].iter().for_each(|&m| cell.push_zerowidth(m));
     }
 }
 

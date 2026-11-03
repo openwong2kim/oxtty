@@ -1504,6 +1504,17 @@ fn plain(cells: &[Cell], mut at: usize, out: &mut Out) -> (usize, usize) {
     let (mut end, mut end_units, mut end_out) = (at, at, out.at);
     while at < scan {
         let cell = &cells[at];
+        // Narrow ASCII text, as `ascii` writes it (the text between clusters).
+        if (cell.c as u32 >= 0x21) & (cell.c as u32 <= 0x7e) {
+            let n = ascii(&cells[at..], out, Flags::empty(), |c| {
+                matches!(c.fg, DEFAULT_FG) & matches!(c.bg, DEFAULT_BG)
+            });
+            if n > 0 {
+                (at, units) = (at + n, units + n);
+                (end, end_units, end_out) = (at, units, out.at);
+                continue;
+            }
+        }
         // The cell after it, which a wide character's right half has to be. Past the end the cell itself, which
         // then is no right half.
         let next = &cells[min(at + 1, scan - 1)];
