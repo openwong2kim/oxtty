@@ -16,8 +16,6 @@ use crate::parser::Parsed;
 use crate::render::{Dirty, Renderer};
 use crate::timer;
 
-/// Feed the engine at most this long per task, then yield to the next task (xterm.js WriteBuffer).
-const TIME_BUDGET_MS: f64 = 12.0;
 /// Bytes or UTF-16 units fed per engine call.
 const SLICE: u32 = 16 * 1024;
 /// Options that only the constructor takes, like xterm.js.
@@ -128,7 +126,13 @@ pub(crate) struct Shared {
     state: Cell<State>,
     /// Serialises OSC 52 reads so each answers the oldest pending read.
     clipboard_reads: RefCell<Promise>,
-    drain_timer: RefCell<Option<timer::Timeout>>,
+    /// Waiting for a turn of the write scheduler, or in one.
+    drain_queued: Cell<bool>,
+    /// A size `resize` was given while the engine already reflowed since the last frame: applied by the next
+    /// frame or write, so a window drag reflows once per frame.
+    resize_pending: Cell<Option<(u32, u32)>>,
+    /// The engine reflowed since the last frame started.
+    resized: Cell<bool>,
     frame: RefCell<Option<timer::AnimationFrame>>,
     options_proxy: RefCell<Option<(Proxy, ProxySetTrap)>>,
     /// `onCrash` and `onSyncFlush` the engine holds; they live as long as the terminal.
@@ -209,7 +213,9 @@ impl Terminal {
             images: RefCell::new(None),
             state: Cell::new(State::default()),
             clipboard_reads: RefCell::new(Promise::resolve(&JsValue::UNDEFINED)),
-            drain_timer: RefCell::new(None),
+            drain_queued: Cell::new(false),
+            resize_pending: Cell::new(None),
+            resized: Cell::new(false),
             frame: RefCell::new(None),
             options_proxy: RefCell::new(None),
             engine_callbacks: (on_crash, on_sync_flush),
@@ -226,12 +232,12 @@ impl Terminal {
 
     #[wasm_bindgen(getter)]
     pub fn cols(&self) -> u32 {
-        self.shared.core.borrow().size().0
+        self.size().0
     }
 
     #[wasm_bindgen(getter)]
     pub fn rows(&self) -> u32 {
-        self.shared.core.borrow().size().1
+        self.size().1
     }
 
     #[wasm_bindgen(getter)]
@@ -353,35 +359,25 @@ impl Terminal {
         self.write("\r\n".into(), callback);
     }
 
+    /// A second resize before the next frame only records the size (`cols`/`rows` report it at once); the frame,
+    /// or a write before it, reflows once and fires `onResize` then.
     pub fn resize(&self, cols: u32, rows: u32) -> Result<(), JsValue> {
-        let rows_changed = {
-            let mut core = self.shared.core.borrow_mut();
-            let engine = core.view.engine();
-            if core.disposed || (cols == engine.cols() && rows == engine.rows()) {
-                return Ok(());
-            }
-            let old_rows = engine.rows();
-            engine.resize(cols, rows)?;
-            let (cols, rows) = (engine.cols(), engine.rows());
-            core.view.resized();
-            Reflect::set(&core.options, &"cols".into(), &cols.into())?;
-            Reflect::set(&core.options, &"rows".into(), &rows.into())?;
-            if let Some(renderer) = core.renderer.as_mut() {
-                renderer.resize(cols, rows);
-            }
-            rows != old_rows
-        };
-        // The selection drops on row changes and the hovered link is let go, before `onResize` (xterm.js).
-        crate::selection::after_resize(&self.shared, rows_changed);
-        crate::links::after_resize(&self.shared);
-        crate::input::after_resize(&self.shared);
-        self.shared.sync_screen_size();
-        let size = Object::new();
-        Reflect::set(&size, &"cols".into(), &self.cols().into())?;
-        Reflect::set(&size, &"rows".into(), &self.rows().into())?;
-        self.shared.events.resize.fire(&[&size]);
-        self.shared.after_change();
-        Ok(())
+        let shared = &self.shared;
+        let open = shared.core.borrow().element.is_some();
+        if open && shared.resized.get() {
+            let core = shared.core.borrow();
+            let applied = core.size();
+            shared
+                .resize_pending
+                .set(((cols, rows) != applied).then_some((cols, rows)));
+            // `options` answers like `cols`/`rows`, so `options.cols = term.cols` stays a no-op.
+            set_size(&core.options, cols, rows)?;
+            drop(core);
+            shared.schedule_frame();
+            return Ok(());
+        }
+        shared.resize_pending.set(Some((cols, rows)));
+        shared.apply_pending_resize()
     }
 
     /// Positive `amount` scrolls down towards the newest output.
@@ -405,7 +401,7 @@ impl Terminal {
         if core.disposed {
             return;
         }
-        core.disposed_size = core.size();
+        core.disposed_size = self.shared.resize_pending.take().unwrap_or(core.size());
         core.disposed = true;
         core.queue.clear();
         // Hook: input, mouse, selection and accessibility remove their listeners here.
@@ -425,7 +421,6 @@ impl Terminal {
         crate::markers::drop_all(&self.shared);
         crate::parser::dispose(&self.shared);
         crate::image::dispose(&self.shared);
-        self.shared.drain_timer.borrow_mut().take();
         self.shared.frame.borrow_mut().take();
         self.shared.options_proxy.borrow_mut().take();
         let e = &self.shared.events;
@@ -449,18 +444,31 @@ impl Terminal {
     }
 }
 
+impl Terminal {
+    fn size(&self) -> (u32, u32) {
+        let pending = self.shared.resize_pending.get();
+        pending.unwrap_or_else(|| self.shared.core.borrow().size())
+    }
+}
+
 impl Shared {
     pub(crate) fn schedule_drain(self: &Rc<Self>) {
-        if self.drain_timer.borrow().is_some() {
+        if self.drain_queued.replace(true) {
             return;
         }
-        let weak = Rc::downgrade(self);
-        *self.drain_timer.borrow_mut() = Some(timer::Timeout::new(0, move || {
-            if let Some(shared) = weak.upgrade() {
-                shared.drain_timer.borrow_mut().take();
-                shared.drain();
-            }
-        }));
+        timer::schedule(Rc::downgrade(self));
+    }
+
+    /// A turn of the write scheduler ([`timer::schedule`]): parses until `until`; returns whether writes are left.
+    pub(crate) fn drain_turn(self: Rc<Self>, until: f64) -> bool {
+        // The frame drain may have parsed everything: nothing to report again.
+        if self.writes_queued() {
+            self.drain(until);
+        }
+        // A paused parser queues the terminal again when it resumes; a disposed one keeps nothing queued.
+        let more = !crate::parser::paused(&self) && self.writes_queued();
+        self.drain_queued.set(more);
+        more
     }
 
     /// Whether writes wait in the queue.
@@ -468,15 +476,17 @@ impl Shared {
         !self.core.borrow().queue.is_empty()
     }
 
-    /// Feeds queued writes for up to [`TIME_BUDGET_MS`]. A crashed engine drops the chunk it was fed. An async
-    /// parser handler holds the queue: the chunk it stopped in stays first, its callback waits.
-    fn drain(self: &Rc<Self>) {
+    /// Feeds queued writes until `until` (a [`timer::now`] time), at least one slice. A crashed engine drops the
+    /// chunk it was fed. An async parser handler holds the queue: the chunk it stopped in stays first, its
+    /// callback waits.
+    fn drain(self: &Rc<Self>, until: f64) {
         if crate::parser::paused(self) {
             return;
         }
-        let start = timer::now();
         let mut paused = false;
         loop {
+            // Also a resize a write callback just deferred: the next chunk parses at the size `cols` reports.
+            self.apply_pending_resize_logged();
             let (slice, rest) = {
                 let core = self.core.borrow();
                 if core.disposed {
@@ -521,12 +531,9 @@ impl Shared {
                     }
                 }
             }
-            if timer::now() - start >= TIME_BUDGET_MS {
+            if timer::now() >= until {
                 break;
             }
-        }
-        if !paused && self.writes_queued() {
-            self.schedule_drain();
         }
         {
             let mut core = self.core.borrow_mut();
@@ -766,7 +773,71 @@ impl Shared {
         });
     }
 
+    /// Reflows to the size a second `resize` before this frame asked for.
+    fn apply_pending_resize(self: &Rc<Self>) -> Result<(), JsValue> {
+        let Some((cols, rows)) = self.resize_pending.take() else {
+            return Ok(());
+        };
+        let rows_changed = {
+            let mut core = self.core.borrow_mut();
+            let engine = core.view.engine();
+            if core.disposed || (cols == engine.cols() && rows == engine.rows()) {
+                return Ok(());
+            }
+            self.resized.set(true);
+            let old_rows = engine.rows();
+            engine.resize(cols, rows)?;
+            let (cols, rows) = (engine.cols(), engine.rows());
+            core.view.resized();
+            set_size(&core.options, cols, rows)?;
+            if let Some(renderer) = core.renderer.as_mut() {
+                renderer.resize(cols, rows);
+            }
+            rows != old_rows
+        };
+        // The selection drops on row changes and the hovered link is let go, before `onResize` (xterm.js).
+        crate::selection::after_resize(self, rows_changed);
+        crate::links::after_resize(self);
+        crate::input::after_resize(self);
+        self.sync_screen_size();
+        let (cols, rows) = self.core.borrow().size();
+        let size = Object::new();
+        set_size(&size, cols, rows)?;
+        self.events.resize.fire(&[&size]);
+        self.after_change();
+        Ok(())
+    }
+
+    /// [`Self::apply_pending_resize`] where nobody takes its error; also before reads of the buffer, so they see
+    /// the size `cols`/`rows` report. Not under a borrow of the core (a read from a parser handler).
+    #[inline(never)]
+    pub(crate) fn apply_pending_resize_logged(self: &Rc<Self>) {
+        if self.resize_pending.get().is_none() || self.core.try_borrow_mut().is_err() {
+            return;
+        }
+        if let Err(error) = self.apply_pending_resize() {
+            web_sys::console::error_1(&error);
+        }
+    }
+
     fn render_frame(self: &Rc<Self>) {
+        // A resize this frame applies keeps the next one waiting for the frame after.
+        let pending = self.resize_pending.get().is_some();
+        self.apply_pending_resize_logged();
+        self.resized.set(pending);
+        // Writes that came since the last frame show in this one, within the scheduler's frame budget.
+        let deadline = timer::frame_started(self.writes_queued());
+        if let Some(until) = deadline {
+            self.drain(until);
+        }
+        // The resize and the drain asked for the frame being drawn now.
+        if pending || deadline.is_some() {
+            self.frame.borrow_mut().take();
+            // A listener or write callback in this frame resized again: that size needs the next frame.
+            if self.resize_pending.get().is_some() {
+                self.schedule_frame();
+            }
+        }
         self.handle_renderer_requests();
         self.apply_scroll_requests();
         let (rows, content, switched) = {
@@ -864,6 +935,13 @@ fn split_chunk(data: &JsValue) -> (JsValue, Option<JsValue>) {
         text.slice(0, n).into(),
         Some(text.slice(n, text.length()).into()),
     )
+}
+
+/// `{ cols, rows }` on `target`.
+fn set_size(target: &Object, cols: u32, rows: u32) -> Result<(), JsValue> {
+    Reflect::set(target, &"cols".into(), &cols.into())?;
+    Reflect::set(target, &"rows".into(), &rows.into())?;
+    Ok(())
 }
 
 fn is_high_surrogate(unit: u16) -> bool {

@@ -145,6 +145,8 @@ impl Terminal {
         &self,
         #[wasm_bindgen(unchecked_optional_param_type = "AnsiSnapshotOptions")] options: JsValue,
     ) -> Result<JsValue, JsValue> {
+        // At the size `cols`/`rows` report, also with a resize waiting for the frame.
+        self.shared.apply_pending_resize_logged();
         match self.shared.core.try_borrow() {
             Ok(core) if !core.disposed => core.view.engine().ansi_snapshot(&options),
             _ => Err("wongtty/xterm: the terminal is disposed".into()),
