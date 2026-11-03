@@ -10,6 +10,17 @@
 // the window are counted in the page. Then the GPU process again after the terminals idled IDLE_MS. With TYPING=1
 // the first terminal is focused and gets an echoed character every 100 ms instead of output, and the echo latency
 // is reported.
+//
+// KINDS picks the engines (default wongtty,xterm); RUNS repeats them, interleaved (the kind order rotates per run), and
+// prints the medians at the end. Each run also reports the GPU process peak over samples every 2 s while busy, the
+// footprint of every browser process (all-process total), the WebGL contexts made and lost, and the load average.
+// ARGS adds Chrome switches to every kind (for example ARGS=--disable-features=SkiaGraphite). A kind may end in
+// `#<set>` for a named set of switches of its own, so a switch is compared with and without it in the same run:
+// `#nograph` is --disable-features=SkiaGraphite (KINDS=wongtty,wongtty#nograph).
+// The dpr is the screen scale factor of a 4500×4500 window (--force-device-scale-factor); SCALE=emulate emulates it in
+// the page instead, where xterm.js's WebGL canvas stays at dpr 1.
+import { chromium } from 'playwright-core';
+import { execFileSync } from 'node:child_process';
 import { footprintDetail, launch, mb, pids, serve } from './common.mjs';
 
 const [panes = 17, seconds = 12, dpr = 1, interval = 50] = process.argv.slice(2).map(Number);
@@ -17,12 +28,71 @@ const [panes = 17, seconds = 12, dpr = 1, interval = 50] = process.argv.slice(2)
 const IDLE_MS = 5000;
 const server = await serve();
 
+const RUNS = Number(process.env.RUNS ?? 1);
+const KINDS = process.env.KINDS?.split(',') ?? ['wongtty', 'xterm'];
+const ARGS = process.env.ARGS ? process.env.ARGS.split(' ') : [];
+const SWITCH_SETS = { nograph: ['--disable-features=SkiaGraphite'] };
+/** The engine and the Chrome switches of a kind such as `wongtty#nograph`. */
+function parseKind(kind) {
+  const [engine, set] = kind.split('#');
+  if (set && !SWITCH_SETS[set]) throw new Error(`unknown switch set #${set} (known: ${Object.keys(SWITCH_SETS).join(', ')})`);
+  return { engine, args: [...ARGS, ...(set ? SWITCH_SETS[set] : [])] };
+}
+KINDS.forEach(parseKind);
+// The device pixel ratio comes from a real screen scale factor by default. With page emulation (SCALE=emulate, the
+// old way) ResizeObserver's device-pixel-content-box still reports CSS pixels, so xterm.js's addon-webgl sizes its
+// drawing buffer at dpr 1 while devicePixelRatio says 2.
+const EMULATE = process.env.SCALE === 'emulate';
+const browserFor = (args) =>
+  EMULATE && !args.length
+    ? launch()
+    : chromium.launch({
+        channel: 'chrome',
+        headless: true,
+        args: ['--use-angle=metal', '--enable-gpu', '--ignore-gpu-blocklist', ...(EMULATE ? [] : [`--force-device-scale-factor=${dpr}`, '--window-size=4500,4500']), ...args],
+      });
+// The GPU process of a fresh browser drops its startup surfaces about 5 s after launch; the empty page is read after.
+const SETTLE = Number(process.env.SETTLE ?? 6000);
+const loadavg = () => execFileSync('sysctl', ['-n', 'vm.loadavg']).toString().trim();
+
+/** Page init script: counts the WebGL contexts the page makes and the `webglcontextlost` events they get. */
+function countContexts() {
+  window.glContexts = { made: 0, lost: 0 };
+  // Weak, so counting keeps no short-lived context (such as page.mjs's renderer-info one) alive and in the GPU process.
+  const made = [];
+  // Device pixels of every live WebGL drawing buffer, in millions.
+  window.glBufferMpx = () =>
+    made.reduce((a, ref) => {
+      const gl = ref.deref();
+      return a + (!gl || gl.isContextLost() ? 0 : gl.drawingBufferWidth * gl.drawingBufferHeight);
+    }, 0) / 1e6;
+  for (const C of [globalThis.HTMLCanvasElement, globalThis.OffscreenCanvas]) {
+    if (!C) continue;
+    const getContext = C.prototype.getContext;
+    C.prototype.getContext = function (type, ...rest) {
+      const ctx = getContext.call(this, type, ...rest);
+      if (ctx && /webgl/.test(type) && !this.glCounted) {
+        this.glCounted = true;
+        window.glContexts.made++;
+        made.push(new WeakRef(ctx));
+        this.addEventListener('webglcontextlost', () => window.glContexts.lost++);
+      }
+      return ctx;
+    };
+  }
+}
+
 async function measure(kind) {
-  const browser = await launch();
+  const { engine, args } = parseKind(kind);
+  const browser = await browserFor(args);
   try {
-    const page = await browser.newPage({ viewport: { width: 4500, height: 4500 }, deviceScaleFactor: dpr });
+    const page = await browser.newPage(EMULATE ? { viewport: { width: 4500, height: 4500 }, deviceScaleFactor: dpr } : { viewport: null });
+    await page.addInitScript(countContexts);
     const errors = [];
     page.on('pageerror', (e) => errors.push(e.message));
+    page.on('console', (m) => {
+      if (/WebGL|context/i.test(m.text())) errors.push(`console: ${m.text().slice(0, 120)}`);
+    });
     await page.goto(`http://127.0.0.1:${server.address().port}/`);
     await page.waitForFunction(() => window.ready, null, { timeout: 60000 });
     const browserCdp = await browser.newBrowserCDPSession();
@@ -30,24 +100,39 @@ async function measure(kind) {
       const p = await pids(browserCdp);
       return (p.gpu ?? p.GPU)[0];
     };
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(SETTLE);
     const empty = footprintDetail(await gpuPid());
     await page.evaluate(([k, n, mixed]) => {
       window.mixed = mixed;
       return window.setup(k, n, 120, 40, 1000, false);
-    }, [kind, panes, !!process.env.MIXED]);
+    }, [engine, panes, !!process.env.MIXED]);
     await page.waitForTimeout(2000);
     const before = footprintDetail(await gpuPid());
     await page.evaluate(() => window.counts());
     await page.evaluate(([i, typing]) => window.startBusy(i, typing), [interval, !!process.env.TYPING]);
-    await page.waitForTimeout(seconds * 1000 - 1000);
+    const started = Date.now();
+    const samples = [];
+    while (Date.now() - started < seconds * 1000 - 3000) {
+      await page.waitForTimeout(2000);
+      samples.push(footprintDetail(await gpuPid()).total);
+    }
+    await page.waitForTimeout(Math.max(0, seconds * 1000 - 1000 - (Date.now() - started)));
     const busy = footprintDetail(await gpuPid());
-    await page.waitForTimeout(1000);
+    samples.push(busy.total);
+    // Every browser process's footprint while busy, by CDP process type.
+    const byType = {};
+    for (const [type, ids] of Object.entries(await pids(browserCdp))) {
+      for (const id of ids) byType[type] = (byType[type] ?? 0) + footprintDetail(id).total;
+    }
+    await page.waitForTimeout(Math.max(0, seconds * 1000 - (Date.now() - started)));
     const { frames, echoes } = await page.evaluate(() => window.stopBusy());
+    // The footprint reads under load can stretch the busy window past `seconds`; frames/s uses the real length.
+    const busyMs = Date.now() - started;
     const counts = await page.evaluate(() => window.counts());
+    const contexts = await page.evaluate(() => ({ ...window.glContexts, mpx: window.glBufferMpx() }));
     await page.waitForTimeout(IDLE_MS);
     const after = footprintDetail(await gpuPid());
-    return { kind, errors, empty, before, busy, after, frames, echoes, counts };
+    return { kind, errors, empty, before, busy, after, frames, busyMs, echoes, counts, contexts, peak: Math.max(...samples), byType, load: loadavg() };
   } finally {
     await browser.close();
   }
@@ -55,16 +140,27 @@ async function measure(kind) {
 
 const cat = (f, e, k) => mb((f.categories[k] ?? 0) - (e.categories[k] ?? 0));
 console.log(`${panes} panes of ${process.env.MIXED ? '92–120×30–40' : '120×40'} printing 3 lines every ${interval} ms for ${seconds} s, dpr ${dpr}`);
+const results = [];
 try {
-  for (const kind of process.env.KINDS?.split(',') ?? ['wongtty', 'xterm']) {
+  for (let run = 0; run < RUNS; run++) for (let i = 0; i < KINDS.length; i++) {
+    const kind = KINDS[(run + i) % KINDS.length];
     const r = await measure(kind);
+    results.push(r);
     const { gl, drawImage, bitmap } = r.counts;
     console.log(
       `${kind.padEnd(8)} errors=${r.errors.length} | GPU process footprint ${mb(r.busy.total)} MB busy, ${mb(r.before.total)} before ` +
         `(over empty page +${mb(r.busy.total - r.empty.total)}: IOSurface +${cat(r.busy, r.empty, 'IOSurface')}, ` +
-        `IOAccelerator (graphics) +${cat(r.busy, r.empty, 'IOAccelerator (graphics)')}) | ${r.frames} frames, ` +
+        `IOAccelerator (graphics) +${cat(r.busy, r.empty, 'IOAccelerator (graphics)')}) | ${r.frames} frames in ${(r.busyMs / 1000).toFixed(1)} s ` +
+        `(${((r.frames * 1000) / r.busyMs).toFixed(1)}/s), ` +
         `WebGL draws ${gl} (${(gl / r.frames).toFixed(1)}/frame), drawImage ${drawImage} (${(drawImage / r.frames).toFixed(1)}/frame), ` +
         `transferFromImageBitmap ${bitmap} | idle ${IDLE_MS / 1000} s after: ${mb(r.after.total)} MB (+${mb(r.after.total - r.empty.total)})`,
+    );
+    const all = Object.values(r.byType).reduce((a, b) => a + b, 0);
+    const types = Object.entries(r.byType).map(([t, b]) => `${t} ${mb(b)}`).join(', ');
+    console.log(
+      `  run ${Math.floor((results.length - 1) / KINDS.length) + 1}: GPU peak ${mb(r.peak)} MB, IOSurface ${mb(r.busy.categories['IOSurface'] ?? 0)}, ` +
+        `IOAccelerator (graphics) ${mb(r.busy.categories['IOAccelerator (graphics)'] ?? 0)}, IOAccelerator ${mb(r.busy.categories['IOAccelerator'] ?? 0)} | ` +
+        `all processes ${mb(all)} MB (${types}) | WebGL contexts ${r.contexts.made}, lost ${r.contexts.lost}, drawing buffers ${r.contexts.mpx.toFixed(1)} Mpx | load ${r.load}`,
     );
     if (r.echoes.length) {
       const ms = r.echoes.map((e) => e[0]).sort((a, b) => a - b);
@@ -77,4 +173,17 @@ try {
   }
 } finally {
   server.close();
+}
+if (RUNS > 1) {
+  const median = (v) => [...v].sort((a, b) => a - b)[v.length >> 1];
+  const all = (r) => Object.values(r.byType).reduce((a, b) => a + b, 0);
+  for (const kind of KINDS) {
+    const rs = results.filter((r) => r.kind === kind);
+    const m = (f) => mb(median(rs.map(f)));
+    console.log(
+      `median of ${rs.length} ${kind.padEnd(8)} GPU busy ${m((r) => r.busy.total)} MB, peak ${m((r) => r.peak)}, idle ${m((r) => r.after.total)} | ` +
+        `IOSurface ${m((r) => r.busy.categories['IOSurface'] ?? 0)}, IOAccelerator (graphics) ${m((r) => r.busy.categories['IOAccelerator (graphics)'] ?? 0)} | ` +
+        `all processes ${m(all)} MB | contexts lost ${rs.map((r) => r.contexts.lost).join(',')}`,
+    );
+  }
 }
