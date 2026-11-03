@@ -10,7 +10,7 @@ Or use `wongtty/xterm`, the xterm.js API with a WebGL2 renderer, also in Rust.
 [![ci](https://github.com/openwong2kim/wongtty/actions/workflows/ci.yml/badge.svg)](https://github.com/openwong2kim/wongtty/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE-APACHE)
 ![rust](https://img.shields.io/badge/rust-1.85%2B-orange)
-![wasm](https://img.shields.io/badge/engine%20wasm-308%20KB%20%C2%B7%20112%20KB%20gzip-654ff0)
+![wasm](https://img.shields.io/badge/engine%20wasm-335%20KiB%20%C2%B7%20125%20KiB%20gzip-654ff0)
 ![status](https://img.shields.io/badge/status-0.0.1%20experimental-lightgrey)
 
 [Measurements](#measurements) · [Quick start](#quick-start) · [xterm.js API](#wongttyxterm-the-xtermjs-api) · [The model](#the-model) · [xterm.js parity](#xtermjs-parity) · [Roadmap](#roadmap)
@@ -158,8 +158,8 @@ does, 17 terminals take 5.1 MiB of engine memory instead of 41.1 MiB
 
 | Module | Bytes | gzip | Budget |
 | --- | ---: | ---: | --- |
-| Engine `wongtty.wasm` | 339,182 | 124,328 | 340 KiB |
-| Front end `xterm_web_bg.wasm` (`wongtty/xterm` only) | 774,006 | 292,898 | 800 KiB raw, 300 KiB gzip |
+| Engine `wongtty.wasm` | 342,597 | 127,977 | 340 KiB |
+| Front end `xterm_web_bg.wasm` (`wongtty/xterm` only) | 781,162 | 295,833 | 800 KiB raw, 300 KiB gzip |
 
 One instance of each serves every terminal on a page, so the code is paid
 once, not per pane. `scripts/build-web.sh` and `test/web/size.test.mjs` fail
@@ -176,19 +176,21 @@ scrollback, wongtty (wasm) against `@xterm/headless`.
 
 **Parser throughput** — MiB/s, higher is better. Node 22 on an Apple M4,
 120×40 with 10,000 lines of scrollback, 8 MiB of generated output per row fed
-in 64 KiB chunks, median of 5 runs (2026-11-03).
-All three end on the same screen.
+in 64 KiB chunks, the median of 3 runs, each the median of 5 passes
+(2026-11-03, load 2.1–2.3). All three end on the same screen. Native here is
+the N-API module called from Node; [Against other engines](#against-other-engines)
+calls the engine from Rust.
 `node --expose-gc packages/wongtty/bench/throughput.mjs` reproduces it after
 building the wasm and N-API modules.
 
 | Output | wongtty native | wongtty wasm | xterm.js headless |
 | --- | ---: | ---: | ---: |
-| Log lines, some colour | 353 | 206 | 96 |
-| Truecolor fg and bg in every cell | 733 | 560 | 138 |
-| Hangul, CJK and emoji | 248 | 184 | 97 |
-| Cursor jumps (TUI redraw) | 534 | 294 | 109 |
-| Scrolling region (DECSTBM) | 429 | 260 | 38 |
-| Short lines into scrollback | 244 | 139 | 57 |
+| Log lines, some colour | 499 | 318 | 96 |
+| Truecolor fg and bg in every cell | 743 | 548 | 142 |
+| Hangul, CJK and emoji | 319 | 252 | 101 |
+| Cursor jumps (TUI redraw) | 528 | 291 | 110 |
+| Scrolling region (DECSTBM) | 503 | 337 | 41 |
+| Short lines into scrollback | 311 | 196 | 59 |
 
 **Compressed history outside the engine** — with
 [`TermHistory`](#compressed-history-for-your-own-term), replaying an 8 MB
@@ -196,12 +198,24 @@ output ring into 100,000 lines of scrollback peaked at 11 MiB, against 143 MiB
 for xterm.js headless (wmux daemon experiment, local).
 
 **The cost.** Each line that scrolls off is compressed on its way into
-history. Natively, against the same engine keeping history uncompressed, that
-costs 5% on short lines, 22% on Hangul lines and 26% on long wrapped lines
-(see [Against other engines](#against-other-engines)), and it is why Ghostty
-stays ahead on Hangul output. On log lines the compressed engine is the
-faster one, 510 against 406 MiB/s: the uncompressed one first allocates and
-faults in 30 MiB of rows.
+history. Natively, against the same engine keeping history uncompressed (see
+[Against other engines](#against-other-engines)):
+
+- While history fills for the first time, the uncompressed engine also
+  allocates and faults in 30 MiB of rows. Compression then costs 3% on agent
+  log lines with emoji, 5% on short lines, 22% on Hangul lines and 26% on long
+  wrapped lines; on log lines the compressed engine is faster, 510 against 406
+  MiB/s.
+- Once history is full, as it is in every terminal that runs for a while, it
+  costs more: 13% on log lines (515 against 595 MiB/s), 12% on short lines
+  (319 against 362), 31% on agent log lines with emoji (276 against 397), 33%
+  on Hangul lines (321 against 478) and 50% on long wrapped lines (335 against
+  669). The history takes 0.8–2.0 MiB of RSS against 30.2 MiB uncompressed.
+
+The full-history figures come from `--steady`: the median of 3 interleaved
+rounds, each the median of 5 passes, load 2.1–2.6. Compression explains part
+of the pinned Ghostty's lead on Hangul (334 MiB/s; wongtty uncompressed runs
+395 on the first fill); Ghostty main, at 567, is ahead of both.
 
 **Many panes in a browser** — 20 panes of 120×40 on one page, all in view
 and all printing; system Chrome on the GPU, Apple M4, 2026-11-02, median of 3
@@ -245,18 +259,20 @@ wongtty is not first everywhere:
   uncompressed, about 10 MiB per terminal where wongtty takes 0.7–1.9. With
   50,000 lines of scrollback Rio falls to 305 MiB/s on log lines and wongtty,
   at 508, leads.
-- **Ghostty** leads on Hangul (334, and 567 for Ghostty main, against 309),
-  agent log lines with emoji (501 against 269) and long wrapped lines (582,
-  Ghostty main 611). wongtty compresses each line on its way into history;
-  with history uncompressed it runs Hangul at 395, ahead of the pinned Ghostty
-  but not of Ghostty main.
+- **Ghostty** leads on Hangul (334, and 567 for Ghostty main, against 309) and
+  agent log lines with emoji (501 against 269), and is ahead of wongtty on long
+  wrapped lines (582, Ghostty main 611, against 327). wongtty compresses each
+  line on its way into history; with history uncompressed it runs Hangul at
+  395, ahead of the pinned Ghostty but not of Ghostty main.
 - **Ghostty main** leads wongtty on grapheme clusters (219 against 205), with
   a screen that differs from wongtty's on that output.
 - **An empty terminal** takes 0.13 MiB in wongtty, 0.05 in Rio and 0.02 in
   Ghostty (17 terminals before any output, footprint per terminal).
 - **Ghostty after an idle compression pass** holds agent log lines in 0.83
-  MiB and long wrapped lines in 1.55, against wongtty's 1.09 and 1.66. Reading
-  that history back costs it 8–10 MiB again (below).
+  MiB and long wrapped lines in 1.55, against wongtty's 1.09 and 1.66.
+  Scrolling, resizing, reading out or serializing a compressed history
+  inflated it again by 6.0–10.6 MiB on log lines, truecolor and Hangul (below);
+  agent log lines and long wrapped lines were not measured that way.
 
 **Native, MiB/s**, higher is better. Each engine gets the same corpus as the
 table above, 120×40 with 10,000 lines of scrollback fed in 64 KiB chunks: 8
@@ -285,10 +301,11 @@ clusters 18.4 against 17.5 for Ghostty main.
 
 wongtty, uncompressed, is slower than Ghostty on log lines (406 against 430)
 because it fills its history for the first time: it allocates and faults in
-30 MiB of rows. Fed again with that history full, it runs at 597 MiB/s and
-Ghostty at 436. With 50,000 lines of scrollback its rows of 24-byte cells grow
-to about 140 MiB, and it falls to 173 MiB/s; wongtty runs at 508 and Ghostty
-at 328. The parser is the same in both; what changes is the memory it writes.
+30 MiB of rows. Fed again with that history full (`--steady`, 3 interleaved
+rounds, load 2.1), it runs at 595 MiB/s, wongtty at 515 and Ghostty at 450.
+With 50,000 lines of scrollback its rows of 24-byte cells grow to about 140
+MiB, and it falls to 173 MiB/s; wongtty runs at 508 and Ghostty at 328. The
+parser is the same in both; what changes is the memory it writes.
 
 **Native, peak RSS growth in MiB**, lower is better. This is the memory one
 engine takes to swallow one output, in a fresh process, median of the 3 runs.
@@ -320,18 +337,24 @@ footprint growth in MiB after the output, and after the pass.
 | Long wrapped lines | 1.66 | 9.80 | **1.55** | **1.55** |
 | Grapheme clusters | **2.28** | 18.58 | 4.33 | 4.83 |
 
-Compressed pages inflate again when they are read. Scrolling through the
-whole history a page at a time, reading every visible cell as a renderer does,
-grew the compressed Ghostty's footprint by 10.2 MiB on log lines, 9.8 on
-Hangul and 7.9 on truecolor, and taking the whole buffer's text grew it by
-7.1–10.5 MiB. The same scroll grew wongtty's by 0.1 MiB.
+Compressed pages inflate again when they are read or reflowed. Footprint that
+stayed with the compressed Ghostty after one operation, from the `scrollback`
+bench below, on log lines, Hangul and truecolor: scrolling through the whole
+history a page at a time, reading every visible cell as a renderer does, 10.2,
+9.8 and 7.9 MiB; one resize to 100 columns, 9.8, 9.4 and 6.0; the whole
+buffer's text, 10.5, 7.9 and 7.1; serializing it, 10.6, 7.9 and 9.7. A search
+kept 0.1–3.3 MiB and clearing the history nothing. The same scroll grew
+wongtty's footprint by 0.1 MiB.
 
 **Operations on a full scrollback**, native, milliseconds, lower is better.
 Each engine first swallows one output (10,000 lines of history; 1,989 for
 truecolor), then one operation runs in a fresh process; the figure is the
 median of 3 processes, each the median of its own repetitions. Ghostty,
-compressed, is the same engine after the compression pass above. Load 2.8.
-Alacritty has no serializer; Rio is not in this bench.
+compressed, is the same engine after the compression pass above. Load 2.8;
+3.0–3.4 for the Ghostty main pass. Alacritty has no serializer; Rio is not in
+this bench. Alacritty's search finds a different number of common matches
+(36 against 63 on truecolor, 42,236 against 45,999 on Hangul), and so does
+Ghostty's on Hangul (45,515), so those rows do not time the same work.
 
 | Operation | Output | wongtty | wongtty, uncompressed | Alacritty | Ghostty | Ghostty, compressed |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -391,6 +414,9 @@ grapheme clusters in every run.
 **Operations in Node**, milliseconds, the same scrollback after log lines and
 Hangul, `scrollback.mjs` (median of 3 processes, load 2.6–3.5). The text
 operation calls `rowText` once per line, for xterm.js `translateToString`.
+The xterm.js search is the bench's own copy of what `@xterm/addon-search`
+0.17 does per logical line (wrapped rows joined, lowercased, `indexOf`), not
+the addon itself; it finds the same matches as wongtty's `searchRows`.
 
 | Operation | Output | wongtty wasm | wongtty N-API | xterm.js |
 | --- | --- | ---: | ---: | ---: |
@@ -408,7 +434,7 @@ operation calls `rowText` once per line, for xterm.js `translateToString`.
 In Node, wongtty resizes and serializes faster than xterm.js. xterm.js is
 faster at whole-buffer text a line at a time (5–26×) and at searching for a
 common match. Searching for a string that is not there is fastest from
-N-API, and about 8× slower from WebAssembly than in xterm.js.
+N-API, and about 8× slower from WebAssembly than that xterm.js search.
 
 **Setup.** Apple M4 (4 performance and 6 efficiency cores, 16 GB), macOS 15.6,
 rustc 1.99.1, 2026-11-03. Every engine is built in release mode with LTO. Node
@@ -439,8 +465,16 @@ cargo run --release --manifest-path bench/engines/Cargo.toml --features ghostty,
 #   -Doptimize=fast -Dcpu=apple_m1 --prefix <dir> in a Ghostty checkout, then
 GHOSTTY_VT_RS_SYS_PREBUILT_DIR=<dir> CARGO_TARGET_DIR=target/ghostty-main ENGINES=wongtty,ghostty \
   cargo run --release --manifest-path bench/engines/Cargo.toml --features ghostty --bin wongtty-engine-bench -- /tmp/vt-corpus main.json
+# The tables ran per output: three rounds of, for each output c,
+#   BENCH_CASES=$c bench/engines/target/release/wongtty-engine-bench /tmp/vt-corpus pin-$c-$r.json
+#   BENCH_CASES=$c ENGINES=wongtty,ghostty target/ghostty-main/release/wongtty-engine-bench /tmp/vt-corpus main-$c-$r.json
+# noting the 1-minute load average; each figure is the median of the three rounds' medians.
 cargo run --release --manifest-path bench/engines/Cargo.toml --features ghostty --bin scrollback -- /tmp/vt-corpus 3
-CORPUS=/tmp/vt-corpus python3 -I bench/engines/scripts/cyc.py bench/engines/target/release/wongtty-engine-bench 10 3 unicode,scrolling-region
+GHOSTTY_VT_RS_SYS_PREBUILT_DIR=<dir> CARGO_TARGET_DIR=target/ghostty-main ENGINES=wongtty,ghostty,ghostty-z \
+  cargo run --release --manifest-path bench/engines/Cargo.toml --features ghostty --bin scrollback -- /tmp/vt-corpus 3
+CORPUS=/tmp/vt-corpus python3 -I bench/engines/scripts/cyc.py \
+  pin=bench/engines/target/release/wongtty-engine-bench,gmain=target/ghostty-main/release/wongtty-engine-bench \
+  10 3 unicode,scrolling-region,graphemes wongtty,ghostty,ghostty@2
 bash scripts/build-wasm.sh && bash scripts/build-node.sh && (cd bench/engines && npm ci) && (cd packages/wongtty && npm ci)
 node --expose-gc bench/engines/node.mjs /tmp/vt-corpus
 node --expose-gc bench/engines/scrollback.mjs /tmp/vt-corpus 3
