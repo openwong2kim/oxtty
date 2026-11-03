@@ -1,5 +1,5 @@
 use std::cmp::max;
-use std::mem;
+use std::{mem, ptr};
 use std::mem::MaybeUninit;
 use std::ops::{Index, IndexMut, Range};
 
@@ -88,6 +88,17 @@ impl<T> Storage<T> {
         self.initialize(additional_lines, columns);
 
         // Update visible lines.
+        self.visible_lines = next;
+    }
+
+    /// wongtty: like [`Storage::grow_visible_lines`], without `MAX_CACHE_SIZE` spare rows.
+    pub fn grow_visible_lines_exact(&mut self, next: usize)
+    where
+        T: Default,
+    {
+        let additional_lines = next - self.visible_lines;
+        let columns = self[Line(0)].len();
+        self.initialize_up_to(additional_lines, columns, self.len + additional_lines);
         self.visible_lines = next;
     }
 
@@ -199,7 +210,11 @@ impl<T> Storage<T> {
         let high = self.compute_index(region.start);
         if low <= high {
             let rows = &mut self.inner[low..=high];
-            if up { rows.rotate_right(positions) } else { rows.rotate_left(positions) }
+            if positions == 1 {
+                rotate_one(rows, up);
+            } else {
+                rotate(rows, positions, up);
+            }
             return;
         }
 
@@ -210,13 +225,13 @@ impl<T> Storage<T> {
         if positions <= head.len().min(tail.len()) {
             let at = tail.len() - positions;
             if up {
-                head.rotate_right(positions);
+                rotate(head, positions, true);
                 tail[at..].swap_with_slice(&mut head[..positions]);
-                tail.rotate_right(positions);
+                rotate(tail, positions, true);
             } else {
-                tail.rotate_left(positions);
+                rotate(tail, positions, false);
                 tail[at..].swap_with_slice(&mut head[..positions]);
-                head.rotate_left(positions);
+                rotate(head, positions, false);
             }
         } else if up {
             for i in (region.start.0..region.end.0 - positions as i32).map(Line::from) {
@@ -296,6 +311,33 @@ impl<T> Storage<T> {
 
         self.inner.rotate_left(self.zero);
         self.zero = 0;
+    }
+}
+
+/// wongtty: `rows.rotate_right(positions)` (`right`) or `rows.rotate_left(positions)`, in one function: inlined at
+/// each place, `slice::rotate` takes most of a kilobyte of wasm a time.
+#[inline(never)]
+fn rotate<T>(rows: &mut [T], positions: usize, right: bool) {
+    let k = if right { positions } else { rows.len() - positions };
+    rows.rotate_right(k);
+}
+
+/// wongtty: `rows.rotate_right(1)` (`right`) or `rows.rotate_left(1)`: one row held aside and one `memmove` of
+/// the others, where a region scroll through `slice::rotate` takes three calls.
+#[inline]
+fn rotate_one<T>(rows: &mut [T], right: bool) {
+    let n = rows.len();
+    if n < 2 {
+        return;
+    }
+    let p = rows.as_mut_ptr();
+    let (from, to, gap) = if right { (n - 1, 0, (0, 1)) } else { (0, n - 1, (1, 0)) };
+    // SAFETY: every index is below `n`; the row read first is written back last into the place the others left,
+    // so each row is moved once and none is dropped or duplicated.
+    unsafe {
+        let held = ptr::read(p.add(from));
+        ptr::copy(p.add(gap.0), p.add(gap.1), n - 1);
+        ptr::write(p.add(to), held);
     }
 }
 

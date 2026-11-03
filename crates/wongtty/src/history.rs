@@ -54,8 +54,8 @@ struct Block {
     /// The rows take `bytes[..end]`; the rest is room for the next row.
     bytes: Vec<u8>,
     end: usize,
-    /// Where each row starts in `bytes`.
-    starts: Vec<u32>,
+    /// Where each row starts in `bytes`: below `BLOCK_BYTES`, so a `u16`.
+    starts: Vec<u16>,
 }
 
 type Extras = Box<[(u16, Arc<CellExtra>)]>;
@@ -70,7 +70,8 @@ pub(crate) struct History {
     /// Rows are appended in order and dropped from the front, so a deque
     /// sorted by row number is enough.
     extras: VecDeque<(u64, Extras)>,
-    /// The last block dropped from the oldest end, kept for the next one.
+    /// The last block of `BLOCK_BYTES` dropped from the oldest end, kept for the next one: the system allocator
+    /// of macOS does not always hand a freed 64 KiB back, which costs more footprint than the block.
     spare: Option<Block>,
     /// The program cleared the history (`CSI 3 J`, RIS). The engine returns
     /// the view to the bottom and lowers this.
@@ -133,37 +134,65 @@ impl History {
         self.extras.clear();
     }
 
-    fn push_row(&mut self, row: &Row<Cell>) {
+    /// Stores a row that leaves the grid (or a reflow): the sink may blank the cells it takes (`encode_take`).
+    ///
+    /// A row is written straight into the room left in the newest block. Where that room may be too small, it is
+    /// encoded aside first and goes in where it fits, so that no block grows past `BLOCK_BYTES` (into a larger
+    /// allocation) but a block holding one row that is larger.
+    fn push_row(&mut self, row: &mut Row<Cell>) {
         if self.limit == 0 {
             return;
         }
         let abs = self.first + self.len as u64;
-        if self.blocks.back().is_none_or(|b| b.end >= BLOCK_BYTES) {
-            let mut block = self.spare.take().unwrap_or_else(|| Block {
-                first: 0,
-                bytes: vec![0; BLOCK_BYTES],
-                end: 0,
-                starts: Vec::new(),
-            });
-            block.first = abs;
-            block.end = 0;
-            block.starts.clear();
-            self.blocks.push_back(block);
+        let scan = scan_len(row);
+        let room = max_len(scan);
+        let mut extras = Vec::new();
+        let mut aside = Vec::new();
+        let (buf, at) = match self.blocks.back_mut() {
+            Some(block) if block.end + room <= block.bytes.len() => {
+                (&mut block.bytes[..], block.end)
+            }
+            _ => {
+                aside.resize(room, 0);
+                (&mut aside[..], 0)
+            }
+        };
+        let end = encode_take(row, scan, buf, at, &mut extras);
+        if !aside.is_empty() {
+            let len = end;
+            if self
+                .blocks
+                .back()
+                .is_none_or(|b| b.end + len > b.bytes.len())
+            {
+                let spare = if len <= BLOCK_BYTES {
+                    self.spare.take()
+                } else {
+                    None
+                };
+                let mut block = spare.unwrap_or_else(|| Block {
+                    first: 0,
+                    bytes: vec![0; BLOCK_BYTES.max(len)],
+                    end: 0,
+                    starts: Vec::new(),
+                });
+                block.first = abs;
+                block.end = 0;
+                block.starts.clear();
+                self.blocks.push_back(block);
+            }
         }
-        // Write at the end of the block. A row may run past the block size;
-        // the next row then starts a new block.
         let Some(block) = self.blocks.back_mut() else {
             return;
         };
-        let scan = scan_len(row);
-        let room = block.end + max_len(scan);
-        if block.bytes.len() < room {
-            block.bytes.reserve_exact(room - block.bytes.len());
-            block.bytes.resize(room, 0);
+        debug_assert!(block.end < BLOCK_BYTES);
+        block.starts.push(block.end as u16);
+        if aside.is_empty() {
+            block.end = end;
+        } else {
+            block.bytes[block.end..block.end + end].copy_from_slice(&aside[..end]);
+            block.end += end;
         }
-        block.starts.push(block.end as u32);
-        let mut extras = Vec::new();
-        block.end = encode(row, scan, &mut block.bytes, block.end, &mut extras);
         if !extras.is_empty() {
             self.extras.push_back((abs, extras.into_boxed_slice()));
         }
@@ -182,7 +211,10 @@ impl History {
         if let Some(front) = self.blocks.front() {
             if self.first >= front.first + front.starts.len() as u64 {
                 let block = self.blocks.pop_front();
-                if self.spare.is_none() {
+                // A larger block (one row past `BLOCK_BYTES`) is freed: rows start below `BLOCK_BYTES` only.
+                if self.spare.is_none()
+                    && block.as_ref().is_some_and(|b| b.bytes.len() == BLOCK_BYTES)
+                {
                     self.spare = block;
                 }
             }
@@ -224,7 +256,7 @@ impl History {
 }
 
 impl HistorySink<Cell> for History {
-    fn push(&mut self, row: &Row<Cell>) {
+    fn push(&mut self, row: &mut Row<Cell>) {
         self.push_row(row);
     }
 
@@ -281,7 +313,7 @@ impl HistoryAbove<Cell> for Above {
                     } else {
                         row.resize_keeping_wrap(columns);
                     }
-                    self.rows.push_row(&row);
+                    self.rows.push_row(&mut row);
                 }
             }
         }
@@ -310,8 +342,8 @@ impl HistoryAbove<Cell> for Above {
                 i,
                 display_offset,
             );
-            for row in rows.drain(..) {
-                self.rows.push_row(&row);
+            for mut row in rows.drain(..) {
+                self.rows.push_row(&mut row);
             }
         }
         buffered
@@ -663,11 +695,11 @@ impl TermHistory {
             rows.truncate_newest(rows.len() - short);
             grid.prepend_history(back, self.scrollback);
         }
-        let older = grid.split_off_history(Self::RECENT);
+        let mut older = grid.split_off_history(Self::RECENT);
         grid.set_history_sink(sink);
         rows.limit = limit;
         rows.cleared = cleared;
-        for row in &older {
+        for row in &mut older {
             rows.push_row(row);
         }
         while rows.len() > limit {
@@ -703,11 +735,11 @@ impl TermHistory {
             term.grid_mut()
         };
         let offset = grid.display_offset();
-        let older = grid.split_off_history(Self::RECENT);
+        let mut older = grid.split_off_history(Self::RECENT);
         grid.set_history_sink(sink);
         let mut stored = self.lock();
-        for row in &older {
-            stored.push(row);
+        for row in &mut older {
+            stored.push_row(row);
         }
         offset
     }
@@ -749,6 +781,24 @@ fn is_default(c: &Cell) -> bool {
         && c.extra.is_none()
 }
 
+/// What `Row::plain` promises of the cells of a row.
+fn is_plain(cells: &[Cell]) -> bool {
+    let attrs = |c: &Cell| c.fg == DEFAULT_FG && c.bg == DEFAULT_BG && c.extra.is_none();
+    let mut i = 0;
+    while let Some(c) = cells.get(i) {
+        let pair = c.flags == Flags::WIDE_CHAR
+            && c.c != ' '
+            && cells
+                .get(i + 1)
+                .is_some_and(|r| attrs(r) && r.c == ' ' && r.flags == Flags::WIDE_CHAR_SPACER);
+        if !(attrs(c) && (pair || (c.flags - Flags::TYPED_SPACE).is_empty())) {
+            return false;
+        }
+        i += 1 + pair as usize;
+    }
+    true
+}
+
 /// The cells `encode` looks at: past the last cell that is not a default blank,
 /// all are default blanks, and those at the end of the row are left out. Cells
 /// past `occ` all equal the last cell (the Row::reset invariant), so with a
@@ -757,7 +807,7 @@ fn is_default(c: &Cell) -> bool {
 fn scan_len(row: &Row<Cell>) -> usize {
     let cells = &row[..];
     if cells.last().is_some_and(is_default) {
-        row.occ.min(cells.len())
+        (row.occ as usize).min(cells.len())
     } else {
         cells.len()
     }
@@ -853,13 +903,13 @@ fn unit(c: char, wide: bool) -> (u32, usize) {
     // first of the three bytes is the marker alone, and the other two are the two-byte form but for its marker.
     let three = ((UNIT_3 as u32 | w) << 16 | n).swap_bytes() >> 8;
     let two = three >> 8 | UNIT_2 as u32 | w;
-    if (n < 0x80) & !wide {
-        (n, 1)
-    } else if n < 0x2000 {
-        (two, 2)
-    } else {
-        (three, 3)
-    }
+    // Selects, not branches: in mixed text the length changes from one character to the next.
+    let (long, big) = ((n >= 0x80) | wide, n >= 0x2000);
+    let word = if big { three } else { two };
+    (
+        if long { word } else { n },
+        1 + long as usize + big as usize,
+    )
 }
 
 /// Writes the leading `cells` that are narrow ASCII characters (typed spaces
@@ -1017,24 +1067,154 @@ fn encode(
     let n = ascii(cells, &mut out, Flags::empty(), |c| {
         matches!(c.fg, DEFAULT_FG) & matches!(c.bg, DEFAULT_BG)
     });
-    if n == scan {
-        if n == 0 {
-            return head;
-        }
-        let [lo, hi] = (n as u16).to_le_bytes();
-        out.buf[head..head + 3].copy_from_slice(&[0, lo, hi]);
+    // Then most others are text of any width with the default attributes: the run goes on through them.
+    let (end, units) = if n == scan {
+        (n, n)
+    } else {
+        plain(cells, n, &mut out)
+    };
+    if units == 0 {
+        out.at = head;
+        return if end == scan {
+            head
+        } else {
+            runs(cells, 0, out, extras)
+        };
+    }
+    let [lo, hi] = (units as u16).to_le_bytes();
+    out.buf[head..head + 3].copy_from_slice(&[0, lo, hi]);
+    if end == scan {
         return out.at;
     }
-    out.at = head;
-    runs(cells, out, extras)
+    runs(cells, end, out, extras)
 }
 
-/// `encode` for the other rows: the runs of `cells` from `out.at` on.
+/// `encode` for a row that leaves the grid. A plain row (`Row::plain`: default
+/// blanks, narrow characters and wide pairs with the default attributes) is
+/// one run of its units, read without checking each cell's attributes or
+/// pairs, and left blank for the grid's reset (`occ` 0).
+fn encode_take(
+    row: &mut Row<Cell>,
+    scan: usize,
+    buf: &mut [u8],
+    at: usize,
+    extras: &mut Vec<(u16, Arc<CellExtra>)>,
+) -> usize {
+    if !row.plain {
+        return encode(row, scan, buf, at, extras);
+    }
+    debug_assert!(is_plain(&row[..]), "stale Row::plain");
+    let mut out = Out { buf, at };
+    out.varint(row.len());
+    let head = out.at;
+    out.at += 3;
+    let cells = &mut row[..][..scan];
+    // Narrow ASCII first, a byte a cell (a wide character is never ASCII, and its spacer comes after it).
+    let dst = &mut out.buf[out.at..out.at + scan];
+    let mut i = 0;
+    for (d, cell) in dst.iter_mut().zip(cells.iter_mut()) {
+        let c = cell.c as u32;
+        if c >= 0x80 {
+            break;
+        }
+        // An erased blank is 0 in a run, a typed space ' '.
+        let erased = (c == b' ' as u32) & cell.flags.is_empty();
+        *d = if erased { 0 } else { c as u8 };
+        cell.c = ' ';
+        cell.flags = Flags::empty();
+        i += 1;
+    }
+    let mut units = i;
+    // After the last unit that is not an erased blank.
+    let mut end_units = dst[..i].iter().rposition(|&b| b != 0).map_or(0, |n| n + 1);
+    out.at += i;
+    let mut end = out.at - (i - end_units);
+    // Then the rest a cell at a time, a spacer as nothing: the next cell does not wait on this one's width.
+    for cell in &mut cells[i..] {
+        let flags = cell.flags.bits();
+        let spacer = flags & Flags::WIDE_CHAR_SPACER.bits() != 0;
+        // An erased blank is 0 in a run, a typed space ' '.
+        let erased = (cell.c == ' ') & (flags == 0);
+        let (word, len) = unit(cell.c, flags & Flags::WIDE_CHAR.bits() != 0);
+        out.word(
+            word & (erased as u32).wrapping_sub(1),
+            if spacer { 0 } else { len },
+        );
+        units += !spacer as usize;
+        let text = !(erased | spacer);
+        end = if text { out.at } else { end };
+        end_units = if text { units } else { end_units };
+        cell.c = ' ';
+        cell.flags = Flags::empty();
+    }
+    row.occ = 0;
+    row.plain = true;
+    if end_units == 0 {
+        return head;
+    }
+    let [lo, hi] = (end_units as u16).to_le_bytes();
+    out.buf[head..head + 3].copy_from_slice(&[0, lo, hi]);
+    end
+}
+
+/// Goes on with the first run of `encode` from cell `at`, which narrow ASCII
+/// text with the default attributes ends: takes the cells with the default
+/// colours and no extras that are narrow characters (typed spaces too),
+/// erased blanks, or wide characters with their right half (`is_pair`), and
+/// writes each as a unit. Returns the cell and the unit count after the last
+/// unit that is not an erased blank, and leaves `out` there: the cells after
+/// it are for `runs`. A unit at a time, a wide character and its right half
+/// in one step.
+#[inline(always)]
+fn plain(cells: &[Cell], mut at: usize, out: &mut Out) -> (usize, usize) {
+    let (wide, right, typed) = (
+        Flags::WIDE_CHAR.bits(),
+        Flags::WIDE_CHAR_SPACER.bits(),
+        Flags::TYPED_SPACE.bits(),
+    );
+    let attrs =
+        |c: &Cell| matches!(c.fg, DEFAULT_FG) & matches!(c.bg, DEFAULT_BG) & c.extra.is_none();
+    let scan = cells.len();
+    let mut units = at;
+    let (mut end, mut end_units, mut end_out) = (at, at, out.at);
+    while at < scan {
+        let cell = &cells[at];
+        // The cell after it, which a wide character's right half has to be. Past the end the cell itself, which
+        // then is no right half.
+        let next = &cells[min(at + 1, scan - 1)];
+        let (c, flags) = (cell.c, cell.flags.bits());
+        let pair = flags == wide;
+        let half = (next.c == ' ') & (next.flags.bits() == right) & attrs(next);
+        let ok = attrs(cell) & ((pair & half & (c != ' ')) | (flags & !typed == 0));
+        if !ok {
+            break;
+        }
+        let erased = (c == ' ') & (flags == 0);
+        let (word, len) = unit(c, pair);
+        out.word(word & (erased as u32).wrapping_sub(1), len);
+        at += 1 + pair as usize;
+        units += 1;
+        // Erased blanks that end the run are left to `runs`.
+        let text = !erased;
+        end = if text { at } else { end };
+        end_units = if text { units } else { end_units };
+        end_out = if text { out.at } else { end_out };
+    }
+    out.at = end_out;
+    (end, end_units)
+}
+
+/// `encode` for the other rows: the runs of `cells` from cell `start` on,
+/// written from `out.at` on.
 #[inline(never)]
-fn runs(cells: &[Cell], mut out: Out, extras: &mut Vec<(u16, Arc<CellExtra>)>) -> usize {
+fn runs(
+    cells: &[Cell],
+    mut start: usize,
+    mut out: Out,
+    extras: &mut Vec<(u16, Arc<CellExtra>)>,
+) -> usize {
     let scan = cells.len();
     let mut prev = (DEFAULT_FG, DEFAULT_BG, Flags::empty());
-    let mut start = 0;
     while start < scan {
         let first = &cells[start];
         let (fg, bg) = (first.fg, first.bg);
@@ -1368,7 +1548,7 @@ mod tests {
         let mut history = History::new(100);
         let rows = sample_rows();
         for row in &rows {
-            history.push(row);
+            history.push(&mut row.clone());
         }
         assert_eq!(history.len(), rows.len());
         for (i, row) in rows.iter().enumerate() {
@@ -1461,7 +1641,7 @@ mod tests {
                 row[Column(col)] = cell;
                 col += 1;
             }
-            history.push(&row);
+            history.push(&mut row.clone());
             rows.push(row);
         }
         for (i, row) in rows.iter().enumerate() {
@@ -1506,7 +1686,7 @@ mod tests {
             {
                 row[Column(i)] = cell(c, DEFAULT_FG, DEFAULT_BG, Flags::empty());
             }
-            history.push(&row);
+            history.push(&mut row.clone());
             row.reset(&Cell::default());
         }
         assert_eq!(history.len(), 3000);
@@ -1526,7 +1706,7 @@ mod tests {
         );
         HistorySink::clear(&mut history);
         assert_eq!(history.len(), 0);
-        history.push(&Row::new(80));
+        history.push(&mut Row::new(80));
         assert_eq!(history.len(), 1);
     }
 
@@ -1544,7 +1724,7 @@ mod tests {
             if n % 7 == 0 {
                 row[Column(1)].push_zerowidth('\u{301}');
             }
-            history.push(&row);
+            history.push(&mut row.clone());
             row.reset(&Cell::default());
         }
         let kept: Vec<_> = (0..1500).map(|i| history.row(i)).collect();
@@ -1555,7 +1735,7 @@ mod tests {
         for (i, row) in kept.iter().enumerate() {
             assert_eq!(history.row(i), *row, "row {i}");
         }
-        history.push(&Row::new(300));
+        history.push(&mut Row::new(300));
         assert_eq!(history.row(1500), Row::new(300));
     }
 
@@ -1594,6 +1774,184 @@ mod tests {
             decode(&bytes, Some(&extras));
         }
         assert_eq!(&decode(&[0xff; 12], None)[..], &Row::<Cell>::new(1)[..]);
+    }
+
+    /// No block grows past `BLOCK_BYTES` but one that holds a single larger row, and every row reads back, with
+    /// rows that fill a block in a few (a colour per cell) and one larger than a block.
+    #[test]
+    fn blocks_keep_their_size() {
+        let mut history = History::new(1000);
+        let mut rows = Vec::new();
+        for n in 0..300u32 {
+            let cols = if n == 151 {
+                30000
+            } else {
+                2000 + n as usize % 7
+            };
+            let mut row = Row::<Cell>::new(cols);
+            for col in 0..cols.min(if n % 3 == 0 { 40 } else { cols }) {
+                let rgb = Rgb {
+                    r: col as u8,
+                    g: n as u8,
+                    b: 7,
+                };
+                row[Column(col)] = cell('x', Color::Spec(rgb), DEFAULT_BG, Flags::empty());
+            }
+            history.push(&mut row.clone());
+            rows.push(row);
+        }
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(history.row(i), *row, "row {i}");
+        }
+        assert!(history.blocks.len() > 3);
+        assert!(history.blocks.iter().any(|b| b.bytes.len() > BLOCK_BYTES));
+        for block in &history.blocks {
+            assert!(
+                block.bytes.len() == BLOCK_BYTES || block.starts.len() == 1,
+                "{}",
+                block.bytes.len()
+            );
+            assert!(block.end <= block.bytes.len());
+        }
+    }
+
+    /// A row too large for a `BLOCK_BYTES` block gets a block of its own and leaves the kept spare block in place.
+    #[test]
+    fn large_row_keeps_the_spare() {
+        let mut history = History::new(20);
+        let colored = |cols: usize, n: u32| {
+            let mut row = Row::<Cell>::new(cols);
+            for col in 0..cols {
+                let rgb = Rgb {
+                    r: col as u8,
+                    g: n as u8,
+                    b: 7,
+                };
+                row[Column(col)] = cell('x', Color::Spec(rgb), DEFAULT_BG, Flags::empty());
+            }
+            row
+        };
+        for n in 0..200u32 {
+            history.push(&mut colored(2000, n));
+        }
+        assert!(history.spare.is_some());
+        // No row is dropped below, so `pop_oldest` cannot refill the spare.
+        history.limit = usize::MAX;
+        let big = colored(30000, 1);
+        history.push(&mut big.clone());
+        assert!(history.blocks.back().unwrap().bytes.len() > BLOCK_BYTES);
+        assert!(history.spare.is_some());
+        assert_eq!(history.row(history.len() - 1), big);
+    }
+
+    /// The default-attribute first run of `encode` (`plain`) writes the bytes `runs` writes for the whole row, on
+    /// random rows of narrow, wide and broken wide characters, typed spaces, bold and coloured cells.
+    #[test]
+    fn plain_wide_matches_runs() {
+        let mut rng = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let chars = ['a', ' ', 'é', '가', '字', '😀', '~'];
+        for _ in 0..20000 {
+            let cols = 1 + (next() % 24) as usize;
+            let mut row = Row::<Cell>::new(cols);
+            let mut col = 0;
+            while col < cols {
+                let r = next();
+                let c = chars[(r % 7) as usize];
+                let wide = matches!(c, '가' | '字' | '😀');
+                let mut flags = if c == ' ' && r & 8 != 0 {
+                    Flags::TYPED_SPACE
+                } else {
+                    Flags::empty()
+                };
+                if r & 0x300 == 0 {
+                    flags |= Flags::BOLD;
+                }
+                if wide && col + 1 < cols {
+                    row[Column(col)] = cell(c, DEFAULT_FG, DEFAULT_BG, flags | Flags::WIDE_CHAR);
+                    let spacer = if r & 0x7000 == 0 {
+                        Flags::empty()
+                    } else {
+                        Flags::WIDE_CHAR_SPACER
+                    };
+                    row[Column(col + 1)] = cell(' ', DEFAULT_FG, DEFAULT_BG, flags | spacer);
+                    col += 2;
+                } else if !wide {
+                    let fg = if r & 0xf0000 == 0 {
+                        Color::Named(NamedColor::Red)
+                    } else {
+                        DEFAULT_FG
+                    };
+                    row[Column(col)] = cell(c, fg, DEFAULT_BG, flags);
+                    col += 1;
+                } else {
+                    col += 1;
+                }
+            }
+            let scan = scan_len(&row);
+            let a = encoded(&row);
+            let mut b = vec![0; max_len(scan)];
+            let mut out = Out { buf: &mut b, at: 0 };
+            out.varint(row.len());
+            let end = runs(&row[..][..scan], 0, out, &mut Vec::new());
+            assert_eq!(a, &b[..end], "{row:?}");
+            assert_eq!(decode(&a, None), row);
+        }
+    }
+
+    /// A plain row (`Row::plain`) taken by `encode_take` gives the bytes `encode` writes for it, and is left blank.
+    #[test]
+    fn plain_take_matches_encode() {
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let chars = ['a', ' ', 'é', '가', '字', '😀', '~', '\u{2500}'];
+        for _ in 0..20000 {
+            let cols = 1 + (next() % 24) as usize;
+            let mut row = Row::<Cell>::new(cols);
+            let mut col = (next() % 3) as usize;
+            while col < cols {
+                let r = next();
+                let c = chars[(r % 8) as usize];
+                let wide = matches!(c, '가' | '字' | '😀');
+                if wide && col + 1 < cols {
+                    row[Column(col)] = cell(c, DEFAULT_FG, DEFAULT_BG, Flags::WIDE_CHAR);
+                    row[Column(col + 1)] =
+                        cell(' ', DEFAULT_FG, DEFAULT_BG, Flags::WIDE_CHAR_SPACER);
+                    col += 2;
+                } else if !wide {
+                    let typed = c == ' ' && r & 8 != 0;
+                    let flags = if typed {
+                        Flags::TYPED_SPACE
+                    } else {
+                        Flags::empty()
+                    };
+                    row[Column(col)] = cell(c, DEFAULT_FG, DEFAULT_BG, flags);
+                    col += 1;
+                }
+                col += (r >> 20) as usize % 4 / 3;
+            }
+            row.plain = true;
+            assert!(is_plain(&row[..]));
+            let want = encoded(&row);
+            let scan = scan_len(&row);
+            let mut got = vec![0; max_len(scan)];
+            let mut taken = row.clone();
+            taken.plain = true;
+            let end = encode_take(&mut taken, scan, &mut got, 0, &mut Vec::new());
+            assert_eq!(&got[..end], want, "{row:?}");
+            assert_eq!(taken, Row::new(cols));
+            assert_eq!(decode(&want, None), row);
+        }
     }
 }
 

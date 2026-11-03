@@ -835,13 +835,13 @@ mod tests {
         let mut split = Row::<Cell>::new(cols);
         split[Column(0)].c = '漢';
         split[Column(0)].flags = Flags::WIDE_CHAR;
-        older.push(&split);
+        older.push(&mut split);
         let mut text = Row::<Cell>::new(cols);
         for col in 0..cols {
             text[Column(col)].c = 'x';
         }
         for _ in 0..2000 {
-            older.push(&text);
+            older.push(&mut text.clone());
         }
         let grid = Grid::<Cell>::new(4, cols, 0);
         let mut out = String::new();

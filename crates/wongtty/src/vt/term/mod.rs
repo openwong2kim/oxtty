@@ -530,7 +530,8 @@ impl<T> Term<T> {
 
         let history_size = config.scrolling_history;
         let mut grid = Grid::new(num_lines, num_cols, history_size);
-        let mut inactive_grid = Grid::new(num_lines, num_cols, 0);
+        // wongtty: the alternate screen is parked at one line until a program enters it (`Grid::park`).
+        let mut inactive_grid = Grid::new(1, num_cols, 0);
         grid.set_keep_cursor_paragraph(!config.reflow_cursor_line);
         inactive_grid.set_keep_cursor_paragraph(!config.reflow_cursor_line);
         grid.set_grow_blank(!config.grow_from_history);
@@ -949,7 +950,12 @@ impl<T> Term<T> {
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
         let reflow = self.config.reflow;
         self.grid.resize(!is_alt && reflow, num_lines, num_cols);
-        self.inactive_grid.resize(is_alt && reflow, num_lines, num_cols);
+        // wongtty: a parked alternate screen is not resized; it takes the primary screen's size when entered.
+        if is_alt {
+            self.inactive_grid.resize(reflow, num_lines, num_cols);
+        } else {
+            self.inactive_grid.park(num_lines, num_cols);
+        }
 
         // Invalidate selection and tabs only when necessary.
         if old_cols != num_cols {
@@ -987,6 +993,9 @@ impl<T> Term<T> {
     /// Swap primary and alternate screen buffer.
     pub fn swap_alt(&mut self) {
         if !self.mode.contains(TermMode::ALT_SCREEN) {
+            // wongtty: a screen of rows for the parked alternate screen.
+            self.inactive_grid.unpark(self.grid.screen_lines(), self.grid.columns());
+
             // Set alt screen cursor to the current primary screen cursor.
             self.inactive_grid.cursor = self.grid.cursor.clone();
 
@@ -1004,6 +1013,9 @@ impl<T> Term<T> {
 
         mem::swap(&mut self.grid, &mut self.inactive_grid);
         self.mode ^= TermMode::ALT_SCREEN;
+        if !self.mode.contains(TermMode::ALT_SCREEN) {
+            self.inactive_grid.park(self.grid.screen_lines(), self.grid.columns());
+        }
         self.selection = None;
         self.mark_fully_damaged();
     }
@@ -1395,21 +1407,33 @@ impl<T> Term<T> {
         // Checked and written in one pass. Writing through the whole row marks all of it occupied; only the cells
         // written are.
         let row = &mut self.grid[point.line];
-        let occ = row.occ;
+        let occ = row.occ as usize;
+        // wongtty: the row stays plain (`Row::plain`) when written with the default pen.
+        let was_plain = row.plain;
+        let plain = was_plain
+            && flags.is_empty()
+            && extra.is_none()
+            && fg == Color::Named(NamedColor::Foreground)
+            && bg == Color::Named(NamedColor::Background);
         let mut n = 0;
         for (cell, &b) in row[point.column..].iter_mut().zip(bytes) {
             if !(0x20..0x7f).contains(&b) || cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER) {
                 break;
             }
             cell.c = b as char;
-            cell.fg = fg;
-            cell.bg = bg;
             cell.flags = if b == b' ' { space_flags } else { flags };
-            cell.extra = extra.clone();
+            // wongtty: the colours of a plain row's narrow cells are the default pen's already, and it has no
+            // extras.
+            if !plain {
+                cell.fg = fg;
+                cell.bg = bg;
+                cell.extra = extra.clone();
+            }
             n += 1;
         }
         let end = point.column.0 + n;
-        row.occ = if n == 0 { occ } else { occ.max(end) };
+        row.occ = if n == 0 { occ } else { occ.max(end) } as u16;
+        row.plain = if n == 0 { was_plain } else { plain };
         if n == 0 {
             return 0;
         }
@@ -1439,7 +1463,14 @@ impl<T> Term<T> {
         let row = &mut self.grid[point.line];
         // The cells are written through the whole row, which marks all of it occupied; only the cells written
         // are, as when written one by one.
-        let occ = row.occ;
+        let occ = row.occ as usize;
+        // wongtty: the row stays plain (`Row::plain`) when written with the default pen.
+        let was_plain = row.plain;
+        let plain = was_plain
+            && flags.is_empty()
+            && extra.is_none()
+            && fg == Color::Named(NamedColor::Foreground)
+            && bg == Color::Named(NamedColor::Background);
         let cells = &mut row[..];
         let wide_cell = |cell: &Cell| cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER);
         let (mut col, mut used) = (point.column.0, 0);
@@ -1471,7 +1502,8 @@ impl<T> Term<T> {
         if let Some(extra) = extra {
             cells[point.column.0..col].iter_mut().for_each(|cell| cell.extra = Some(extra.clone()));
         }
-        row.occ = if used == 0 { occ } else { occ.max(col) };
+        row.occ = if used == 0 { occ } else { occ.max(col) } as u16;
+        row.plain = if used == 0 { was_plain } else { plain };
         if used == 0 {
             return 0;
         }
@@ -2527,6 +2559,7 @@ impl<T: EventListener> Handler for Term<T> {
         self.cursor_style = None;
         self.grid.reset();
         self.inactive_grid.reset();
+        self.inactive_grid.park(self.grid.screen_lines(), self.grid.columns());
         self.scroll_region = Line(0)..Line(self.screen_lines() as i32);
         self.tabs = TabStops::new(self.columns());
         self.title_stack = Vec::new();
@@ -3322,6 +3355,26 @@ mod tests {
         for c in (0..=0x10ffff).filter_map(char::from_u32) {
             assert_eq!(char_width(c), crate::vt::wmux_unicode11::width(c), "{:#x}", c as u32);
         }
+    }
+
+    /// The alternate screen holds one row while the primary screen is up, and comes back blank at the primary
+    /// screen's size with its saved cursor where a resize would have left it.
+    #[test]
+    fn parked_alternate_screen() {
+        let mut term = Term::new(Config::default(), &TermSize::new(10, 6), VoidListener);
+        let mut parser = ansi::Processor::new();
+        assert_eq!(term.inactive_grid.screen_lines(), 1);
+        parser.advance(&mut term, b"\x1b[?1049h\x1b[6;10H\x1b7x\x1b[?1049l");
+        assert_eq!(term.inactive_grid.screen_lines(), 1);
+        term.resize(TermSize::new(8, 4));
+        assert_eq!(term.inactive_grid.screen_lines(), 1);
+        parser.advance(&mut term, b"\x1b[?1049h\x1b8");
+        assert_eq!((term.grid.screen_lines(), term.grid.columns()), (4, 8));
+        assert_eq!(term.grid.cursor.point, Point::new(Line(3), Column(7)));
+        assert!((0..4).all(|line| term.grid[Line(line)].is_clear()));
+        parser.advance(&mut term, b"\x1bc");
+        assert!(!term.mode.contains(TermMode::ALT_SCREEN));
+        assert_eq!(term.inactive_grid.screen_lines(), 1);
     }
 
     #[test]

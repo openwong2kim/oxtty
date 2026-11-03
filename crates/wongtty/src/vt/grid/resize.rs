@@ -77,7 +77,12 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         let lines_added = target - self.lines;
 
         // Need to resize before updating buffer.
-        self.raw.grow_visible_lines(target);
+        // wongtty: while a compressed history is reflowed, no spare rows (they are dropped right after).
+        if self.history_above.is_some() {
+            self.raw.grow_visible_lines_exact(target);
+        } else {
+            self.raw.grow_visible_lines(target);
+        }
         self.lines = target;
 
         // wongtty: the rows that came into view go back to history, and spare rows come in blank at the bottom.

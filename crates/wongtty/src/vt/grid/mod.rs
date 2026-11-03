@@ -29,6 +29,12 @@ pub trait GridCell: Sized {
     /// Perform an opinionated cell reset based on a template cell.
     fn reset(&mut self, template: &Self);
 
+    /// wongtty: `reset` to a default blank for a cell of a plain row (`Row::plain`), which holds no extras and the
+    /// default colours already.
+    fn reset_plain(&mut self, template: &Self) {
+        self.reset(template);
+    }
+
     fn flags(&self) -> &Flags;
     fn flags_mut(&mut self) -> &mut Flags;
 }
@@ -186,7 +192,8 @@ pub enum RowMove {
 /// wongtty: receives the rows a full history drops, oldest first, so they can
 /// be kept outside the grid.
 pub trait HistorySink<T>: fmt::Debug + Send {
-    fn push(&mut self, row: &Row<T>);
+    /// The row leaves the grid: the sink may blank cells it has taken (the grid resets the row afterwards).
+    fn push(&mut self, row: &mut Row<T>);
 
     /// The history was cleared (`CSI 3 J`, reset).
     fn clear(&mut self);
@@ -244,6 +251,32 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             history_above: None,
             row_moves: None,
         }
+    }
+
+    /// wongtty: keeps one blank row of `columns` cells, for a grid not in use (the alternate screen while the
+    /// primary one is up) whose screen is `lines` × `columns`. Its settings and counters stay, and its cursors
+    /// are where a resize to that screen leaves them in a grid without history (clamped where it shrinks).
+    /// Nothing reads its rows until `unpark`.
+    pub fn park(&mut self, lines: usize, columns: usize)
+    where
+        T: Default,
+    {
+        self.unpark(1, columns);
+        for cursor in [&mut self.cursor, &mut self.saved_cursor] {
+            cursor.point.line = min(cursor.point.line, Line(lines as i32 - 1));
+            cursor.point.column = min(cursor.point.column, Column(columns - 1));
+        }
+    }
+
+    /// wongtty: a screen of `lines` blank rows of `columns` cells, for a parked grid that comes into use.
+    pub fn unpark(&mut self, lines: usize, columns: usize)
+    where
+        T: Default,
+    {
+        self.raw = Storage::with_capacity(lines, columns);
+        self.lines = lines;
+        self.columns = columns;
+        self.display_offset = 0;
     }
 
     /// wongtty: starts or stops logging how screen rows move (`take_row_moves`).
@@ -360,7 +393,14 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
     fn increase_scroll_limit(&mut self, count: usize) {
         let count = min(count, self.max_scroll_limit - self.history_size());
         if count != 0 {
-            self.raw.initialize_up_to(count, self.columns, self.max_scroll_limit + self.lines);
+            // wongtty: while a compressed history is reflowed (rows held above), no spare rows: they are dropped
+            // again right after the resize.
+            let max_len = if self.history_above.is_some() {
+                self.raw.len() + count
+            } else {
+                self.max_scroll_limit + self.lines
+            };
+            self.raw.initialize_up_to(count, self.columns, max_len);
         }
     }
 
@@ -465,7 +505,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
                 let dropped = (history + positions).saturating_sub(self.max_scroll_limit);
                 let mut sink = sink.lock().unwrap_or_else(PoisonError::into_inner);
                 for i in 0..dropped {
-                    sink.push(&self.raw[Line(i as i32 - history as i32)]);
+                    sink.push(&mut self.raw[Line(i as i32 - history as i32)]);
                 }
             }
 

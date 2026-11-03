@@ -186,6 +186,20 @@ single crate.
   `occ` short there, so the lazy `Row::reset` could skip cells whose
   background differed from the last cell, and a reused row kept a stale
   background after a resize.
+- `HistorySink::push` takes the row mutably: the sink may blank the cells it
+  takes, which the grid resets afterwards anyway (`grid/mod.rs`).
+- While the history is held above the grid during a resize
+  (`history_above`), `Grid::increase_scroll_limit` caps the storage at the
+  rows it holds plus those asked for, and `grow_lines` grows the visible
+  lines with `Storage::grow_visible_lines_exact`: no `MAX_CACHE_SIZE` spare
+  rows that the resize drops again right after.
+- The alternate screen's grid is parked at one row while the primary screen
+  is up (`Grid::park`, `Grid::unpark`): `Term::new` makes it one row,
+  `swap_alt` unparks it at the primary screen's size on the way in and parks
+  it on the way out, a resize parks it at the new size instead of resizing
+  it, and RIS parks it after the reset. Its cursors, settings and counters
+  stay; the cursors are clamped as a resize of a grid without history clamps
+  them.
 - Mechanical changes by `scripts/vendor-vt.sh`: `lib.rs` → `mod.rs` without
   Alacritty's crate-wide lint attributes, `crate::` → `crate::vt::`,
   `alacritty_terminal::` → `wongtty::vt::` in doc examples, and
@@ -281,6 +295,20 @@ Same results as upstream, in less time:
 - `grid/row.rs`: `Row::reset` compares the template with the cell at `occ`
   (all cells from there on are alike) rather than the last cell, which on a
   long row is a cache miss of its own.
+- `grid/row.rs`: `Row::plain` marks a row whose cells all have the default
+  colours and no extra and are default blanks, narrow characters (no flags
+  but `TYPED_SPACE`) or a `WIDE_CHAR` with its `WIDE_CHAR_SPACER` right after
+  it. `Row::new` and a reset to a default blank set it, every mutable
+  accessor clears it, and `term/mod.rs` `input_ascii` and `input_run` keep it
+  while they write with the default pen (`input_ascii` then writes only the
+  character and flags). The compressed history (`src/history.rs`) takes such
+  a row as one run without checking each cell, and a reset of one writes
+  only the characters and flags (`GridCell::reset_plain`). `Row::occ` is a
+  `u16` (rows are at most `u16::MAX` wide) so the flag fits in the row's four
+  words (`Storage::swap`).
+- `grid/storage.rs`: a one-line region scroll holds one row aside and moves
+  the others with one `memmove` (`rotate_one`) instead of `slice::rotate`'s
+  three calls, and the other region rotates go through one function.
 - `term/mod.rs`: `input_ascii` checks and writes each cell in one pass, and
   `input_run` counts the bytes it took from what is left of the text and
   puts the pen's extra on the cells it wrote after writing them;
