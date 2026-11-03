@@ -277,7 +277,7 @@ impl<'de> Deserialize<'de> for Extra {
 /// The most zerowidth characters an interned cluster holds, and the most clusters interned: past them a cell
 /// keeps its characters in a `CellExtra` of its own, as before, so the table stays small whatever a program prints
 /// (at most about 300 KiB, for 4,096 clusters of 8).
-const MAX_MARKS: usize = 8;
+pub(crate) const MAX_MARKS: usize = 8;
 const MAX_INTERNED: usize = 4096;
 
 /// The interned clusters, each its length then its characters, by an open-addressed hash of the characters.

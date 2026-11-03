@@ -17,7 +17,7 @@ use crate::vt::event::{Event, EventListener};
 use crate::vt::grid::{Dimensions, Grid, GridIterator, Scroll};
 use crate::vt::index::{self, Boundary, Column, Direction, Line, Point, Side};
 use crate::vt::selection::{Selection, SelectionRange, SelectionType};
-use crate::vt::term::cell::{Cell, Flags, ImageTile, LineLength};
+use crate::vt::term::cell::{Cell, Flags, ImageTile, LineLength, MAX_MARKS};
 use crate::vt::term::color::Colors;
 use crate::vt::vi_mode::{ViModeCursor, ViMotion};
 use crate::vt::vte::ansi::{
@@ -1447,9 +1447,10 @@ impl<T> Term<T> {
         n
     }
 
-    /// wongtty: `input` for each of `text`'s characters one or two cells wide that fit on the cursor row, while
-    /// none needs the general path (as `input_ascii`, or a character the charset maps). Returns how many bytes
-    /// of `text` it wrote.
+    /// wongtty: `input` for each of `text`'s characters one or two cells wide that fit on the cursor row, and the
+    /// zerowidth characters after one (as one cluster), while none needs the general path (as `input_ascii`, a
+    /// character the charset maps, or zerowidth characters with the pen's extra). Returns how many bytes of `text`
+    /// it wrote.
     fn input_run(&mut self, text: &str) -> usize {
         let point = self.grid.cursor.point;
         let columns = self.columns();
@@ -1475,9 +1476,33 @@ impl<T> Term<T> {
         let wide_cell = |cell: &Cell| cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER);
         let (mut col, mut used) = (point.column.0, 0);
         let mut chars = text.chars();
+        let mut marked = false;
         while let Some(c) = chars.next() {
             let width = match char_width(c) {
                 Some(width @ 1..=2) => width,
+                // The zerowidth characters after a cell this run wrote go on it (on a wide character's left half),
+                // interned once for all of them.
+                Some(0) if col > point.column.0 && extra.is_none() => {
+                    let mut marks = [c; MAX_MARKS];
+                    let mut n = 1;
+                    while n < MAX_MARKS {
+                        let mut ahead = chars.clone();
+                        match ahead.next() {
+                            Some(m) if char_width(m) == Some(0) => (marks[n], n, chars) = (m, n + 1, ahead),
+                            _ => break,
+                        }
+                    }
+                    let at = if cells[col - 1].flags.contains(Flags::WIDE_CHAR_SPACER) { col - 2 } else { col - 1 };
+                    let cell = &mut cells[at];
+                    if cell.extra.is_none() {
+                        cell.set_zerowidth(&marks[..n]);
+                    } else {
+                        marks[..n].iter().for_each(|&m| cell.push_zerowidth(m));
+                    }
+                    marked = true;
+                    used = text.len() - chars.as_str().len();
+                    continue;
+                },
                 _ => break,
             };
             if col + width > columns || (mapped && c.is_ascii()) {
@@ -1503,7 +1528,7 @@ impl<T> Term<T> {
             cells[point.column.0..col].iter_mut().for_each(|cell| cell.extra = Some(extra.clone()));
         }
         row.occ = if used == 0 { occ } else { occ.max(col) } as u16;
-        row.plain = if used == 0 { was_plain } else { plain };
+        row.plain = if used == 0 { was_plain } else { plain & !marked };
         if used == 0 {
             return 0;
         }
@@ -3302,8 +3327,10 @@ mod tests {
     /// one character at a time.
     #[test]
     fn input_str_matches_input() {
-        let pieces: [&str; 32] = [
+        let pieces: [&str; 38] = [
             "abc", "hello world ", " ", "가", "漢字", "😀", "é", "e\u{301}", "\u{200b}", "\x7f", "\t", "\r", "\n", "\x08",
+            "\u{fe0f}", "\u{2764}\u{fe0f}", "1\u{fe0f}\u{20e3}", "\u{1f468}\u{200d}\u{1f469}", "\u{1f3f3}\u{fe0f}\u{200d}",
+            "a\u{300}\u{301}\u{302}\u{303}\u{304}\u{305}\u{306}\u{307}\u{308}\u{309}",
             "\x1b(0", "\x1b(B", "\x0e", "\x0f", "\x1b[4h", "\x1b[4l", "\x1b[?7l", "\x1b[?7h", "\x1b[31m", "\x1b[0m",
             "\x1b[H", "\x1b[2;9H", "\x1b[K", "\x1b[3@", "\x1b[2P", "\x1b]8;id=a;x\x1b\\", "xxxxxxxxxxxxx", "가나다라마",
         ];
