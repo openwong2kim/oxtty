@@ -114,8 +114,8 @@ impl Present {
 
 struct AtlasTextures {
     atlas: u32,
-    /// Per page: texture and the page version it holds.
-    pages: Vec<(WebGlTexture, u32)>,
+    /// Per page: texture and the page it holds ([`TextureAtlas::page_stamp`]), `None` before its first upload.
+    pages: Vec<(WebGlTexture, Option<(u64, u32)>)>,
 }
 
 struct Programs {
@@ -377,8 +377,9 @@ impl Gpu {
         }
     }
 
-    /// Uploads the pages of `atlas` that changed and binds them to the texture units.
-    fn bind_atlas(&mut self, atlas: &TextureAtlas) {
+    /// Uploads the pages of `atlas` that changed and binds them to the texture units: only the glyphs added since
+    /// the last upload when that is all that changed, else the whole page.
+    fn bind_atlas(&mut self, atlas: &mut TextureAtlas) {
         let gl = &self.gl;
         // Textures of atlases that are gone
         let live = atlas::live_ids();
@@ -404,35 +405,54 @@ impl Gpu {
         let units = atlas::max_atlas_pages().unwrap_or(0) as usize;
         let entry = &mut self.textures[index];
         for i in 0..atlas.page_count().min(units) {
-            let Some(canvas) = atlas.page_canvas(i) else {
-                continue;
-            };
             gl.active_texture(Gl::TEXTURE0 + i as u32);
             if entry.pages.len() <= i {
                 let Some(texture) = gl.create_texture() else {
                     return;
                 };
-                entry.pages.push((texture, u32::MAX));
+                entry.pages.push((texture, None));
             }
-            let (texture, version) = &mut entry.pages[i];
+            let (texture, have) = &mut entry.pages[i];
             gl.bind_texture(Gl::TEXTURE_2D, Some(texture));
-            if *version != atlas.page_version(i) {
-                gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE as i32);
-                gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE as i32);
-                // Glyphs are drawn at the atlas's own scale: no mipmaps to rebuild at every upload (as in
-                // @xterm/addon-webgl 0.20.0-beta.329, `src/GlyphRenderer.ts` lines 410-414)
-                gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::LINEAR as i32);
-                gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::LINEAR as i32);
-                let _ = gl.tex_image_2d_with_u32_and_u32_and_html_canvas_element(
-                    Gl::TEXTURE_2D,
-                    0,
-                    Gl::RGBA as i32,
-                    Gl::RGBA,
-                    Gl::UNSIGNED_BYTE,
-                    canvas,
-                );
-                *version = atlas.page_version(i);
+            let stamp = atlas.page_stamp(i);
+            if *have == Some(stamp) {
+                continue;
             }
+            if let Some(updates) = atlas.take_page_updates(i, *have) {
+                for g in updates {
+                    let _ = gl.tex_sub_image_2d_with_i32_and_i32_and_u32_and_type_and_opt_u8_array(
+                        Gl::TEXTURE_2D,
+                        0,
+                        g.x,
+                        g.y,
+                        g.w,
+                        g.h,
+                        Gl::RGBA,
+                        Gl::UNSIGNED_BYTE,
+                        Some(&g.data),
+                    );
+                }
+                *have = Some(stamp);
+                continue;
+            }
+            let Some(canvas) = atlas.page_canvas(i) else {
+                continue;
+            };
+            gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE as i32);
+            gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE as i32);
+            // Glyphs are drawn at the atlas's own scale: no mipmaps to rebuild at every upload (as in
+            // @xterm/addon-webgl 0.20.0-beta.329, `src/GlyphRenderer.ts` lines 410-414)
+            gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::LINEAR as i32);
+            gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::LINEAR as i32);
+            let _ = gl.tex_image_2d_with_u32_and_u32_and_html_canvas_element(
+                Gl::TEXTURE_2D,
+                0,
+                Gl::RGBA as i32,
+                Gl::RGBA,
+                Gl::UNSIGNED_BYTE,
+                canvas,
+            );
+            *have = Some(stamp);
         }
     }
 
@@ -454,8 +474,8 @@ impl Gpu {
         }
         programs.rect.draw_backgrounds(&self.gl, frame.rects);
         if let Some(atlas) = frame.glyphs.atlas().cloned() {
-            if let Ok(atlas) = atlas.try_borrow() {
-                self.bind_atlas(&atlas);
+            if let Ok(mut atlas) = atlas.try_borrow_mut() {
+                self.bind_atlas(&mut atlas);
                 frame.glyphs.pack(frame.model, &mut self.scratch);
                 programs
                     .glyph

@@ -249,6 +249,9 @@ struct AtlasPage {
     /// Indices into `TextureAtlas::glyphs`.
     glyphs: Vec<usize>,
     version: u32,
+    /// Glyphs added since the page's texture was last uploaded, newest last, each with the version it made: a
+    /// texture only behind by these takes them with `texSubImage2D` instead of the whole page.
+    pending: Vec<PendingGlyph>,
     // Filled left to right, top to bottom. A glyph less than half the current row's height fixes that row, gets
     // a fixed row of its own height below, and a new current row starts under that.
     current_row: Row,
@@ -269,6 +272,7 @@ impl AtlasPage {
             used_pixels: 0.0,
             glyphs: Vec::new(),
             version: 0,
+            pending: Vec::new(),
             current_row: Row::default(),
             fixed_rows: Vec::new(),
         })
@@ -302,8 +306,22 @@ impl AtlasPage {
         self.current_row = Row::default();
         self.fixed_rows.clear();
         self.version += 1;
+        self.pending.clear();
     }
 }
+
+/// A glyph's pixels as written to its page, for a partial texture upload.
+pub(super) struct PendingGlyph {
+    pub version: u32,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub data: Vec<u8>,
+}
+
+/// Pending glyphs a page keeps at most (while no pane draws it); a texture further behind takes the whole page.
+const MAX_PENDING: usize = 256;
 
 fn create_canvas(document: &Document, width: f64, height: f64) -> Option<HtmlCanvasElement> {
     let canvas: HtmlCanvasElement = document.create_element("canvas").ok()?.dyn_into().ok()?;
@@ -398,8 +416,30 @@ impl TextureAtlas {
         self.pages.get(i).map(|p| &p.canvas)
     }
 
-    pub fn page_version(&self, i: usize) -> u32 {
-        self.pages.get(i).map_or(0, |p| p.version)
+    /// Which page is at `i` and its version: a texture holding this stamp holds the page as it is.
+    pub fn page_stamp(&self, i: usize) -> (u64, u32) {
+        self.pages
+            .get(i)
+            .map_or((u64::MAX, 0), |p| (p.id, p.version))
+    }
+
+    /// For a texture of page `i` about to be brought up to date from `have` (its [`Self::page_stamp`], `None`
+    /// for a new texture): the glyphs it lacks when glyph additions are all it lacks, `None` when it needs the
+    /// whole page. Either way the page's pending glyphs are handed over.
+    pub(super) fn take_page_updates(
+        &mut self,
+        i: usize,
+        have: Option<(u64, u32)>,
+    ) -> Option<Vec<PendingGlyph>> {
+        let page = self.pages.get_mut(i)?;
+        let mut pending = std::mem::take(&mut page.pending);
+        let (id, version) = have?;
+        let first = pending.first()?.version;
+        if id != page.id || first > version.wrapping_add(1) || version >= page.version {
+            return None;
+        }
+        pending.retain(|g| g.version > version);
+        Some(pending)
     }
 
     pub fn page_width(&self, i: usize) -> f64 {
@@ -460,6 +500,7 @@ impl TextureAtlas {
                 let merged_index = self.pages.len() - merging.len();
                 let mut merged = self.merge_pages(&merging, merged_index)?;
                 merged.version += 1;
+                merged.pending.clear();
                 let mut indices = merging.clone();
                 indices.sort_unstable();
                 for &i in indices.iter().rev() {
@@ -523,6 +564,7 @@ impl TextureAtlas {
                 }
             }
             page.version += 1;
+            page.pending.clear();
         }
     }
 
@@ -1138,6 +1180,34 @@ impl TextureAtlas {
         page.glyphs.push(index);
         page.used_pixels += glyph.size.0 * glyph.size.1;
         page.version += 1;
+        // The same pixels putImageData wrote, packed, for a partial upload
+        let (bx, by, gw, gh) = (
+            bounds.0 as usize,
+            bounds.1 as usize,
+            glyph.size.0 as usize,
+            glyph.size.1 as usize,
+        );
+        let stride = tmp_w as usize * 4;
+        let mut packed = Vec::with_capacity(gw * gh * 4);
+        for row in by..(by + gh).min(tmp_h as usize) {
+            let start = row * stride + bx * 4;
+            packed.extend_from_slice(&data[start..(start + gw * 4).min(data.len())]);
+        }
+        if packed.len() == gw * gh * 4 {
+            if page.pending.len() >= MAX_PENDING {
+                page.pending.remove(0);
+            }
+            page.pending.push(PendingGlyph {
+                version: page.version,
+                x: glyph.texture_position.0 as i32,
+                y: glyph.texture_position.1 as i32,
+                w: gw as i32,
+                h: gh as i32,
+                data: packed,
+            });
+        } else {
+            page.pending.clear();
+        }
         Some(index)
     }
 
