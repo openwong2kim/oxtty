@@ -264,6 +264,10 @@ impl AtlasPage {
         // Alpha: clear_color turns the background transparent
         let options = js_sys::Object::new();
         js_sys::Reflect::set(&options, &"alpha".into(), &true.into()).ok()?;
+        // A page in CPU memory: putImageData is a copy instead of a GPU-process upload per glyph, and glyphs reach
+        // the texture from their own pixels (`pending`). 17 panes of truecolor output: GPU process -63 MiB and
+        // about 50 points less of its CPU, renderer +47 MiB
+        js_sys::Reflect::set(&options, &"willReadFrequently".into(), &true.into()).ok()?;
         let ctx = context_2d(&canvas, &options)?;
         Some(Self {
             id,

@@ -9,9 +9,10 @@
 //! On a GPU, the frame is handed over without a copy: `transferToImageBitmap` on the `OffscreenCanvas` and
 //! `transferFromImageBitmap` into the pane's `bitmaprenderer` canvas ([`Present`]). Against `drawImage` into a 2D
 //! canvas this saves the GPU process a copy of every frame and the buffers Chromium keeps behind a 2D canvas that
-//! keeps drawing (17 panes of 120×40 with agent output: about 100 MB of the GPU process). A region (the cursor
-//! layer) is drawn as a frame of its own, the pane's picture shifted by the viewport. Software GL (SwiftShader)
-//! and a surface that is not an `OffscreenCanvas` keep the copy into a 2D canvas.
+//! keeps drawing (15 panes of 120×40 printing logs: GPU process 446 → 320 MB); once every pane idles, the surface
+//! shrinks to a pixel ([`trim`]). A region (the cursor layer) is drawn as a frame of its own, the pane's picture
+//! shifted by the viewport. Software GL (SwiftShader) and a surface that is not an `OffscreenCanvas` keep the copy
+//! into a 2D canvas.
 //!
 //! Chrome crashes the page's renderer when a WebGL context is lost on purpose (`WEBGL_lose_context`, or Chrome
 //! dropping the oldest context once a page has more than 16) between a transfer and the commit of that frame; a
@@ -194,6 +195,8 @@ struct Gpu {
     last_recreate: f64,
     recreate_gap: f64,
     draws: u32,
+    /// When a pane last drew (`timer::now`).
+    last_draw: f64,
 }
 
 thread_local! {
@@ -269,6 +272,7 @@ pub fn ensure(document: &Document) -> Result<(), JsValue> {
         last_recreate: f64::NEG_INFINITY,
         recreate_gap: 1000.0,
         draws: 0,
+        last_draw: 0.0,
     };
     gpu.listen();
     gpu.build();
@@ -344,6 +348,16 @@ pub fn image_textures() -> u32 {
             .and_then(|g| g.as_ref().map(|g| g.image_textures.len() as u32))
             .unwrap_or(0)
     })
+}
+
+/// Shrinks the shared surface to a pixel once no pane drew for `idle_ms`: after transfers it keeps drawing
+/// buffers of the last frame's size that no canvas shows.
+pub fn trim(idle_ms: f64) {
+    with_gpu(move |gpu| {
+        if timer::now() - gpu.last_draw >= idle_ms {
+            gpu.surface.set_size(1, 1);
+        }
+    });
 }
 
 /// What a pane draws in one frame.
@@ -585,6 +599,7 @@ impl Gpu {
                 };
                 ctx.show(Some(&bitmap));
                 self.draws = self.draws.wrapping_add(1);
+                self.last_draw = timer::now();
                 return true;
             }
         };

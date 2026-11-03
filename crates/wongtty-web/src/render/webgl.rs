@@ -895,11 +895,10 @@ impl Inner {
             layer.show(blink_shown);
         }
     }
-    /// Compacts the canvas once it has not drawn for [`COMPACT_AFTER_MS`] (a canvas that takes frames by
-    /// transfer has no buffers of its own to free).
+    /// Compacts the canvas once it has not drawn for [`COMPACT_AFTER_MS`].
     fn schedule_compact(&mut self) {
         self.last_draw_at = timer::now();
-        if self.compact.is_none() && self.present.has_buffers() {
+        if self.compact.is_none() {
             self.arm_compact(COMPACT_AFTER_MS);
         }
     }
@@ -923,7 +922,13 @@ impl Inner {
     /// 17 panes of 120×40 at devicePixelRatio 2 held about 400 MB of the GPU process for 120 MB of pixels.
     /// Resizing the canvas drops them all; the same frame is drawn again at once, in the same task, so the page
     /// never paints the empty canvas and the pane keeps one buffer.
+    /// A canvas that takes frames by transfer has no buffers of its own: the shared surface lets go of its own
+    /// once every pane idles.
     fn compact_canvas(&mut self) {
+        if !self.present.has_buffers() {
+            gpu::trim(COMPACT_AFTER_MS);
+            return;
+        }
         let width = self.canvas.width();
         if !self.visible || self.collapsed || width == 0 || !self.can_redraw_last_frame() {
             return;
