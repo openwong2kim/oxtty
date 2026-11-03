@@ -47,7 +47,6 @@ const WIDE: u8 = 1 << 5;
 const DEFAULT_FG: Color = Color::Named(NamedColor::Foreground);
 const DEFAULT_BG: Color = Color::Named(NamedColor::Background);
 
-#[derive(Debug)]
 struct Block {
     /// Absolute number of the block's first row.
     first: u64,
@@ -56,11 +55,27 @@ struct Block {
     end: usize,
     /// Where each row starts in `bytes`: below `BLOCK_BYTES`, so a `u16`.
     starts: Vec<u16>,
+    /// The most cells any row stored here looks at (`scan_len`), and whether any of them wraps, so that a column
+    /// change can keep the block as it is when it changes none of its rows. Rows dropped do not lower them.
+    max_scan: u16,
+    wrapped: bool,
+}
+
+impl Block {
+    fn new(len: usize) -> Self {
+        Self {
+            first: 0,
+            bytes: vec![0; len],
+            end: 0,
+            starts: Vec::new(),
+            max_scan: 0,
+            wrapped: false,
+        }
+    }
 }
 
 type Extras = Box<[(u16, Arc<CellExtra>)]>;
 
-#[derive(Debug)]
 pub(crate) struct History {
     limit: usize,
     blocks: VecDeque<Block>,
@@ -76,6 +91,20 @@ pub(crate) struct History {
     /// The program cleared the history (`CSI 3 J`, RIS). The engine returns
     /// the view to the bottom and lowers this.
     pub(crate) cleared: bool,
+    /// The width rows are read at, 0 for the width each was stored with. A column change keeps the rows it
+    /// changes none of as they are stored (`Above`) and sets this instead: their cells past the width they are
+    /// read at are default blanks, as are the cells a wider read adds.
+    cols: usize,
+}
+
+/// The counts only: the rows are bytes (`HistorySink` asks for `Debug`).
+impl std::fmt::Debug for History {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("History")
+            .field("first", &self.first)
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
 }
 
 impl History {
@@ -88,6 +117,7 @@ impl History {
             extras: VecDeque::new(),
             spare: None,
             cleared: false,
+            cols: 0,
         }
     }
 
@@ -101,8 +131,21 @@ impl History {
         self.first + i as u64
     }
 
-    /// Row `i`, 0 being the oldest.
+    /// Row `i`, 0 being the oldest, at the width rows are read at.
     pub(crate) fn row(&self, i: usize) -> Row<Cell> {
+        let abs = self.first + i as u64;
+        decode(
+            self.bytes(i),
+            self.extras
+                .binary_search_by_key(&abs, |(at, _)| *at)
+                .ok()
+                .map(|i| &self.extras[i].1),
+            self.cols,
+        )
+    }
+
+    /// The bytes row `i` is stored as.
+    fn bytes(&self, i: usize) -> &[u8] {
         let abs = self.first + i as u64;
         let at = self
             .blocks
@@ -110,13 +153,12 @@ impl History {
         let block = &self.blocks[at];
         let k = (abs - block.first) as usize;
         let end = block.starts.get(k + 1).map_or(block.end, |&e| e as usize);
-        decode(
-            &block.bytes[block.starts[k] as usize..end],
-            self.extras
-                .binary_search_by_key(&abs, |(at, _)| *at)
-                .ok()
-                .map(|i| &self.extras[i].1),
-        )
+        &block.bytes[block.starts[k] as usize..end]
+    }
+
+    /// Row `i`'s `shape`.
+    fn shape(&self, i: usize) -> Option<(usize, bool)> {
+        shape(self.bytes(i))
     }
 
     /// Removes every row, oldest first.
@@ -144,7 +186,17 @@ impl History {
             return;
         }
         let abs = self.first + self.len as u64;
+        // Rows are read at `cols`: one stored at another width would read back cut or padded.
+        debug_assert!(
+            self.cols == 0 || row.len() == self.cols,
+            "row of {} cells, history at {}",
+            row.len(),
+            self.cols
+        );
         let scan = scan_len(row);
+        // A wrapped row ends with `WRAPLINE`. One that a resize without reflow grew keeps it where it was, at its
+        // last cell that is not a default blank: a read at that width would end with it.
+        let wrapped = scan > 0 && row[Column(scan - 1)].flags.contains(Flags::WRAPLINE);
         let room = max_len(scan);
         let mut extras = Vec::new();
         let mut aside = Vec::new();
@@ -159,34 +211,15 @@ impl History {
         };
         let end = encode_take(row, scan, buf, at, &mut extras);
         if !aside.is_empty() {
-            let len = end;
-            if self
-                .blocks
-                .back()
-                .is_none_or(|b| b.end + len > b.bytes.len())
-            {
-                let spare = if len <= BLOCK_BYTES {
-                    self.spare.take()
-                } else {
-                    None
-                };
-                let mut block = spare.unwrap_or_else(|| Block {
-                    first: 0,
-                    bytes: vec![0; BLOCK_BYTES.max(len)],
-                    end: 0,
-                    starts: Vec::new(),
-                });
-                block.first = abs;
-                block.end = 0;
-                block.starts.clear();
-                self.blocks.push_back(block);
-            }
+            self.room_for(end, abs);
         }
         let Some(block) = self.blocks.back_mut() else {
             return;
         };
         debug_assert!(block.end < BLOCK_BYTES);
         block.starts.push(block.end as u16);
+        block.max_scan = block.max_scan.max(scan as u16);
+        block.wrapped |= wrapped;
         if aside.is_empty() {
             block.end = end;
         } else {
@@ -200,6 +233,53 @@ impl History {
         if self.len > self.limit {
             self.pop_oldest();
         }
+    }
+
+    /// Makes sure the newest block has room for a row of `len` bytes, numbered
+    /// `abs`: else a new block takes it, the spare when the row fits that.
+    fn room_for(&mut self, len: usize, abs: u64) {
+        if self
+            .blocks
+            .back()
+            .is_none_or(|b| b.end + len > b.bytes.len())
+        {
+            let spare = if len <= BLOCK_BYTES {
+                self.spare.take()
+            } else {
+                None
+            };
+            let mut block = spare.unwrap_or_else(|| Block::new(BLOCK_BYTES.max(len)));
+            block.first = abs;
+            block.end = 0;
+            block.starts.clear();
+            block.max_scan = 0;
+            block.wrapped = false;
+            self.blocks.push_back(block);
+        }
+    }
+
+    /// Moves the oldest row of `from` here as it is stored, with the `shape` it
+    /// has: a column change that changes nothing of it.
+    fn move_oldest(&mut self, from: &mut History, (scan, wrapped): (usize, bool)) {
+        let abs = self.first + self.len as u64;
+        let bytes = from.bytes(0);
+        self.room_for(bytes.len(), abs);
+        let Some(block) = self.blocks.back_mut() else {
+            return;
+        };
+        block.starts.push(block.end as u16);
+        block.bytes[block.end..block.end + bytes.len()].copy_from_slice(bytes);
+        block.end += bytes.len();
+        block.max_scan = block.max_scan.max(scan as u16);
+        block.wrapped |= wrapped;
+        if from.extras.front().is_some_and(|(at, _)| *at == from.first) {
+            if let Some((_, extras)) = from.extras.pop_front() {
+                self.extras.push_back((abs, extras));
+            }
+        }
+        self.len += 1;
+        from.pop_oldest();
+        self.reuse(from);
     }
 
     fn pop_oldest(&mut self) {
@@ -242,6 +322,50 @@ impl History {
         self.len = min(self.len, keep);
     }
 
+    /// The rows left in the oldest block when a column change to `columns` keeps
+    /// every one of them as it is: none wraps, and none that `shrink`s has cells
+    /// past `columns` that are not default blanks.
+    fn front_unchanged(&self, columns: usize, shrink: bool) -> Option<usize> {
+        let block = self.blocks.front()?;
+        (!block.wrapped && (!shrink || block.max_scan as usize <= columns))
+            .then(|| block.first + block.starts.len() as u64 - self.first)
+            .map(|n| n as usize)
+    }
+
+    /// Moves the oldest block of `from` here as it is, its rows numbered on
+    /// from the newest here; returns how many rows it holds. Rows `from` has
+    /// dropped from the block take numbers below the first here, so this holds
+    /// no rows before then.
+    fn take_block(&mut self, from: &mut History) -> usize {
+        let Some(mut block) = from.blocks.pop_front() else {
+            return 0;
+        };
+        let dead = from.first - block.first;
+        debug_assert!(dead == 0 || self.blocks.is_empty());
+        let n = block.starts.len() - dead as usize;
+        let abs = self.first + self.len as u64;
+        let end = from.first + n as u64;
+        while from.extras.front().is_some_and(|(at, _)| *at < end) {
+            if let Some((at, extras)) = from.extras.pop_front() {
+                self.extras.push_back((at - from.first + abs, extras));
+            }
+        }
+        block.first = abs - dead;
+        from.first = end;
+        from.len -= n;
+        self.blocks.push_back(block);
+        self.len += n;
+        n
+    }
+
+    /// Takes the spare block of `older`, which a reflow empties, for the rows it stores here: no second set of
+    /// blocks while the old history is still alive.
+    fn reuse(&mut self, older: &mut History) {
+        if self.spare.is_none() {
+            self.spare = older.spare.take();
+        }
+    }
+
     /// Numbers the rows again from `first` on, which is past their numbers.
     fn renumber(&mut self, first: u64) {
         let delta = first - self.first;
@@ -261,14 +385,65 @@ impl HistorySink<Cell> for History {
     }
 
     fn clear(&mut self) {
+        let freed = !self.blocks.is_empty() || self.spare.is_some();
         self.drop_all();
+        // The next row gets a block when it comes: none is kept for it.
+        self.spare = None;
         self.cleared = true;
+        if freed {
+            release_freed();
+        }
+    }
+}
+
+impl Drop for History {
+    fn drop(&mut self) {
+        if !self.blocks.is_empty() || self.spare.is_some() {
+            self.blocks.clear();
+            self.spare = None;
+            release_freed();
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The `release_freed` calls on this thread, for the tests.
+    static RELEASES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Has the system allocator hand back the memory of the blocks just freed
+/// (native builds): the macOS allocator keeps freed blocks of `BLOCK_BYTES` in
+/// the footprint otherwise, which then stays as large as the history was.
+fn release_freed() {
+    #[cfg(test)]
+    RELEASES.with(|n| n.set(n.get() + 1));
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: no zone (all of them) and no goal (as much as can be freed) are valid arguments.
+        unsafe {
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        // SAFETY: glibc's malloc_trim takes any pad.
+        unsafe {
+            malloc_trim(0);
+        }
     }
 }
 
 /// The older history rows while the grid resizes. A column change reflows
 /// them one row at a time, decoding each and storing the result in a new
-/// [`History`] whose rows are numbered from `next` on.
+/// [`History`] whose rows are numbered from `next` on; a row or a block of
+/// rows it changes none of moves there as it is stored.
 #[derive(Debug)]
 struct Above {
     rows: History,
@@ -298,14 +473,25 @@ impl HistoryAbove<Cell> for Above {
         keep: usize,
     ) -> Vec<Row<Cell>> {
         let mut older = self.take();
+        let keep = keep.max(1);
+        // The newest rows go through the reflow that keeps the rows the grid takes back: enough of them to end at
+        // least `keep` lines, from a row on that the row before does not wrap into. The rows before them are
+        // reflowed on their own, and every row they reflow to is stored here.
+        let n = older.len();
+        let (mut tail, mut ends) = (0, 0);
+        while tail < n {
+            let wraps = older.shape(n - 1 - tail).is_none_or(|(_, wraps)| wraps);
+            if ends >= keep && !wraps {
+                break;
+            }
+            ends += !wraps as usize;
+            tail += 1;
+        }
         // Reflowed rows not stored yet. The newest can still take cells from
         // the next row.
         let mut rows = VecDeque::new();
-        for i in (base..base + older.len()).rev() {
-            let row = older.row(0);
-            older.pop_oldest();
-            grow_row(&mut rows, row, reflow, columns, i, display_offset);
-            while rows.len() > keep.max(1) {
+        let store = |rows: &mut VecDeque<Row<Cell>>, stored: &mut History, keep: usize| {
+            while rows.len() > keep {
                 if let Some(mut row) = rows.pop_front() {
                     // Without reflow a row keeps its wrapped mark, as the grid does with the xterm.js resize.
                     if reflow {
@@ -313,10 +499,57 @@ impl HistoryAbove<Cell> for Above {
                     } else {
                         row.resize_keeping_wrap(columns);
                     }
-                    self.rows.push_row(&mut row);
+                    stored.push_row(&mut row);
                 }
             }
+        };
+        let mut misses = Misses::default();
+        while older.len() > 0 {
+            let before = older.len() > tail;
+            // A row that wraps into none takes no cells from the next and is kept as it is stored, as is a block of
+            // them, unless the row before it wraps into it.
+            let takes = rows.back().is_some_and(|r: &Row<Cell>| {
+                let len = r.len();
+                reflow && len < columns && r[Column(len - 1)].flags.contains(Flags::WRAPLINE)
+            });
+            if before && !takes {
+                if let Some(k) = older.front_unchanged(columns, false) {
+                    // The newest block can hold the newest rows too: none of them wraps, so the reflow would give
+                    // the grid them all, which read the same at the new width.
+                    let (whole, newest) = (older.first == older.blocks[0].first, k == older.len());
+                    if (k <= older.len() - tail || newest)
+                        && (whole || (self.rows.blocks.is_empty() && rows.is_empty()))
+                    {
+                        store(&mut rows, &mut self.rows, 0);
+                        self.rows.take_block(&mut older);
+                        if newest {
+                            self.rows.cols = columns;
+                            let n = self.rows.len();
+                            rows.extend((n - tail..n).map(|i| self.rows.row(i)));
+                            self.rows.truncate_newest(n - tail);
+                        }
+                        continue;
+                    }
+                }
+                if let Some(shape) = misses.shape(&older, |(_, wraps)| !wraps) {
+                    store(&mut rows, &mut self.rows, 0);
+                    self.rows.move_oldest(&mut older, shape);
+                    continue;
+                }
+            }
+            let i = base + older.len() - 1;
+            let row = older.row(0);
+            older.pop_oldest();
+            self.rows.reuse(&mut older);
+            grow_row(&mut rows, row, reflow, columns, i, display_offset);
+            store(&mut rows, &mut self.rows, if before { 1 } else { keep });
+            if older.len() == tail {
+                // The row before the newest ones wraps into none of them.
+                store(&mut rows, &mut self.rows, 0);
+            }
         }
+        self.rows.reuse(&mut older);
+        self.rows.cols = columns;
         rows.into()
     }
 
@@ -330,9 +563,28 @@ impl HistoryAbove<Cell> for Above {
         let mut older = self.take();
         let mut rows = Vec::new();
         let mut buffered = None;
-        for i in (base..base + older.len()).rev() {
+        let mut misses = Misses::default();
+        while older.len() > 0 {
+            // A row that neither wraps nor reaches past the new width is kept as it is stored, as is a block of
+            // them, unless the row before it carries cells into it.
+            if buffered.is_none() {
+                if older.front_unchanged(columns, true).is_some() {
+                    let whole = older.first == older.blocks[0].first;
+                    if whole || self.rows.blocks.is_empty() {
+                        self.rows.take_block(&mut older);
+                        continue;
+                    }
+                }
+                if let Some(shape) = misses.shape(&older, |(scan, wraps)| !wraps && scan <= columns)
+                {
+                    self.rows.move_oldest(&mut older, shape);
+                    continue;
+                }
+            }
+            let i = base + older.len() - 1;
             let row = older.row(0);
             older.pop_oldest();
+            self.rows.reuse(&mut older);
             shrink_row(
                 &mut rows,
                 &mut buffered,
@@ -346,6 +598,8 @@ impl HistoryAbove<Cell> for Above {
                 self.rows.push_row(&mut row);
             }
         }
+        self.rows.reuse(&mut older);
+        self.rows.cols = columns;
         buffered
     }
 
@@ -353,6 +607,34 @@ impl HistoryAbove<Cell> for Above {
         while self.rows.len() > max {
             self.rows.pop_oldest();
         }
+    }
+}
+
+/// Which oldest rows of a history a column change looks at the `shape` of, to
+/// keep them as they are stored. A row whose shape does not pass is decoded
+/// after the cost of a look: after `MISSES` of them in a row, the rest of its
+/// block is decoded without one (rows of a block are mostly alike).
+#[derive(Default)]
+struct Misses(usize);
+
+const MISSES: usize = 8;
+
+impl Misses {
+    /// The shape of the oldest row of `older` if it passes `keeps`.
+    fn shape(
+        &mut self,
+        older: &History,
+        keeps: impl Fn((usize, bool)) -> bool,
+    ) -> Option<(usize, bool)> {
+        if older.blocks.front().is_some_and(|b| b.first == older.first) {
+            self.0 = 0;
+        }
+        if self.0 >= MISSES {
+            return None;
+        }
+        let shape = older.shape(0).filter(|&shape| keeps(shape));
+        self.0 = if shape.is_some() { 0 } else { self.0 + 1 };
+        shape
     }
 }
 
@@ -536,7 +818,10 @@ fn shrink_row(
 /// this before feeding it: the primary grid then keeps the newest `RECENT`
 /// history rows and hands older ones here. Rows are numbered oldest first and
 /// sit above the grid's own history; they belong to the primary screen. Resize
-/// through [`TermHistory::resize`] so that reflow sees the whole history.
+/// through [`TermHistory::resize`] so that reflow sees the whole history: a
+/// column change records the width rows are read at, which has to stay the
+/// primary grid's width, so a [`Term::resize`] past this would have rows
+/// stored at the new width read back at the old one.
 #[derive(Clone)]
 pub struct TermHistory {
     inner: Arc<Mutex<History>>,
@@ -612,6 +897,8 @@ impl TermHistory {
         let mut stored = self.lock();
         let sink = grid.set_history_sink(None);
         let (next, cleared, limit) = (stored.id(stored.len()), stored.cleared, stored.limit);
+        let blocks = stored.blocks.len() + stored.spare.is_some() as usize;
+        let columns_change = columns != grid.columns();
 
         // The rows the grid takes back, newest first: two screens' worth (old
         // and new height), and the rest of the cursor paragraph if it reaches
@@ -705,7 +992,20 @@ impl TermHistory {
         while rows.len() > limit {
             rows.pop_oldest();
         }
+        // A block a column change emptied is kept as the spare, which only a full history (`pop_oldest`) needs.
+        if rows.len() < limit {
+            rows.spare = None;
+        }
+        let freed = rows.blocks.len() + (rows.spare.is_some() as usize) < blocks;
         *stored = rows;
+        drop(stored);
+        // A column change also frees the rows the grid took back and reflowed: about 0.6 MiB at 120x40 that the
+        // macOS allocator keeps in the footprint otherwise, while those of a row change are fewer and taken again.
+        // Elsewhere only freed blocks are worth a release: glibc's `malloc_trim` walks every arena.
+        let reflowed = cfg!(target_os = "macos") && columns_change && n > 0;
+        if freed || reflowed {
+            release_freed();
+        }
         offset
     }
 
@@ -799,15 +1099,22 @@ fn is_plain(cells: &[Cell]) -> bool {
     true
 }
 
-/// The cells `encode` looks at: past the last cell that is not a default blank,
-/// all are default blanks, and those at the end of the row are left out. Cells
-/// past `occ` all equal the last cell (the Row::reset invariant), so with a
-/// default blank last the scan can stop there.
+/// The cells `encode` looks at: up to the last cell that is not a default
+/// blank, past which all are default blanks, left out at the end of the row.
+/// Cells past `occ` all equal the last cell (the Row::reset invariant), so
+/// with a default blank last the scan can start back from there. A decoded or
+/// grown row counts all its cells as occupied, so the blank tail is not
+/// counted in: a plain row takes the one-run path of `encode`, and a block's
+/// `max_scan` tells which narrower widths change none of its rows.
 #[inline]
 fn scan_len(row: &Row<Cell>) -> usize {
     let cells = &row[..];
     if cells.last().is_some_and(is_default) {
-        (row.occ as usize).min(cells.len())
+        let occ = (row.occ as usize).min(cells.len());
+        cells[..occ]
+            .iter()
+            .rposition(|c| !is_default(c))
+            .map_or(0, |i| i + 1)
     } else {
         cells.len()
     }
@@ -1316,16 +1623,23 @@ fn runs(
     out.at
 }
 
-/// Decodes one row. Bytes that do not hold a row decode to blanks, as many as
-/// the width they start with when it is readable, otherwise one.
-fn decode(mut bytes: &[u8], extras: Option<&Extras>) -> Row<Cell> {
+/// Decodes one row, `width` cells wide (0: as wide as it was stored). Bytes
+/// that do not hold a row decode to blanks, as many as the width they start
+/// with when it is readable, otherwise one.
+fn decode(mut bytes: &[u8], extras: Option<&Extras>, width: usize) -> Row<Cell> {
     let cols = take_varint(&mut bytes).filter(|n| (1..=u16::MAX as usize).contains(n));
-    cols.and_then(|cols| decode_cells(bytes, cols, extras))
-        .unwrap_or_else(|| Row::new(cols.unwrap_or(1)))
+    let width = if width == 0 { cols.unwrap_or(1) } else { width };
+    cols.and_then(|cols| decode_cells(bytes, cols, extras, width))
+        .unwrap_or_else(|| Row::new(width))
 }
 
-fn decode_cells(mut bytes: &[u8], cols: usize, extras: Option<&Extras>) -> Option<Row<Cell>> {
-    let mut cells = Vec::with_capacity(cols);
+fn decode_cells(
+    mut bytes: &[u8],
+    cols: usize,
+    extras: Option<&Extras>,
+    width: usize,
+) -> Option<Row<Cell>> {
+    let mut cells = Vec::with_capacity(cols.max(width));
     let (mut fg, mut bg, mut flags) = (DEFAULT_FG, DEFAULT_BG, Flags::empty());
     // The default blanks that end the row are not written.
     while cells.len() < cols && !bytes.is_empty() {
@@ -1392,7 +1706,9 @@ fn decode_cells(mut bytes: &[u8], cols: usize, extras: Option<&Extras>) -> Optio
     for (col, extra) in extras.into_iter().flat_map(|e| e.iter()) {
         cells.get_mut(*col as usize)?.extra = Some(extra.clone());
     }
-    Some(Row::from_vec(cells, cols))
+    // Read at another width: the cells past the narrower one are default blanks.
+    cells.resize(width, Cell::default());
+    Some(Row::from_vec(cells, width))
 }
 
 fn take_color(bytes: &mut &[u8]) -> Option<Color> {
@@ -1470,6 +1786,43 @@ fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
     let (head, rest) = bytes.split_at_checked(n)?;
     *bytes = rest;
     Some(head)
+}
+
+/// From a stored row's bytes, without decoding its cells: how many cells it
+/// was stored with (its `scan_len` then: the blanks past them are default),
+/// and whether it wraps (its last run, which holds the last of them, has
+/// `WRAPLINE`). `None` for bytes `decode` would not read either.
+fn shape(mut bytes: &[u8]) -> Option<(usize, bool)> {
+    take_varint(&mut bytes)?;
+    let (mut at, mut cells, mut flags) = (0, 0, 0);
+    while at < bytes.len() {
+        let (tag, n) = (
+            bytes[at],
+            u16::from_le_bytes([*bytes.get(at + 1)?, *bytes.get(at + 2)?]),
+        );
+        at += 3;
+        // A colour is its kind and 2, 1 or 3 bytes (`Out::color`).
+        for color in [FG, BG] {
+            if tag & color != 0 {
+                at += [3, 2][..].get(*bytes.get(at)? as usize).map_or(4, |&n| n);
+            }
+        }
+        if tag & FLAGS != 0 {
+            flags = u16::from_le_bytes([*bytes.get(at)?, *bytes.get(at + 1)?]);
+            at += 2;
+        }
+        if tag & BLANK != 0 {
+            cells += n as usize;
+            continue;
+        }
+        for _ in 0..n {
+            let b = *bytes.get(at)?;
+            let long = b >= UNIT_2;
+            at += 1 + long as usize + (b >= UNIT_3) as usize;
+            cells += 1 + (long && b & WIDE != 0) as usize;
+        }
+    }
+    (at == bytes.len()).then_some((cells, flags as u32 & Flags::WRAPLINE.bits() != 0))
 }
 
 #[cfg(test)]
@@ -1558,7 +1911,8 @@ mod tests {
 
     /// Rows of random cells from a small set (so that runs form), with wide
     /// pairs, broken pairs, typed and erased spaces, blanks to the end and
-    /// extras: each decodes to the cells it was encoded from.
+    /// extras: each decodes to the cells it was encoded from, and its `shape`
+    /// is what it was stored with.
     #[test]
     fn random_rows_round_trip() {
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
@@ -1646,6 +2000,10 @@ mod tests {
         }
         for (i, row) in rows.iter().enumerate() {
             assert_eq!(&history.row(i)[..], &row[..], "row {i}");
+            // The bytes tell the cells looked at and the wrap without a decode.
+            let scan = scan_len(row);
+            let wrapped = scan > 0 && row[Column(scan - 1)].flags.contains(Flags::WRAPLINE);
+            assert_eq!(history.shape(i), Some((scan, wrapped)), "row {i}");
         }
     }
 
@@ -1672,7 +2030,7 @@ mod tests {
         let out = encoded(&row);
         // 48 characters × 3 bytes + 23 spaces + a few header bytes
         assert!(out.len() <= 175, "{} bytes", out.len());
-        assert_eq!(&decode(&out, None)[..], &row[..]);
+        assert_eq!(&decode(&out, None, 0)[..], &row[..]);
     }
 
     #[test]
@@ -1769,11 +2127,11 @@ mod tests {
                 // Random bytes.
                 _ => bytes = (0..next() % 40).map(|_| next() as u8).collect(),
             }
-            let row = decode(&bytes, None);
+            let row = decode(&bytes, None, 0);
             assert!(row.len() >= 1);
-            decode(&bytes, Some(&extras));
+            decode(&bytes, Some(&extras), 0);
         }
-        assert_eq!(&decode(&[0xff; 12], None)[..], &Row::<Cell>::new(1)[..]);
+        assert_eq!(&decode(&[0xff; 12], None, 0)[..], &Row::<Cell>::new(1)[..]);
     }
 
     /// No block grows past `BLOCK_BYTES` but one that holds a single larger row, and every row reads back, with
@@ -1813,6 +2171,87 @@ mod tests {
             );
             assert!(block.end <= block.bytes.len());
         }
+    }
+
+    /// A column change that changes no row keeps every block as it is and reads the rows at the new width; the
+    /// grid takes the newest back.
+    #[test]
+    fn unchanged_rows_keep_their_blocks() {
+        let mut history = History::new(usize::MAX);
+        let mut rows = Vec::new();
+        for n in 0..6000u32 {
+            let mut row = Row::<Cell>::new(120);
+            for (i, c) in format!("line {n} {}", "x".repeat((n % 20) as usize))
+                .chars()
+                .enumerate()
+            {
+                row[Column(i)] = cell(c, DEFAULT_FG, DEFAULT_BG, Flags::empty());
+            }
+            history.push(&mut row.clone());
+            rows.push(row);
+        }
+        let blocks: Vec<_> = history.blocks.iter().map(|b| b.bytes.as_ptr()).collect();
+        assert!(blocks.len() > 1);
+        let next = history.id(history.len());
+        let mut above = Above {
+            rows: history,
+            next,
+        };
+        let mut offset = 0;
+        assert!(above.shrink_columns(true, 40, 50, &mut offset).is_none());
+        let kept = |h: &History| {
+            h.blocks
+                .iter()
+                .map(|b| b.bytes.as_ptr())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kept(&above.rows), blocks);
+        assert_eq!(above.rows.id(0), next);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(above.rows.row(i)[..], row[..][..40], "row {i}");
+        }
+        above.next = above.rows.id(above.rows.len());
+        let back = above.grow_columns(true, 130, 50, &mut offset, 80);
+        assert_eq!(back.len(), 80);
+        for (row, want) in back.iter().zip(&rows[rows.len() - 80..]) {
+            assert_eq!(row[..][..40], want[..][..40]);
+            assert!(row[..][40..].iter().all(is_default));
+        }
+        assert_eq!(kept(&above.rows), blocks);
+        assert_eq!(above.rows.len(), rows.len() - 80);
+        let row = above.rows.row(7);
+        assert_eq!(row.len(), 130);
+        assert_eq!(row[..][..40], rows[7][..][..40]);
+        assert_eq!(offset, 0);
+    }
+
+    /// Rows are read at the width of the last column change, so one stored at another width is a misuse.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "history at 100")]
+    fn a_row_at_another_width_than_rows_are_read_at_panics() {
+        let mut history = History::new(10);
+        history.cols = 100;
+        history.push(&mut Row::<Cell>::new(160));
+    }
+
+    /// A history holding only its spare block frees it on a clear and on drop, and has the allocator hand it back.
+    #[test]
+    fn a_spare_block_alone_is_released() {
+        let releases = || RELEASES.with(|n| n.get());
+        let before = releases();
+        let mut history = History::new(10);
+        history.spare = Some(Block::new(BLOCK_BYTES));
+        history.clear();
+        assert!(history.spare.is_none());
+        assert_eq!(releases(), before + 1);
+        history.clear();
+        assert_eq!(releases(), before + 1, "nothing to free");
+        history.spare = Some(Block::new(BLOCK_BYTES));
+        drop(history);
+        assert_eq!(releases(), before + 2);
+        drop(History::new(10));
+        assert_eq!(releases(), before + 2, "nothing to free");
     }
 
     /// A row too large for a `BLOCK_BYTES` block gets a block of its own and leaves the kept spare block in place.
@@ -1900,7 +2339,7 @@ mod tests {
             out.varint(row.len());
             let end = runs(&row[..][..scan], 0, out, &mut Vec::new());
             assert_eq!(a, &b[..end], "{row:?}");
-            assert_eq!(decode(&a, None), row);
+            assert_eq!(decode(&a, None, 0), row);
         }
     }
 
@@ -1950,7 +2389,7 @@ mod tests {
             let end = encode_take(&mut taken, scan, &mut got, 0, &mut Vec::new());
             assert_eq!(&got[..end], want, "{row:?}");
             assert_eq!(taken, Row::new(cols));
-            assert_eq!(decode(&want, None), row);
+            assert_eq!(decode(&want, None, 0), row);
         }
     }
 }
@@ -2044,6 +2483,28 @@ mod oracle {
                 _ => format!("{}\r\n", "w".repeat(rng.below(30) as usize)),
             };
             s.push_str(&token);
+        }
+        s
+    }
+
+    /// Log output: many short lines, so that a history takes several blocks,
+    /// and now and then a stretch of colours, wide characters and long wrapped
+    /// lines, so that some blocks change in a resize and others do not.
+    fn log_chunk(rng: &mut Rng, lines: u64) -> String {
+        let mut s = String::new();
+        let mut odd = 0;
+        for n in 0..lines {
+            if rng.below(400) == 0 {
+                odd = rng.below(30);
+            }
+            if odd > 0 {
+                odd -= 1;
+                s.push_str(&chunk(rng, 6));
+                continue;
+            }
+            let most = if rng.below(4) == 0 { 40 } else { 12 };
+            let width = rng.below(most);
+            s.push_str(&format!("{n} {}\r\n", "w".repeat(width as usize)));
         }
         s
     }
@@ -2191,19 +2652,47 @@ mod oracle {
         full: usize,
         alt: usize,
         dropped: usize,
+        /// Blocks a resize kept as they were, and those it stored again.
+        kept: usize,
+        stored: usize,
     }
 
-    fn run(seed: u64, seen: &mut Seen) {
+    /// Seeds to run: `WONGTTY_FUZZ_CASES` or `default`.
+    fn cases(default: u64) -> u64 {
+        std::env::var("WONGTTY_FUZZ_CASES")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// One run of resizes after output. `wide` takes widths up to 250 columns, and every other engine run behaves
+    /// as with a Windows PTY that does not reflow (`Engine::set_windows_pty`).
+    fn run(seed: u64, seen: &mut Seen, logs: bool, wide: bool) {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         let engine = seed % 3 != 0;
-        let (mut cols, mut rows) = (rng.below(38) as usize + 2, rng.below(8) as usize + 1);
-        let scrollback = [17, 24, 60, 150, 400, 1500][rng.below(6) as usize];
+        let max_cols = if wide { 248 } else { 38 };
+        let (mut cols, mut rows) = (rng.below(max_cols) as usize + 2, rng.below(8) as usize + 1);
+        let scrollback = if logs {
+            [2000, 5000, 12000][rng.below(3) as usize]
+        } else {
+            [17, 24, 60, 150, 400, 1500][rng.below(6) as usize]
+        };
         let mut a = Side::new(engine, cols, rows, scrollback);
         let mut b = Side::new(engine, cols, rows, scrollback);
+        if wide && engine && seed % 2 == 0 {
+            // Conpty before 21376 marks rows as wrapped by its heuristic; another backend does not.
+            let heuristic = seed % 4 == 0;
+            a.term.set_windows_pty(false, false, heuristic);
+            b.term.set_windows_pty(false, false, heuristic);
+        }
         let mut offset = 0;
         for step in 0..10 {
             let tokens = rng.below(400);
-            let mut bytes = chunk(&mut rng, tokens);
+            let mut bytes = if logs {
+                log_chunk(&mut rng, tokens * 8)
+            } else {
+                chunk(&mut rng, tokens)
+            };
             if rng.below(3) == 0 {
                 // End inside a long line: the cursor paragraph reaches far up.
                 bytes.push_str(&"q".repeat(rng.below(1200) as usize));
@@ -2223,10 +2712,10 @@ mod oracle {
             };
             let (old_cols, old_rows) = (cols, rows);
             match rng.below(4) {
-                0 => cols = rng.below(38) as usize + 2,
+                0 => cols = rng.below(max_cols) as usize + 2,
                 1 => rows = rng.below(10) as usize + 1,
                 _ => {
-                    cols = rng.below(38) as usize + 2;
+                    cols = rng.below(max_cols) as usize + 2;
                     rows = rng.below(10) as usize + 1;
                 }
             }
@@ -2254,12 +2743,28 @@ mod oracle {
                 // Nothing to do: the rows keep their ids (the reference stores them again).
                 continue;
             }
-            let next = {
+            let (next, blocks) = {
                 let stored = a.history.lock();
-                stored.id(stored.len())
+                // A block taken again for other rows (the spare) has other row starts.
+                let blocks: Vec<_> = (stored.blocks.iter())
+                    .map(|b| (b.bytes.as_ptr(), b.starts.clone()))
+                    .collect();
+                (stored.id(stored.len()), blocks)
             };
             let size = TermSize::new(cols, rows);
             let got = a.history.reflow(&mut a.term, size, offset);
+            {
+                let stored = a.history.lock();
+                let kept = (stored.blocks.iter())
+                    .filter(|b| {
+                        blocks.iter().any(|(at, starts)| {
+                            *at == b.bytes.as_ptr() && starts.starts_with(&b.starts)
+                        })
+                    })
+                    .count();
+                seen.kept += kept;
+                seen.stored += blocks.len() - kept.min(blocks.len());
+            }
             let want = b
                 .history
                 .reflow_take_all(&mut b.term, TermSize::new(cols, rows), offset);
@@ -2318,8 +2823,8 @@ mod oracle {
     #[test]
     fn reflow_matches_the_whole_history_in_the_grid() {
         let mut seen = Seen::default();
-        for seed in 1..=600 {
-            run(seed, &mut seen);
+        for seed in 1..=cases(600) {
+            run(seed, &mut seen, false, false);
         }
         // The cases the reflow has to get right all came up.
         assert!(seen.split > 1000, "{seen:?}");
@@ -2328,6 +2833,68 @@ mod oracle {
         assert!(seen.full > 50, "{seen:?}");
         assert!(seen.alt > 100, "{seen:?}");
         assert!(seen.dropped > 50, "{seen:?}");
+        eprintln!("{seen:?}");
+    }
+
+    /// A resize keeps the blocks it changes no row of, and stores the others
+    /// again, as a grid with the whole history in it reflows them.
+    #[test]
+    fn reflow_keeps_unchanged_blocks_as_the_whole_history_in_the_grid() {
+        let mut seen = Seen::default();
+        for seed in 1..=cases(600) / 15 {
+            run(seed, &mut seen, true, false);
+        }
+        assert!(seen.kept > 100 && seen.stored > 100, "{seen:?}");
+        eprintln!("{seen:?}");
+    }
+
+    /// A resize has the allocator hand memory back only after a column change of rows held here (on macOS), or one
+    /// that drops blocks; a history that is not full keeps no spare block after it.
+    #[test]
+    fn reflow_releases_only_after_a_column_change() {
+        let releases = || RELEASES.with(|n| n.get());
+        let resize = |side: &mut Side, cols: usize, rows: usize| {
+            let before = releases();
+            side.history
+                .reflow(&mut side.term, TermSize::new(cols, rows), 0);
+            releases() - before
+        };
+        let mut side = Side::new(true, 120, 40, 10_000);
+        assert_eq!(resize(&mut side, 100, 40), 0, "empty history");
+        let mut log = String::new();
+        for n in 0..6000 {
+            if n % 150 == 149 {
+                log.push_str(&"L".repeat(158));
+            } else {
+                log.push_str(&format!("{n} line of a log {}", "x".repeat(n % 40)));
+            }
+            log.push_str("\r\n");
+        }
+        side.feed(log.as_bytes());
+        assert!(side.history.len() > 5000);
+        assert_eq!(resize(&mut side, 100, 30), 0, "rows only");
+        assert_eq!(resize(&mut side, 100, 40), 0, "rows only");
+        let reflowed = cfg!(target_os = "macos") as usize;
+        for (i, cols) in [120, 100, 120, 100, 120].into_iter().enumerate() {
+            assert_eq!(resize(&mut side, cols, 40), reflowed, "column change {i}");
+            assert!(side.history.lock().spare.is_none(), "column change {i}");
+        }
+    }
+
+    /// The same at widths up to 250 columns, and without reflow (a Windows PTY).
+    #[test]
+    fn reflow_matches_at_wide_columns_and_without_reflow() {
+        let mut seen = Seen::default();
+        for seed in 1..=cases(600) / 10 {
+            run(seed, &mut seen, false, true);
+        }
+        for seed in 1..=cases(600) / 60 {
+            run(seed, &mut seen, true, true);
+        }
+        assert!(
+            seen.split > 100 && seen.kept > 100 && seen.stored > 100,
+            "{seen:?}"
+        );
         eprintln!("{seen:?}");
     }
 }
