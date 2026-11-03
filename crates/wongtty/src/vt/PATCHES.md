@@ -318,16 +318,21 @@ Same results as upstream, in less time:
   `scroll_down_relative` touch the selection only when there is one.
 - `term/cell.rs`: a cell whose extra holds only zerowidth characters (up to
   8: combining marks, variation selectors, joiners) shares one interned
-  `CellExtra` per cluster (`intern`, a per-thread list of at most 512, never
-  freed) instead of allocating an `Arc` and a `Vec` of its own;
-  `push_zerowidth` interns the cluster with the new character, and past the
-  limits falls back to upstream's copy-on-write. The field stays
+  `CellExtra` per cluster instead of allocating an `Arc` and a `Vec` of its
+  own. `intern` is a per-thread open-addressed table of 1024 slots, each with
+  the cluster's hash: a lookup looks at most at 8 slots, and when those all
+  hold other clusters the new one replaces one of them (cells keep the one
+  replaced), so the cost stays bounded and the table follows what is printed
+  whatever the number of distinct clusters. `push_zerowidth` interns the
+  cluster with the new character, and past `MAX_MARKS` or with other extras
+  falls back to upstream's copy-on-write. The field stays
   `Option<Arc<CellExtra>>`, so every other cell write compiles as before.
   `term/mod.rs` `input_run` puts the zerowidth characters that follow a cell
-  it wrote on that cell (`put_marks`, as `input` does, interned once for the
-  cluster) instead of leaving the run, and after them goes back to
-  `input_ascii` for a stretch of eight or more ASCII bytes. WebAssembly
-  builds leave this to `input`, for code size.
+  it wrote, or that start the run after the cell before the cursor, on that
+  cell (`put_marks`, as `input` does, interned once for the cluster) instead
+  of leaving the run, and after them goes back to `input_ascii` for a stretch
+  of eight or more ASCII bytes. WebAssembly builds leave this to `input`, for
+  code size.
 
 ## Parser fast paths
 

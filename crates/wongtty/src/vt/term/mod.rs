@@ -1477,6 +1477,8 @@ impl<T> Term<T> {
         let (mut col, mut used) = (point.column.0, 0);
         let mut chars = text.chars();
         let mut marked = false;
+        // The cell before the run that zerowidth characters at its start go on, as `input` damages it.
+        let mut before = None;
         loop {
             let mut zerowidth = None;
             while let Some(c) = chars.next() {
@@ -1506,11 +1508,15 @@ impl<T> Term<T> {
                 col += width;
                 used = text.len() - chars.as_str().len();
             }
-            // The zerowidth characters after a cell this run wrote go on it, then the run goes on: but for a stretch
-            // of ASCII text (words after an emoji), left to `input_ascii`. In WebAssembly, where the code size counts
-            // for more, `input` puts them.
+            // The zerowidth characters after a cell this run wrote, or at its start after the cell before the cursor
+            // (an accent after ASCII text), go on it, then the run goes on: but for a stretch of ASCII text (words
+            // after an emoji), left to `input_ascii`. In WebAssembly, where the code size counts for more, `input`
+            // puts them.
             match zerowidth {
-                Some(c) if cfg!(not(target_family = "wasm")) && col > point.column.0 && extra.is_none() => {
+                Some(c) if cfg!(not(target_family = "wasm")) && col > 0 && extra.is_none() => {
+                    if col == point.column.0 {
+                        before = Some(col - 1 - cells[col - 1].flags.contains(Flags::WIDE_CHAR_SPACER) as usize);
+                    }
                     put_marks(&mut cells[..col], c, &mut chars);
                     marked = true;
                     used = text.len() - chars.as_str().len();
@@ -1530,7 +1536,12 @@ impl<T> Term<T> {
         if used == 0 {
             return 0;
         }
-        self.damage.damage_line(point.line.0 as usize, point.column.0.saturating_sub(1), col - 1);
+        let (left, right) = match before {
+            Some(at) if col == point.column.0 => (at, at),
+            Some(at) => (at.min(point.column.0 - 1), col - 1),
+            None => (point.column.0.saturating_sub(1), col - 1),
+        };
+        self.damage.damage_line(point.line.0 as usize, left, right);
         if col < columns {
             self.grid.cursor.point.column = Column(col);
         } else {
@@ -3352,10 +3363,11 @@ mod tests {
     /// one character at a time.
     #[test]
     fn input_str_matches_input() {
-        let pieces: [&str; 38] = [
+        let pieces: [&str; 42] = [
             "abc", "hello world ", " ", "가", "漢字", "😀", "é", "e\u{301}", "\u{200b}", "\x7f", "\t", "\r", "\n", "\x08",
             "\u{fe0f}", "\u{2764}\u{fe0f}", "1\u{fe0f}\u{20e3}", "\u{1f468}\u{200d}\u{1f469}", "\u{1f3f3}\u{fe0f}\u{200d}",
             "a\u{300}\u{301}\u{302}\u{303}\u{304}\u{305}\u{306}\u{307}\u{308}\u{309}",
+            "\u{300}\u{301}\u{302}", "\u{1f3fd}", "a\u{300}\u{301}b\u{302}", "\u{1161}\u{11a8}",
             "\x1b(0", "\x1b(B", "\x0e", "\x0f", "\x1b[4h", "\x1b[4l", "\x1b[?7l", "\x1b[?7h", "\x1b[31m", "\x1b[0m",
             "\x1b[H", "\x1b[2;9H", "\x1b[K", "\x1b[3@", "\x1b[2P", "\x1b]8;id=a;x\x1b\\", "xxxxxxxxxxxxx", "가나다라마",
         ];
