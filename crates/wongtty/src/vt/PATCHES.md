@@ -316,6 +316,17 @@ Same results as upstream, in less time:
   emoticon (U+1F5FB–U+1F64F) and transport (U+1F680–U+1F6C5) emoji, which
   the table gives two cells; `scroll_up_relative` and
   `scroll_down_relative` touch the selection only when there is one.
+- `term/cell.rs`: a cell whose extra holds only zerowidth characters (up to
+  8: combining marks, variation selectors, joiners) shares one interned
+  `CellExtra` per cluster (`intern`, a per-thread list of at most 512, never
+  freed) instead of allocating an `Arc` and a `Vec` of its own;
+  `push_zerowidth` interns the cluster with the new character, and past the
+  limits falls back to upstream's copy-on-write. The field stays
+  `Option<Arc<CellExtra>>`, so every other cell write compiles as before.
+  `term/mod.rs` `input_run` puts the zerowidth characters that follow a cell
+  it wrote on that cell (`put_mark`, as `input` does) instead of leaving the
+  run, and after one goes back to `input_ascii` for a stretch of eight or
+  more ASCII bytes.
 
 ## Parser fast paths
 
