@@ -364,11 +364,12 @@ impl Terminal {
     pub fn resize(&self, cols: u32, rows: u32) -> Result<(), JsValue> {
         let shared = &self.shared;
         let open = shared.core.borrow().element.is_some();
-        if open && shared.resized.get() && shared.frame.borrow().is_some() {
+        if open && shared.resized.get() {
             let applied = shared.core.borrow().size();
             shared
                 .resize_pending
                 .set(((cols, rows) != applied).then_some((cols, rows)));
+            shared.schedule_frame();
             return Ok(());
         }
         shared.resize_pending.set(Some((cols, rows)));
