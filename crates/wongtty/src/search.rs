@@ -203,6 +203,17 @@ fn push_row(
     content
 }
 
+/// Rows read bottom up by [`Engine::search_previous`], so each is decoded once: finding where a line starts reads the
+/// row above it, which ends the next line up and stays here for it.
+#[derive(Default)]
+struct RowsUp {
+    /// Each row's characters and cells (counted from its own column 0), the bottom row first.
+    chars: Vec<char>,
+    cells: Vec<u32>,
+    /// Where each row starts in `chars`.
+    starts: Vec<usize>,
+}
+
 impl Engine {
     fn top_line(&self) -> i32 {
         -(self.history_len() as i32)
@@ -261,6 +272,54 @@ impl Engine {
         chars.truncate(keep);
         cells.truncate(keep);
         Some(rows)
+    }
+
+    /// Pushes row `line` onto `up`; returns whether it wraps.
+    fn push_up(&self, line: i32, up: &mut RowsUp) -> Option<bool> {
+        up.starts.push(up.chars.len());
+        self.with_row(line, |row| {
+            let wrapped = row
+                .last()
+                .is_some_and(|c| c.flags.contains(Flags::WRAPLINE));
+            push_row(row, 0, !wrapped, &mut up.chars, &mut up.cells);
+            wrapped
+        })
+    }
+
+    /// The logical line that ends at row `last` (above a row that starts one), as [`Engine::read_line`] reads it.
+    fn read_line_up(&self, last: i32, up: &mut RowsUp) -> Option<Text> {
+        if up.starts.is_empty() {
+            self.push_up(last, up)?;
+        }
+        let top = self.top_line();
+        let mut first = last;
+        while first > top && self.push_up(first - 1, up)? {
+            first -= 1;
+        }
+        let rows = (last - first + 1) as usize;
+        let end = up.starts.get(rows).copied().unwrap_or(up.chars.len());
+        let cols = self.cols() as u32;
+        let (mut chars, mut cells) = (Vec::with_capacity(end), Vec::with_capacity(end));
+        for k in (0..rows).rev() {
+            let row = up.starts[k]..up.starts.get(k + 1).copied().unwrap_or(end);
+            let base = (rows - 1 - k) as u32 * cols;
+            chars.extend_from_slice(&up.chars[row.clone()]);
+            cells.extend(up.cells[row].iter().map(|&at| at + base));
+        }
+        // What is left is the row above, the last of the next line up
+        let carried = up.starts.len() > rows;
+        up.chars.drain(..end);
+        up.cells.drain(..end);
+        up.starts.clear();
+        if carried {
+            up.starts.push(0);
+        }
+        Some(Text {
+            first,
+            rows: rows as i32,
+            chars,
+            cells,
+        })
     }
 
     fn read_folded(&self, first: i32, options: SearchOptions) -> Option<Text> {
@@ -356,20 +415,24 @@ impl Engine {
         } else {
             (line, col)
         };
-        let (mut first, mut before) = self.locate(line, col)?;
+        let (first, mut before) = self.locate(line, col)?;
         let top = self.top_line();
+        let mut text = self.read_folded(first, options)?;
+        let mut up = RowsUp::default();
         loop {
-            let text = self.read_folded(first, options)?;
             let bound = (0..text.cells.len())
                 .find(|&i| text.end(i) > before)
                 .unwrap_or(text.cells.len());
             if let Some(s) = text.previous(&needle, bound, options.whole_word) {
                 return Some(text.found(s, needle.len(), cols));
             }
-            if first <= top {
+            if text.first <= top {
                 return None;
             }
-            first = self.line_start(first - 1);
+            text = self.read_line_up(text.first - 1, &mut up)?;
+            if !options.case_sensitive {
+                text = text.fold();
+            }
             before = u32::MAX;
         }
     }
@@ -435,6 +498,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TermHistory;
 
     fn found(
         t: &Engine,
@@ -445,6 +509,64 @@ mod tests {
     ) -> Option<(i32, u16, i32, u16)> {
         t.search_next(q, o, line, col)
             .map(|m| (m.start_line, m.start_col, m.end_line, m.end_col))
+    }
+
+    /// Every match `search_previous` steps through from the end of the buffer.
+    fn all_previous(t: &Engine, q: &str, o: SearchOptions) -> Vec<SearchMatch> {
+        let (mut line, mut col) = (t.rows() as i32, 0);
+        let mut out = Vec::new();
+        while let Some(m) = t.search_previous(q, o, line, col) {
+            out.push(m);
+            (line, col) = (m.start_line, m.start_col);
+        }
+        out
+    }
+
+    #[test]
+    fn previous_reads_compressed_history_as_the_grid_does_and_decodes_each_row_once() {
+        let mut packed = Engine::new(12, 4, 500);
+        let mut plain = Engine::new_uncompressed(12, 4, 500);
+        for i in 0..300 {
+            // Single rows, lines that wrap over up to four rows, wide characters and İ (two characters lowercased)
+            let line = match i % 5 {
+                0 => format!("Ab{i} "),
+                1 => format!("{}ab", "x Ab ".repeat(i % 9)),
+                2 => format!("漢字Ab{}", "İab".repeat(i % 4)),
+                3 => String::new(),
+                _ => format!("{}AB", "-".repeat(11)),
+            };
+            packed.feed(format!("{line}\r\n").as_bytes());
+            plain.feed(format!("{line}\r\n").as_bytes());
+        }
+        let options = [
+            SearchOptions::default(),
+            SearchOptions {
+                case_sensitive: true,
+                whole_word: false,
+            },
+            SearchOptions {
+                case_sensitive: false,
+                whole_word: true,
+            },
+        ];
+        let mut matches = 0;
+        for offset in [0, 150] {
+            packed.scroll_to_bottom();
+            packed.scroll_display(offset);
+            for o in options {
+                for q in ["ab", "Ab", "i̇ab", "字a"] {
+                    let want = all_previous(&plain, q, o);
+                    matches += want.len();
+                    assert_eq!(all_previous(&packed, q, o), want, "{q} {o:?} at {offset}");
+                }
+            }
+        }
+        assert!(matches > 1000, "{matches}");
+        packed.scroll_to_bottom();
+        let before = crate::DECODES.with(std::cell::Cell::get);
+        assert_eq!(packed.search_previous("absent", options[0], 4, 0), None);
+        let decoded = crate::DECODES.with(std::cell::Cell::get) - before;
+        assert_eq!(decoded, packed.history_len() - TermHistory::RECENT);
     }
 
     #[test]
