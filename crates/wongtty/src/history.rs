@@ -165,7 +165,11 @@ impl History {
                 .back()
                 .is_none_or(|b| b.end + len > b.bytes.len())
             {
-                let spare = self.spare.take().filter(|_| len <= BLOCK_BYTES);
+                let spare = if len <= BLOCK_BYTES {
+                    self.spare.take()
+                } else {
+                    None
+                };
                 let mut block = spare.unwrap_or_else(|| Block {
                     first: 0,
                     bytes: vec![0; BLOCK_BYTES.max(len)],
@@ -777,11 +781,6 @@ fn is_default(c: &Cell) -> bool {
         && c.extra.is_none()
 }
 
-/// The cells `encode` looks at: past the last cell that is not a default blank,
-/// all are default blanks, and those at the end of the row are left out. Cells
-/// past `occ` all equal the last cell (the Row::reset invariant), so with a
-/// default blank last the scan can stop there.
-#[inline]
 /// What `Row::plain` promises of the cells of a row.
 fn is_plain(cells: &[Cell]) -> bool {
     let attrs = |c: &Cell| c.fg == DEFAULT_FG && c.bg == DEFAULT_BG && c.extra.is_none();
@@ -800,6 +799,11 @@ fn is_plain(cells: &[Cell]) -> bool {
     true
 }
 
+/// The cells `encode` looks at: past the last cell that is not a default blank,
+/// all are default blanks, and those at the end of the row are left out. Cells
+/// past `occ` all equal the last cell (the Row::reset invariant), so with a
+/// default blank last the scan can stop there.
+#[inline]
 fn scan_len(row: &Row<Cell>) -> usize {
     let cells = &row[..];
     if cells.last().is_some_and(is_default) {
@@ -1809,6 +1813,35 @@ mod tests {
             );
             assert!(block.end <= block.bytes.len());
         }
+    }
+
+    /// A row too large for a `BLOCK_BYTES` block gets a block of its own and leaves the kept spare block in place.
+    #[test]
+    fn large_row_keeps_the_spare() {
+        let mut history = History::new(20);
+        let colored = |cols: usize, n: u32| {
+            let mut row = Row::<Cell>::new(cols);
+            for col in 0..cols {
+                let rgb = Rgb {
+                    r: col as u8,
+                    g: n as u8,
+                    b: 7,
+                };
+                row[Column(col)] = cell('x', Color::Spec(rgb), DEFAULT_BG, Flags::empty());
+            }
+            row
+        };
+        for n in 0..200u32 {
+            history.push(&mut colored(2000, n));
+        }
+        assert!(history.spare.is_some());
+        // No row is dropped below, so `pop_oldest` cannot refill the spare.
+        history.limit = usize::MAX;
+        let big = colored(30000, 1);
+        history.push(&mut big.clone());
+        assert!(history.blocks.back().unwrap().bytes.len() > BLOCK_BYTES);
+        assert!(history.spare.is_some());
+        assert_eq!(history.row(history.len() - 1), big);
     }
 
     /// The default-attribute first run of `encode` (`plain`) writes the bytes `runs` writes for the whole row, on
