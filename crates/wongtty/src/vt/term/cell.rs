@@ -298,6 +298,12 @@ impl GridCell for Cell {
     fn reset(&mut self, template: &Self) {
         *self = Cell { bg: template.bg, ..Cell::default() };
     }
+
+    #[inline]
+    fn reset_plain(&mut self, _: &Self) {
+        self.c = ' ';
+        self.flags = Flags::empty();
+    }
 }
 
 impl From<Color> for Cell {

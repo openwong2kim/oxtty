@@ -1395,10 +1395,29 @@ impl<T> Term<T> {
         // Checked and written in one pass. Writing through the whole row marks all of it occupied; only the cells
         // written are.
         let row = &mut self.grid[point.line];
-        let occ = row.occ;
+        let occ = row.occ as usize;
+        // wongtty: the row stays plain (`Row::plain`) when written with the default pen.
+        let was_plain = row.plain;
+        let plain = was_plain
+            && flags.is_empty()
+            && extra.is_none()
+            && fg == Color::Named(NamedColor::Foreground)
+            && bg == Color::Named(NamedColor::Background);
         let mut n = 0;
-        for (cell, &b) in row[point.column..].iter_mut().zip(bytes) {
-            if !(0x20..0x7f).contains(&b) || cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER) {
+        if plain {
+            // wongtty: a plain row holds no wide characters or extras and its colours are the pen's already, so
+            // only the character and the flags change.
+            for (cell, &b) in row[point.column..].iter_mut().zip(bytes) {
+                if !(0x20..0x7f).contains(&b) {
+                    break;
+                }
+                cell.c = b as char;
+                cell.flags = if b == b' ' { Flags::TYPED_SPACE } else { Flags::empty() };
+                n += 1;
+            }
+        }
+        for (cell, &b) in row[point.column + n..].iter_mut().zip(&bytes[n..]) {
+            if plain || !(0x20..0x7f).contains(&b) || cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER) {
                 break;
             }
             cell.c = b as char;
@@ -1409,7 +1428,8 @@ impl<T> Term<T> {
             n += 1;
         }
         let end = point.column.0 + n;
-        row.occ = if n == 0 { occ } else { occ.max(end) };
+        row.occ = if n == 0 { occ } else { occ.max(end) } as u32;
+        row.plain = if n == 0 { was_plain } else { plain };
         if n == 0 {
             return 0;
         }
@@ -1439,7 +1459,7 @@ impl<T> Term<T> {
         let row = &mut self.grid[point.line];
         // The cells are written through the whole row, which marks all of it occupied; only the cells written
         // are, as when written one by one.
-        let occ = row.occ;
+        let occ = row.occ as usize;
         let cells = &mut row[..];
         let wide_cell = |cell: &Cell| cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER);
         let (mut col, mut used) = (point.column.0, 0);
@@ -1471,7 +1491,7 @@ impl<T> Term<T> {
         if let Some(extra) = extra {
             cells[point.column.0..col].iter_mut().for_each(|cell| cell.extra = Some(extra.clone()));
         }
-        row.occ = if used == 0 { occ } else { occ.max(col) };
+        row.occ = if used == 0 { occ } else { occ.max(col) } as u32;
         if used == 0 {
             return 0;
         }

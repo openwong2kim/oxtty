@@ -133,7 +133,8 @@ impl History {
         self.extras.clear();
     }
 
-    fn push_row(&mut self, row: &Row<Cell>) {
+    /// Stores a row that leaves the grid (or a reflow): the sink may blank the cells it takes (`encode_take`).
+    fn push_row(&mut self, row: &mut Row<Cell>) {
         if self.limit == 0 {
             return;
         }
@@ -163,7 +164,7 @@ impl History {
         }
         block.starts.push(block.end as u32);
         let mut extras = Vec::new();
-        block.end = encode(row, scan, &mut block.bytes, block.end, &mut extras);
+        block.end = encode_take(row, scan, &mut block.bytes, block.end, &mut extras);
         if !extras.is_empty() {
             self.extras.push_back((abs, extras.into_boxed_slice()));
         }
@@ -224,7 +225,7 @@ impl History {
 }
 
 impl HistorySink<Cell> for History {
-    fn push(&mut self, row: &Row<Cell>) {
+    fn push(&mut self, row: &mut Row<Cell>) {
         self.push_row(row);
     }
 
@@ -281,7 +282,7 @@ impl HistoryAbove<Cell> for Above {
                     } else {
                         row.resize_keeping_wrap(columns);
                     }
-                    self.rows.push_row(&row);
+                    self.rows.push_row(&mut row);
                 }
             }
         }
@@ -310,8 +311,8 @@ impl HistoryAbove<Cell> for Above {
                 i,
                 display_offset,
             );
-            for row in rows.drain(..) {
-                self.rows.push_row(&row);
+            for mut row in rows.drain(..) {
+                self.rows.push_row(&mut row);
             }
         }
         buffered
@@ -663,11 +664,11 @@ impl TermHistory {
             rows.truncate_newest(rows.len() - short);
             grid.prepend_history(back, self.scrollback);
         }
-        let older = grid.split_off_history(Self::RECENT);
+        let mut older = grid.split_off_history(Self::RECENT);
         grid.set_history_sink(sink);
         rows.limit = limit;
         rows.cleared = cleared;
-        for row in &older {
+        for row in &mut older {
             rows.push_row(row);
         }
         while rows.len() > limit {
@@ -703,11 +704,11 @@ impl TermHistory {
             term.grid_mut()
         };
         let offset = grid.display_offset();
-        let older = grid.split_off_history(Self::RECENT);
+        let mut older = grid.split_off_history(Self::RECENT);
         grid.set_history_sink(sink);
         let mut stored = self.lock();
-        for row in &older {
-            stored.push(row);
+        for row in &mut older {
+            stored.push_row(row);
         }
         offset
     }
@@ -754,10 +755,16 @@ fn is_default(c: &Cell) -> bool {
 /// past `occ` all equal the last cell (the Row::reset invariant), so with a
 /// default blank last the scan can stop there.
 #[inline]
+/// What `Row::plain` promises of every cell of the row.
+fn is_plain(c: &Cell) -> bool {
+    let attrs = c.fg == DEFAULT_FG && c.bg == DEFAULT_BG && c.extra.is_none();
+    attrs && (c.flags - Flags::TYPED_SPACE).is_empty() && (' '..='~').contains(&c.c)
+}
+
 fn scan_len(row: &Row<Cell>) -> usize {
     let cells = &row[..];
     if cells.last().is_some_and(is_default) {
-        row.occ.min(cells.len())
+        (row.occ as usize).min(cells.len())
     } else {
         cells.len()
     }
@@ -1027,6 +1034,46 @@ fn encode(
     }
     out.at = head;
     runs(cells, out, extras)
+}
+
+/// `encode` for a row that leaves the grid. A plain row (`Row::plain`: default
+/// blanks and narrow ASCII with the default attributes) is one run of its
+/// characters, read without checking each cell's attributes, and left blank
+/// for the grid's reset (`occ` 0).
+fn encode_take(
+    row: &mut Row<Cell>,
+    scan: usize,
+    buf: &mut [u8],
+    at: usize,
+    extras: &mut Vec<(u16, Arc<CellExtra>)>,
+) -> usize {
+    if !row.plain {
+        return encode(row, scan, buf, at, extras);
+    }
+    debug_assert!(row[..].iter().all(is_plain), "stale Row::plain");
+    let cols = row.len();
+    let mut out = Out { buf, at };
+    out.varint(cols);
+    let head = out.at;
+    let body = head + 3;
+    let cells = &mut row[..][..scan];
+    let dst = &mut out.buf[body..body + scan];
+    for (d, cell) in dst.iter_mut().zip(cells.iter_mut()) {
+        // An erased blank is 0 in a run, a typed space ' '.
+        let erased = (cell.c == ' ') & !cell.flags.contains(Flags::TYPED_SPACE);
+        *d = if erased { 0 } else { cell.c as u8 };
+        cell.c = ' ';
+        cell.flags = Flags::empty();
+    }
+    let n = dst.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+    row.occ = 0;
+    row.plain = true;
+    if n == 0 {
+        return head;
+    }
+    let [lo, hi] = (n as u16).to_le_bytes();
+    out.buf[head..body].copy_from_slice(&[0, lo, hi]);
+    body + n
 }
 
 /// `encode` for the other rows: the runs of `cells` from `out.at` on.
@@ -1368,7 +1415,7 @@ mod tests {
         let mut history = History::new(100);
         let rows = sample_rows();
         for row in &rows {
-            history.push(row);
+            history.push(&mut row.clone());
         }
         assert_eq!(history.len(), rows.len());
         for (i, row) in rows.iter().enumerate() {
@@ -1461,7 +1508,7 @@ mod tests {
                 row[Column(col)] = cell;
                 col += 1;
             }
-            history.push(&row);
+            history.push(&mut row.clone());
             rows.push(row);
         }
         for (i, row) in rows.iter().enumerate() {
@@ -1506,7 +1553,7 @@ mod tests {
             {
                 row[Column(i)] = cell(c, DEFAULT_FG, DEFAULT_BG, Flags::empty());
             }
-            history.push(&row);
+            history.push(&mut row.clone());
             row.reset(&Cell::default());
         }
         assert_eq!(history.len(), 3000);
@@ -1526,7 +1573,7 @@ mod tests {
         );
         HistorySink::clear(&mut history);
         assert_eq!(history.len(), 0);
-        history.push(&Row::new(80));
+        history.push(&mut Row::new(80));
         assert_eq!(history.len(), 1);
     }
 
@@ -1544,7 +1591,7 @@ mod tests {
             if n % 7 == 0 {
                 row[Column(1)].push_zerowidth('\u{301}');
             }
-            history.push(&row);
+            history.push(&mut row.clone());
             row.reset(&Cell::default());
         }
         let kept: Vec<_> = (0..1500).map(|i| history.row(i)).collect();
@@ -1555,7 +1602,7 @@ mod tests {
         for (i, row) in kept.iter().enumerate() {
             assert_eq!(history.row(i), *row, "row {i}");
         }
-        history.push(&Row::new(300));
+        history.push(&mut Row::new(300));
         assert_eq!(history.row(1500), Row::new(300));
     }
 

@@ -1,5 +1,5 @@
 use std::cmp::max;
-use std::mem;
+use std::{mem, ptr};
 use std::mem::MaybeUninit;
 use std::ops::{Index, IndexMut, Range};
 
@@ -163,7 +163,9 @@ impl<T> Storage<T> {
     /// instructions. This implementation achieves the swap in only 8 movups
     /// instructions.
     pub fn swap(&mut self, a: Line, b: Line) {
-        debug_assert_eq!(mem::size_of::<Row<T>>(), mem::size_of::<usize>() * 4);
+        // wongtty: four words on 64-bit targets, five on wasm32, where `Row::plain` takes a word of its own.
+        let words = mem::size_of::<Row<T>>() / mem::size_of::<usize>();
+        debug_assert_eq!(mem::size_of::<Row<T>>(), mem::size_of::<usize>() * words);
 
         let a = self.compute_index(a);
         let b = self.compute_index(b);
@@ -179,7 +181,7 @@ impl<T> Storage<T> {
             //
             // The optimizer unrolls this loop and vectorizes it.
             let mut tmp: MaybeUninit<usize>;
-            for i in 0..4 {
+            for i in 0..words as isize {
                 tmp = *a_ptr.offset(i);
                 *a_ptr.offset(i) = *b_ptr.offset(i);
                 *b_ptr.offset(i) = tmp;
@@ -199,7 +201,13 @@ impl<T> Storage<T> {
         let high = self.compute_index(region.start);
         if low <= high {
             let rows = &mut self.inner[low..=high];
-            if up { rows.rotate_right(positions) } else { rows.rotate_left(positions) }
+            if positions == 1 {
+                rotate_one(rows, up);
+            } else {
+                // One `rotate` for both directions: `rotate_left(k)` is `rotate_right(len - k)`.
+                let k = if up { positions } else { rows.len() - positions };
+                rows.rotate_right(k);
+            }
             return;
         }
 
@@ -296,6 +304,25 @@ impl<T> Storage<T> {
 
         self.inner.rotate_left(self.zero);
         self.zero = 0;
+    }
+}
+
+/// wongtty: `rows.rotate_right(1)` (`right`) or `rows.rotate_left(1)`: one row held aside and one `memmove` of
+/// the others, where a region scroll through `slice::rotate` takes three calls.
+#[inline]
+fn rotate_one<T>(rows: &mut [T], right: bool) {
+    let n = rows.len();
+    if n < 2 {
+        return;
+    }
+    let p = rows.as_mut_ptr();
+    let (from, to, gap) = if right { (n - 1, 0, (0, 1)) } else { (0, n - 1, (1, 0)) };
+    // SAFETY: every index is below `n`; the row read first is written back last into the place the others left,
+    // so each row is moved once and none is dropped or duplicated.
+    unsafe {
+        let held = ptr::read(p.add(from));
+        ptr::copy(p.add(gap.0), p.add(gap.1), n - 1);
+        ptr::write(p.add(to), held);
     }
 }
 

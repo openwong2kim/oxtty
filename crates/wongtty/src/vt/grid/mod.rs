@@ -29,6 +29,12 @@ pub trait GridCell: Sized {
     /// Perform an opinionated cell reset based on a template cell.
     fn reset(&mut self, template: &Self);
 
+    /// wongtty: `reset` to a default blank for a cell of a plain row (`Row::plain`), which holds no extras and the
+    /// default colours already.
+    fn reset_plain(&mut self, template: &Self) {
+        self.reset(template);
+    }
+
     fn flags(&self) -> &Flags;
     fn flags_mut(&mut self) -> &mut Flags;
 }
@@ -186,7 +192,8 @@ pub enum RowMove {
 /// wongtty: receives the rows a full history drops, oldest first, so they can
 /// be kept outside the grid.
 pub trait HistorySink<T>: fmt::Debug + Send {
-    fn push(&mut self, row: &Row<T>);
+    /// The row leaves the grid: the sink may blank cells it has taken (the grid resets the row afterwards).
+    fn push(&mut self, row: &mut Row<T>);
 
     /// The history was cleared (`CSI 3 J`, reset).
     fn clear(&mut self);
@@ -465,7 +472,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
                 let dropped = (history + positions).saturating_sub(self.max_scroll_limit);
                 let mut sink = sink.lock().unwrap_or_else(PoisonError::into_inner);
                 for i in 0..dropped {
-                    sink.push(&self.raw[Line(i as i32 - history as i32)]);
+                    sink.push(&mut self.raw[Line(i as i32 - history as i32)]);
                 }
             }
 
