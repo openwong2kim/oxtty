@@ -5,8 +5,10 @@
 //! colours and flags form one run and only their characters are written, in
 //! as many bytes as UTF-8 or fewer. A 120-column log line takes about 40
 //! bytes, and the default blanks that end a row take none. A wide character
-//! and the cell after it are one unit. Combining marks, underline colours and
-//! links (`Cell::extra`) are rare, so they are kept apart by row and column.
+//! and the cell after it are one unit. The zerowidth characters of a cell in
+//! the first run (combining marks, variation selectors, joiners) follow its
+//! unit; underline colours and links (`Cell::extra`) are rare, so they are
+//! kept apart by row and column, with the zerowidth characters of other runs.
 //!
 //! Rows are appended to 64 KiB blocks; a block is dropped once all its rows
 //! have fallen off the oldest end. Every row that scrolls off is encoded, so
@@ -43,6 +45,12 @@ const FLAGS: u8 = 1 << 3;
 const UNIT_2: u8 = 0x80;
 const UNIT_3: u8 = 0xc0;
 const WIDE: u8 = 1 << 5;
+
+// After a unit of the first run, `MARKS + n - 1` and then `n` narrow units: the
+// cell's interned cluster of zerowidth characters (up to `INLINE_MARKS`). No
+// unit starts with these bytes, whose first byte is at most 0xf0.
+const MARKS: u8 = 0xf8;
+const INLINE_MARKS: usize = 4;
 
 const DEFAULT_FG: Color = Color::Named(NamedColor::Foreground);
 const DEFAULT_BG: Color = Color::Named(NamedColor::Background);
@@ -1148,6 +1156,15 @@ impl Out<'_> {
         self.at += len;
     }
 
+    /// Writes the zerowidth characters that follow a unit (`MARKS`).
+    fn marks(&mut self, marks: &[char]) {
+        self.byte(MARKS + marks.len() as u8 - 1);
+        for &m in marks {
+            let (word, len) = unit(m, false);
+            self.word(word, len);
+        }
+    }
+
     fn varint(&mut self, mut n: usize) {
         while n >= 0x80 {
             self.byte(n as u8 | 0x80);
@@ -1466,9 +1483,10 @@ fn encode_take(
 
 /// Goes on with the first run of `encode` from cell `at`, which narrow ASCII
 /// text with the default attributes ends: takes the cells with the default
-/// colours and no extras that are narrow characters (typed spaces too),
-/// erased blanks, or wide characters with their right half (`is_pair`), and
-/// writes each as a unit. Returns the cell and the unit count after the last
+/// colours and no extras but an interned cluster (`inline_marks`) that are
+/// narrow characters (typed spaces too), erased blanks, or wide characters
+/// with their right half (`is_pair`), and writes each as a unit, then its
+/// cluster. Returns the cell and the unit count after the last
 /// unit that is not an erased blank, and leaves `out` there: the cells after
 /// it are for `runs`. A unit at a time, a wide character and its right half
 /// in one step.
@@ -1492,23 +1510,42 @@ fn plain(cells: &[Cell], mut at: usize, out: &mut Out) -> (usize, usize) {
         let (c, flags) = (cell.c, cell.flags.bits());
         let pair = flags == wide;
         let half = (next.c == ' ') & (next.flags.bits() == right) & attrs(next);
-        let ok = attrs(cell) & ((pair & half & (c != ' ')) | (flags & !typed == 0));
+        let marks = match &cell.extra {
+            None => &[][..],
+            Some(extra) => match inline_marks(extra) {
+                Some(marks) => marks,
+                None => break,
+            },
+        };
+        let colors = matches!(cell.fg, DEFAULT_FG) & matches!(cell.bg, DEFAULT_BG);
+        let ok = colors & ((pair & half & (c != ' ')) | (flags & !typed == 0));
         if !ok {
             break;
         }
         let erased = (c == ' ') & (flags == 0);
         let (word, len) = unit(c, pair);
         out.word(word & (erased as u32).wrapping_sub(1), len);
+        if !marks.is_empty() {
+            out.marks(marks);
+        }
         at += 1 + pair as usize;
         units += 1;
         // Erased blanks that end the run are left to `runs`.
-        let text = !erased;
+        let text = !erased | !marks.is_empty();
         end = if text { at } else { end };
         end_units = if text { units } else { end_units };
         end_out = if text { out.at } else { end_out };
     }
     out.at = end_out;
     (end, end_units)
+}
+
+/// The zerowidth characters `plain` writes after a unit: an interned cluster
+/// (no other extra) of up to `INLINE_MARKS`, which keeps a cell in `max_len`.
+#[inline]
+fn inline_marks(extra: &Extra) -> Option<&[char]> {
+    let marks = extra.zerowidth();
+    (extra.get().is_none() & (marks.len() <= INLINE_MARKS)).then_some(marks)
 }
 
 /// `encode` for the other rows: the runs of `cells` from cell `start` on,
@@ -1665,32 +1702,25 @@ fn decode_cells(
             continue;
         }
         for _ in 0..n {
-            let (&b, rest) = bytes.split_first()?;
-            let (c, wide) = match b {
-                0 => (' ', false),
-                b' ' => {
-                    bytes = rest;
-                    cells.push(cell(' ', flags | Flags::TYPED_SPACE));
-                    continue;
+            let at = cells.len();
+            match take_unit(&mut bytes)? {
+                (' ', _, true) => cells.push(cell(' ', flags | Flags::TYPED_SPACE)),
+                ('\0', ..) => cells.push(cell(' ', flags)),
+                (c, true, _) => {
+                    cells.push(cell(c, flags | Flags::WIDE_CHAR));
+                    cells.push(cell(' ', flags | Flags::WIDE_CHAR_SPACER));
                 }
-                0x01..0x80 => (b as char, false),
-                _ => {
-                    let len = if b < UNIT_3 { 2 } else { 3 };
-                    let unit = take(&mut bytes, len)?;
-                    let n = unit[1..]
-                        .iter()
-                        .fold((b & 0x1f) as u32, |n, &b| n << 8 | b as u32);
-                    (char::from_u32(n)?, b & WIDE != 0)
-                }
-            };
-            if b < 0x80 {
-                bytes = rest;
+                (c, false, _) => cells.push(cell(c, flags)),
             }
-            if wide {
-                cells.push(cell(c, flags | Flags::WIDE_CHAR));
-                cells.push(cell(' ', flags | Flags::WIDE_CHAR_SPACER));
-            } else {
-                cells.push(cell(c, flags));
+            // The unit's zerowidth characters.
+            if let Some(&b) = bytes.first().filter(|&&b| b >= MARKS) {
+                let mut marks = ['\0'; INLINE_MARKS];
+                let k = (b - MARKS) as usize + 1;
+                bytes = &bytes[1..];
+                for m in marks.get_mut(..k)? {
+                    *m = take_unit(&mut bytes)?.0;
+                }
+                cells[at].set_zerowidth(&marks[..k]);
             }
         }
         if cells.len() > cols {
@@ -1704,6 +1734,27 @@ fn decode_cells(
     // Read at another width: the cells past the narrower one are default blanks.
     cells.resize(width, Cell::default());
     Some(Row::from_vec(cells, width))
+}
+
+/// Takes a unit: its character ('\0' for an erased blank, the byte of another
+/// one-byte unit), whether it is wide, and whether it is a typed space.
+#[inline(always)]
+fn take_unit(bytes: &mut &[u8]) -> Option<(char, bool, bool)> {
+    let (&b, rest) = bytes.split_first()?;
+    Some(match b {
+        0x00..0x80 => {
+            *bytes = rest;
+            (b as char, false, b == b' ')
+        }
+        _ => {
+            let len = if b < UNIT_3 { 2 } else { 3 };
+            let unit = take(bytes, len)?;
+            let n = unit[1..]
+                .iter()
+                .fold((b & 0x1f) as u32, |n, &b| n << 8 | b as u32);
+            (char::from_u32(n)?, b & WIDE != 0, false)
+        }
+    })
 }
 
 fn take_color(bytes: &mut &[u8]) -> Option<Color> {
@@ -1810,11 +1861,18 @@ fn shape(mut bytes: &[u8]) -> Option<(usize, bool)> {
             cells += n as usize;
             continue;
         }
+        let len = |b: u8| 1 + (b >= UNIT_2) as usize + (b >= UNIT_3) as usize;
         for _ in 0..n {
             let b = *bytes.get(at)?;
-            let long = b >= UNIT_2;
-            at += 1 + long as usize + (b >= UNIT_3) as usize;
-            cells += 1 + (long && b & WIDE != 0) as usize;
+            at += len(b);
+            cells += 1 + (b >= UNIT_2 && b & WIDE != 0) as usize;
+            // The unit's zerowidth characters.
+            if let Some(&b) = bytes.get(at).filter(|&&b| b >= MARKS) {
+                at += 1;
+                for _ in 0..=b - MARKS {
+                    at += len(*bytes.get(at)?);
+                }
+            }
         }
     }
     (at == bytes.len()).then_some((cells, flags as u32 & Flags::WRAPLINE.bits() != 0))
@@ -1905,8 +1963,8 @@ mod tests {
     }
 
     /// Rows of random cells from a small set (so that runs form), with wide
-    /// pairs, broken pairs, typed and erased spaces, blanks to the end and
-    /// extras: each decodes to the cells it was encoded from, and its `shape`
+    /// pairs, broken pairs, typed and erased spaces, blanks to the end,
+    /// zerowidth characters and extras: each decodes to the cells it was encoded from, and its `shape`
     /// is what it was stored with.
     #[test]
     fn random_rows_round_trip() {
@@ -1938,6 +1996,18 @@ mod tests {
             '\u{10ffff}',
         ];
         let flags = [Flags::empty(), Flags::BOLD, Flags::INVERSE | Flags::ITALIC];
+        // Combining marks, variation selectors, a joiner, a keycap, Hangul jamo and the extremes of the unit forms.
+        let marks = [
+            '\u{301}',
+            '\u{fe0f}',
+            '\u{200d}',
+            '\u{20e3}',
+            '\u{1160}',
+            '\u{11a8}',
+            '\u{e0100}',
+            '\0',
+            '\u{7f}',
+        ];
         let link = Extra::from(Arc::new(CellExtra::default()));
         let mut history = History::new(usize::MAX);
         let mut rows = Vec::new();
@@ -1984,8 +2054,18 @@ mod tests {
                     }
                     _ => cell.c = chars[next(chars.len() as u64) as usize],
                 }
-                if next(20) == 0 {
-                    cell.extra = Some(link.clone());
+                match next(20) {
+                    0 => cell.extra = Some(link.clone()),
+                    // Zerowidth characters: one to six (past `INLINE_MARKS`), sometimes with a link too.
+                    1..=3 => {
+                        for _ in 0..=next(6) {
+                            cell.push_zerowidth(marks[next(marks.len() as u64) as usize]);
+                        }
+                        if next(8) == 0 {
+                            cell.set_hyperlink(Some(Hyperlink::new(Some("m"), "https://m".into())));
+                        }
+                    }
+                    _ => {}
                 }
                 row[Column(col)] = cell;
                 col += 1;
@@ -1996,6 +2076,90 @@ mod tests {
         for (i, row) in rows.iter().enumerate() {
             assert_eq!(&history.row(i)[..], &row[..], "row {i}");
             // The bytes tell the cells looked at and the wrap without a decode.
+            let scan = scan_len(row);
+            let wrapped = scan > 0 && row[Column(scan - 1)].flags.contains(Flags::WRAPLINE);
+            assert_eq!(history.shape(i), Some((scan, wrapped)), "row {i}");
+        }
+    }
+
+    /// Clusters as a program prints them (ZWJ families, flags, VS16, keycaps, skin tones, NFD jamo, accents)
+    /// go through a terminal into history and back as the cells the screen had, their zerowidth characters
+    /// written after their units rather than kept apart.
+    #[test]
+    fn clusters_round_trip_inline() {
+        use crate::vt::event::VoidListener;
+        use crate::vt::term::Config;
+        use crate::vt::term::test::TermSize;
+        use crate::vt::vte::ansi;
+        let pieces = [
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}",
+            "\u{1f44d}\u{1f3fd}",
+            "\u{1f1f0}\u{1f1f7}",
+            "\u{2764}\u{fe0f}",
+            "1\u{fe0f}\u{20e3}",
+            "\u{1f3f3}\u{fe0f}\u{200d}\u{1f308}",
+            "\u{1100}\u{1161}\u{11a8}",
+            "a\u{301}\u{302}",
+            "e\u{300}\u{301}\u{302}\u{303}\u{304}\u{305}",
+            "\u{1b}[31mx\u{301}\u{1b}[0m",
+            "ok ",
+        ];
+        let mut seed = 7u64;
+        let config = Config {
+            scrolling_history: 1000,
+            ..Config::default()
+        };
+        let mut term = Term::new(config, &TermSize::new(30, 4), VoidListener);
+        let mut parser = ansi::Processor::new();
+        let mut text = String::new();
+        for line in 0..300 {
+            for _ in 0..8 {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                text.push_str(pieces[(seed >> 33) as usize % pieces.len()]);
+            }
+            text.push_str(if line % 7 == 0 { "" } else { "\r\n" });
+        }
+        parser.advance(&mut term, text.as_bytes());
+        let grid = term.grid();
+        let mut history = History::new(usize::MAX);
+        let rows: Vec<Row<Cell>> = (1..=grid.history_size())
+            .rev()
+            .map(|i| grid[Line(-(i as i32))].clone())
+            .collect();
+        assert!(
+            rows.iter()
+                .flat_map(|r| r[..].iter())
+                .any(|c| c.zerowidth().is_some_and(|z| z.len() > 1))
+        );
+        for row in &rows {
+            let mut extras = Vec::new();
+            let mut out = vec![0; max_len(row.len())];
+            encode(row, scan_len(row), &mut out, 0, &mut extras);
+            // Clusters are kept apart only after a cell the first run does not take: other colours, a wrap, a
+            // cluster `inline_marks` does not take (more than `INLINE_MARKS`, or not interned: other tests may have
+            // filled the table).
+            let first = row[..].iter().position(|c| {
+                c.fg != DEFAULT_FG
+                    || c.flags
+                        .intersects(Flags::WRAPLINE | Flags::LEADING_WIDE_CHAR_SPACER)
+                    || c.extra.as_ref().is_some_and(|e| inline_marks(e).is_none())
+            });
+            // A wide character goes with its right half.
+            let first = first.map(|f| {
+                f - (f > 0 && row[Column(f - 1)].flags.contains(Flags::WIDE_CHAR)) as usize
+            });
+            assert!(
+                extras
+                    .iter()
+                    .all(|&(col, _)| first.is_some_and(|f| col as usize >= f)),
+                "{row:?}"
+            );
+            history.push(&mut row.clone());
+        }
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(&history.row(i)[..], &row[..], "row {i}");
             let scan = scan_len(row);
             let wrapped = scan > 0 && row[Column(scan - 1)].flags.contains(Flags::WRAPLINE);
             assert_eq!(history.shape(i), Some((scan, wrapped)), "row {i}");
