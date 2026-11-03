@@ -1,7 +1,7 @@
 // wongtty — terminal emulator engine (Rust → WebAssembly).
 // Works in browsers, bundlers (Vite/webpack resolve the .wasm URL) and Node ≥ 18.
 
-const ABI = 13;
+const ABI = 14;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 // Input buffer: smallest allocation, and the largest one kept between writes.
@@ -778,7 +778,10 @@ export class Terminal {
   /** Bytes that rebuild this screen in a fresh xterm.js, or why they cannot. `options` as @xterm/addon-serialize's `scrollback` and `excludeModes`. */
   ansiSnapshot({ scrollback, excludeModes = false } = {}) {
     const n = wasm.wongtty_ansi_snapshot(this.#handle(), scrollback ?? -1, excludeModes ? 1 : 0);
-    return n > 0 ? { ok: true, payload: bytesOut(n) } : { ok: false, reason: textOut(-n) };
+    const result = n > 0 ? { ok: true, payload: bytesOut(n) } : { ok: false, reason: textOut(-n) };
+    // The payload is copied out; free it in the engine's memory rather than at the next call
+    wasm.wongtty_out_release();
+    return result;
   }
 
   dispose() {
