@@ -250,8 +250,10 @@ struct AtlasPage {
     glyphs: Vec<usize>,
     version: u32,
     /// Glyphs added since the page's texture was last uploaded, newest last, each with the version it made: a
-    /// texture only behind by these takes them with `texSubImage2D` instead of the whole page.
-    pending: Vec<PendingGlyph>,
+    /// texture only behind by these takes them with `texSubImage2D` instead of the whole page. `None` while no
+    /// texture could take them (before the first upload, after a change that needs the whole page), so no copies
+    /// are made that would only be dropped.
+    pending: Option<Vec<PendingGlyph>>,
     // Filled left to right, top to bottom. A glyph less than half the current row's height fixes that row, gets
     // a fixed row of its own height below, and a new current row starts under that.
     current_row: Row,
@@ -276,7 +278,7 @@ impl AtlasPage {
             used_pixels: 0.0,
             glyphs: Vec::new(),
             version: 0,
-            pending: Vec::new(),
+            pending: None,
             current_row: Row::default(),
             fixed_rows: Vec::new(),
         })
@@ -310,7 +312,7 @@ impl AtlasPage {
         self.current_row = Row::default();
         self.fixed_rows.clear();
         self.version += 1;
-        self.pending.clear();
+        self.pending = None;
     }
 }
 
@@ -436,7 +438,8 @@ impl TextureAtlas {
         have: Option<(u64, u32)>,
     ) -> Option<Vec<PendingGlyph>> {
         let page = self.pages.get_mut(i)?;
-        let mut pending = std::mem::take(&mut page.pending);
+        // The texture holds the page as it is once this returns
+        let mut pending = page.pending.replace(Vec::new()).unwrap_or_default();
         let (id, version) = have?;
         let first = pending.first()?.version;
         if id != page.id || first > version.wrapping_add(1) || version >= page.version {
@@ -504,7 +507,7 @@ impl TextureAtlas {
                 let merged_index = self.pages.len() - merging.len();
                 let mut merged = self.merge_pages(&merging, merged_index)?;
                 merged.version += 1;
-                merged.pending.clear();
+                merged.pending = None;
                 let mut indices = merging.clone();
                 indices.sort_unstable();
                 for &i in indices.iter().rev() {
@@ -568,7 +571,7 @@ impl TextureAtlas {
                 }
             }
             page.version += 1;
-            page.pending.clear();
+            page.pending = None;
         }
     }
 
@@ -1185,6 +1188,9 @@ impl TextureAtlas {
         page.used_pixels += glyph.size.0 * glyph.size.1;
         page.version += 1;
         // The same pixels putImageData wrote, packed, for a partial upload
+        let Some(pending) = &mut page.pending else {
+            return Some(index);
+        };
         let (bx, by, gw, gh) = (
             bounds.0 as usize,
             bounds.1 as usize,
@@ -1198,10 +1204,10 @@ impl TextureAtlas {
             packed.extend_from_slice(&data[start..(start + gw * 4).min(data.len())]);
         }
         if packed.len() == gw * gh * 4 {
-            if page.pending.len() >= MAX_PENDING {
-                page.pending.remove(0);
+            if pending.len() >= MAX_PENDING {
+                pending.remove(0);
             }
-            page.pending.push(PendingGlyph {
+            pending.push(PendingGlyph {
                 version: page.version,
                 x: glyph.texture_position.0 as i32,
                 y: glyph.texture_position.1 as i32,
@@ -1210,7 +1216,7 @@ impl TextureAtlas {
                 data: packed,
             });
         } else {
-            page.pending.clear();
+            page.pending = None;
         }
         Some(index)
     }
