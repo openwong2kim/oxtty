@@ -187,8 +187,23 @@ test('native rowCellsInto and viewportCellsInto fill the caller buffer like rowC
   assert.equal(t.viewportCellsInto(view), view.length);
   for (let y = 0; y < 3; y++) assert.deepEqual(view.subarray(y * 24, y * 24 + 24), t.rowCells(y - t.displayOffset));
   // A view into a larger buffer is written at its own offset
-  const backing = new Uint32Array(view.length + 8);
+  const backing = new Uint32Array(view.length + 8).fill(9);
   assert.equal(t.viewportCellsInto(backing.subarray(8)), view.length);
   assert.deepEqual(backing.subarray(8), view);
+  assert.deepEqual(Array.from(backing.subarray(0, 8)), [9, 9, 9, 9, 9, 9, 9, 9]);
+  // A SharedArrayBuffer view is written the same way (the host owns any cross-thread synchronisation)
+  const shared = new Uint32Array(new SharedArrayBuffer(view.length * 4));
+  assert.equal(t.viewportCellsInto(shared), view.length);
+  assert.deepEqual(Array.from(shared), Array.from(view));
+  assert.equal(t.rowCellsInto(-2, shared), 6 * 4);
+  assert.deepEqual(Array.from(shared.subarray(0, 24)), Array.from(t.rowCells(-2)));
   assert.throws(() => t.viewportCellsInto(new Uint32Array(view.length - 1)), /need 72/);
+});
+
+test('index.d.ts declares every method and getter the binding exports', () => {
+  const dts = require('node:fs').readFileSync(path.join(__dirname, 'index.d.ts'), 'utf8');
+  const declared = new Set([...dts.matchAll(/^ {2}(?:get |set |static )?(\w+)\(/gm)].map((m) => m[1]));
+  const exported = Object.getOwnPropertyNames(Terminal.prototype).filter((n) => n !== 'constructor');
+  exported.push(...Object.getOwnPropertyNames(Terminal).filter((n) => typeof Terminal[n] === 'function'));
+  assert.deepEqual(exported.filter((n) => !declared.has(n)), []);
 });
