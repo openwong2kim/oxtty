@@ -24,11 +24,14 @@ const INIT_ONLY: [&str; 3] = ["cols", "rows", "scrollback"];
 const STYLE_ID: &str = "wongtty-xterm-style";
 /// The accessibility and scrollbar rules are xterm.js 6.1.0-beta.336 `css/xterm.css` lines 133–166 and 218–262
 /// (commit 08829c7eb6279dda2a9e86df901353a1a89858ca, MIT), with the default theme's slider colours.
+/// An unfocused terminal's helpers sit under the canvas, so the browser does not composite an overlap layer for
+/// each of many panes; the focused one stays on top for the IME.
 const STYLE: &str = "
 .xterm { position: relative; cursor: text; user-select: none; -webkit-user-select: none; }
 .xterm .xterm-screen { position: relative; }
 .xterm .xterm-screen canvas { position: absolute; left: 0; top: 0; }
 .xterm .xterm-helpers { position: absolute; top: 0; z-index: 5; }
+.xterm .xterm-screen > .xterm-helpers:not(:focus-within) { z-index: 0; }
 .xterm.focus, .xterm:focus { outline: none; }
 .xterm .xterm-accessibility { position: absolute; left: 0; top: 0; bottom: 0; right: 0; z-index: 10; color: transparent; pointer-events: none; }
 .xterm .xterm-accessibility-tree *::selection { color: transparent; }
