@@ -248,7 +248,6 @@ M2 runs on key input code borrowed from xterm.js. M3 moves encoding to Rust.
 | --- | --- |
 | ✅ Selection range computation and link detection in Rust | Same selection results as xterm.js (word, line, rectangular selection) — `crates/wongtty-web/src/selection`, `links.rs`; `selection.test.mjs`, `links.test.mjs` |
 | ✅ Viewport-only mode: the screen holds only visible lines ± a margin, fetching from the host on scroll | Per-pane renderer memory measured and published against the M1 baseline — `term.setHistoryProvider` (design below); 17 panes × 10,000 lines: renderer footprint +86 → +26 MB, engine wasm memory 69 → 9 MB; 20 panes: +100 → +29 MB, 81 → 13 MB (README measurements) |
-| Web Worker parsing option | Measure the reduction in main thread usage with 20 panes outputting concurrently |
 | ✅ Skip drawing inactive panes | Hidden panes receive output but do not draw — `renderer-context.test.mjs` (panes out of view or idle draw nothing, and catch up when shown) |
 
 #### Viewport-only mode: design (2026-11-02)
@@ -337,15 +336,19 @@ resize with the daemon's new `historyLength`.
 
 ### M5 · 1.0 public release
 
+1.0 is wongtty as wmux's terminal, not a general release:
+
 - Default engine for wmux on all platforms
-- API freeze, documentation site, migration guide (xterm.js → wongtty)
 - Continuous fuzzing (parser, serialization), 0 panics
+- A 7-day wmux soak with 0 regressions (e2e, IME, screen snapshots)
 
 ### After 1.0
 
 - Native renderer (wgpu + cosmic-text) — when wmux moves off Electron
 - Kitty graphics (sixel and iTerm2 images are in M2)
 - Shell integration (OSC 133 prompt regions)
+- On request from outside users: API freeze, documentation site, migration guide (xterm.js → wongtty)
+- Web Worker parsing option (D7) — only if main-thread time becomes the limit: each worker adds a JavaScript runtime, which works against the memory goal
 
 ---
 
