@@ -226,8 +226,11 @@ test('the page-wide window and font listeners go with the last terminal and come
   });
 });
 
-test('no leaks over 100 terminals: both WebAssembly memories stay flat', { timeout: 120000 }, async () => {
+test('no leaks over 100 terminals: both WebAssembly memories stay flat', { timeout: 180000 }, async () => {
   await withCycles(async (cycle, measure) => {
+    // Twenty terminals do not always reach the allocator's working size: on CI the second memory sometimes grew
+    // its last page in the measured run (21 -> 22 pages), where 600 more terminals stay at 22
+    await cycle(100);
     const before = await measure();
     await cycle(100);
     const after = await measure();
