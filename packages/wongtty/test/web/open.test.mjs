@@ -7,6 +7,7 @@ test('init() loads both modules in the browser and open() builds the xterm.js DO
     await page.waitForFunction(() => window.ready);
     const dom = await page.evaluate(() => [...document.querySelectorAll('.terminal.xterm > .xterm-scrollable-element > .xterm-screen > .xterm-helpers')].length);
     assert.equal(dom, 1);
+    assert.equal(await page.evaluate(() => window.term.element.dataset.engine), 'wongtty');
     const reply = await page.evaluate(() => new Promise((resolve) => {
       window.term.onData(resolve);
       window.term.write('ab\x1b[6n');

@@ -307,6 +307,8 @@ impl Terminal {
         }
         let element: HtmlElement = document.create_element("div")?.unchecked_into();
         element.class_list().add_2("terminal", "xterm")?;
+        // The classes are xterm.js's; this says which engine built the element
+        element.set_attribute("data-engine", "wongtty")?;
         element.set_dir("ltr");
         let screen: HtmlElement = document.create_element("div")?.unchecked_into();
         screen.class_list().add_1("xterm-screen")?;
