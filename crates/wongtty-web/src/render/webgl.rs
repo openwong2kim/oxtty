@@ -464,7 +464,6 @@ impl Inner {
         }
         self.collapsed = collapsed;
         if collapsed {
-            self.compact = None;
             self.present.clear();
             self.canvas.set_width(0);
             self.canvas.set_height(0);
@@ -887,6 +886,7 @@ impl Inner {
         if self.draw(cursor_drawn, None) {
             self.draws = self.draws.wrapping_add(1);
             self.last_cursor = cursor_drawn;
+            gpu::drew();
             self.schedule_compact();
         } else {
             self.full_redraw = true;
@@ -922,24 +922,26 @@ impl Inner {
     /// 17 panes of 120×40 at devicePixelRatio 2 held about 400 MB of the GPU process for 120 MB of pixels.
     /// Resizing the canvas drops them all; the same frame is drawn again at once, in the same task, so the page
     /// never paints the empty canvas and the pane keeps one buffer.
-    /// A canvas that takes frames by transfer has no buffers of its own: the shared surface lets go of its own
-    /// once every pane idles.
+    /// A canvas that takes frames by transfer has no buffers of its own. Either way the shared surface lets go of
+    /// its own once every pane idles, also when this pane took no room since it drew.
     fn compact_canvas(&mut self) {
-        if !self.present.has_buffers() {
-            gpu::trim(COMPACT_AFTER_MS);
-            return;
-        }
         let width = self.canvas.width();
-        if !self.visible || self.collapsed || width == 0 || !self.can_redraw_last_frame() {
-            return;
+        if self.present.has_buffers()
+            && self.visible
+            && !self.collapsed
+            && width > 0
+            && self.can_redraw_last_frame()
+        {
+            self.canvas.set_width(0);
+            self.canvas.set_width(width);
+            if self.draw(self.last_cursor, None) {
+                self.compactions = self.compactions.wrapping_add(1);
+            } else {
+                self.request_redraw_all();
+            }
         }
-        self.canvas.set_width(0);
-        self.canvas.set_width(width);
-        if self.draw(self.last_cursor, None) {
-            self.compactions = self.compactions.wrapping_add(1);
-        } else {
-            self.request_redraw_all();
-        }
+        // After the redraw above, which read the surface at its full size
+        gpu::trim(COMPACT_AFTER_MS);
     }
     /// Whether the model, vertices and context can draw the canvas's last frame again: not when a frame is pending
     /// that redraws everything (the model may be cleared), or the atlas moved glyphs the vertices point at.

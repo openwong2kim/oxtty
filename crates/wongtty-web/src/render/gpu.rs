@@ -34,8 +34,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
     CanvasRenderingContext2d, Document, Event, EventTarget, HtmlCanvasElement, ImageBitmap,
-    OffscreenCanvas, WebGl2RenderingContext as Gl, WebGlContextAttributes, WebGlTexture,
-    WebglLoseContext,
+    OffscreenCanvas, OffscreenCanvasRenderingContext2d, WebGl2RenderingContext as Gl,
+    WebGlContextAttributes, WebGlTexture, WebglLoseContext,
 };
 
 use super::atlas::{self, TextureAtlas};
@@ -115,6 +115,22 @@ impl Surface {
                 c.set_height(height);
             }
         }
+    }
+
+    /// Reads the surface once as a 2D image source, as the copy present does: Chromium keeps a copy of the frame a
+    /// 2D canvas last read from it until it is read again.
+    fn read(&self) {
+        let Some(ctx) = OffscreenCanvas::new(1, 1)
+            .ok()
+            .and_then(|c| c.get_context("2d").ok().flatten())
+            .and_then(|c| c.dyn_into::<OffscreenCanvasRenderingContext2d>().ok())
+        else {
+            return;
+        };
+        let _ = match self {
+            Self::Offscreen(c) => ctx.draw_image_with_offscreen_canvas(c, 0.0, 0.0),
+            Self::Element(c) => ctx.draw_image_with_html_canvas_element(c, 0.0, 0.0),
+        };
     }
 }
 
@@ -199,7 +215,7 @@ struct Gpu {
     last_recreate: f64,
     recreate_gap: f64,
     draws: u32,
-    /// When a pane last drew (`timer::now`).
+    /// When a pane last drew a new frame (`timer::now`), not counting redraws of a last frame ([`drew`]).
     last_draw: f64,
 }
 
@@ -361,13 +377,26 @@ pub fn image_textures() -> u32 {
     })
 }
 
-/// Shrinks the shared surface to a pixel once no pane drew for `idle_ms`: after transfers it keeps drawing
-/// buffers of the last frame's size that no canvas shows.
+/// A pane drew a new frame: the shared surface is in use.
+pub fn drew() {
+    GPU.with(|g| {
+        if let Ok(Some(gpu)) = g.try_borrow_mut().as_deref_mut() {
+            gpu.last_draw = timer::now();
+        }
+    });
+}
+
+/// Shrinks the shared surface to a pixel once no pane drew for `idle_ms`: it keeps drawing buffers of the last
+/// frame's size that no canvas shows, and on the copy path also the copy the panes' canvases read (one pane of
+/// 2512×1760 device px held two 17 MB buffers next to its canvas's one).
 pub fn trim(idle_ms: f64) {
     GPU.with(|g| {
         if let Ok(Some(gpu)) = g.try_borrow().as_deref() {
-            if timer::now() - gpu.last_draw >= idle_ms {
+            if timer::now() - gpu.last_draw >= idle_ms && gpu.surface.size() != (1, 1) {
                 gpu.surface.set_size(1, 1);
+                if !gpu.transfer {
+                    gpu.surface.read();
+                }
             }
         }
     });
@@ -612,7 +641,6 @@ impl Gpu {
                 };
                 ctx.show(Some(&bitmap));
                 self.draws = self.draws.wrapping_add(1);
-                self.last_draw = timer::now();
                 return true;
             }
         };

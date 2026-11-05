@@ -51,6 +51,66 @@ test('a pane idle for a second redraws its last frame once into a fresh canvas, 
   assert.deepEqual(r, { busy: true, idle: 1, requests: [], same: 0, size: true, changed: true, present: 'copy' });
 });
 
+/** In the page: resolves after `n` frames. */
+const FRAMES = `(n) => new Promise((resolve) => (function next(k) { k ? requestAnimationFrame(() => next(k - 1)) : resolve(); })(n))`;
+
+// The shared surface keeps buffers of the last frame's size, and on the copy path also the copy a pane's canvas read
+// of it: one full-window pane at devicePixelRatio 2 held two 17 MB buffers next to its canvas's one
+test('on the copy path too, the shared surface shrinks to a pixel once every pane has idled for a second', async (t) => {
+  const r = await inPage(async ([text, framesSrc]) => {
+    const frames = eval(framesSrc);
+    const a = new T.Pane(30, 4);
+    const b = new T.Pane(30, 4);
+    await a.write(text);
+    await b.write(text);
+    const shown = await a.pixels();
+    const surface = a.debug.gl.canvas;
+    const size = () => [surface.width, surface.height].join('x');
+    const drawn = size();
+    // b keeps drawing while a idles
+    for (let i = 0; i < 8; i++) {
+      await T.sleep(200);
+      await b.write(`\r${i}`);
+      await frames(1);
+    }
+    const busy = size();
+    await T.sleep(1500);
+    const idle = size();
+    const kept = T.diff(shown, T.read(a.canvas));
+    await a.write('\x1b[2;1Hmore');
+    const after = await a.pixels();
+    const out = { present: a.debug.present, drawn, busy, idle, kept, grown: size(), redrawn: T.diff(shown, after) > 0 };
+    a.dispose();
+    b.dispose();
+    return out;
+  }, [TEXT, FRAMES]);
+  if (r.present !== 'copy') return t.skip(`panes present by ${r.present}`);
+  assert.notEqual(r.drawn, '1x1');
+  assert.deepEqual(r, { present: 'copy', drawn: r.drawn, busy: r.drawn, idle: '1x1', kept: 0, grown: r.drawn, redrawn: true });
+});
+
+test('a pane that takes no room right after it drew still lets the shared surface shrink', async () => {
+  const r = await inPage(async ([text, framesSrc]) => {
+    const frames = eval(framesSrc);
+    const p = new T.Pane(30, 4);
+    await p.write(text);
+    const before = await p.pixels();
+    const surface = p.debug.gl.canvas;
+    const size = () => [surface.width, surface.height].join('x');
+    const drawn = size();
+    p.container.style.display = 'none';
+    await T.sleep(1500);
+    const hidden = size();
+    p.container.style.display = '';
+    await frames(3);
+    const out = { drawn, hidden, diff: T.diff(before, T.read(p.canvas)) };
+    p.dispose();
+    return out;
+  }, [TEXT, FRAMES]);
+  assert.notEqual(r.drawn, '1x1');
+  assert.deepEqual(r, { drawn: r.drawn, hidden: '1x1', diff: 0 });
+});
+
 test('a pane with display: none has no canvas pixels, and has its last frame back before the page paints it again', async () => {
   const r = await inPage(async (text) => {
     const frames = (n) => new Promise((resolve) => (n > 0 ? requestAnimationFrame(() => frames(n - 1).then(resolve)) : resolve()));
