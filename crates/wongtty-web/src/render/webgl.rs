@@ -74,8 +74,8 @@ thread_local! {
     static VISIBILITY: Option<IntersectionObserver> = visibility_observer();
     /// One observer tells every pane when it takes no room on the page and when it does again.
     static COLLAPSE: Option<ResizeObserver> = collapse_observer();
-    /// Whether the page-wide font and window listeners are registered.
-    static LISTENING: Cell<bool> = const { Cell::new(false) };
+    /// The page-wide font and window listeners, while any pane lives.
+    static PAGE_LISTENERS: RefCell<Vec<Listener>> = const { RefCell::new(Vec::new()) };
 }
 
 /// How glyphs are measured (`CharSizeService`): canvas text metrics, or a DOM element where those are missing.
@@ -183,25 +183,33 @@ fn collapse_observer() -> Option<ResizeObserver> {
     ResizeObserver::new(&callback).ok()
 }
 
-/// The font and window listeners every pane shares, registered with the first pane for the page's lifetime.
+/// The font and window listeners every pane shares, registered with the first pane and removed with the last
+/// ([`unlisten_page`]), so they do not keep the module alive once every terminal is gone.
 fn listen_page(window: &web_sys::Window, document: &Document) {
-    if LISTENING.with(|l| l.replace(true)) {
-        return;
-    }
-    let fonts_loaded = Closure::<dyn FnMut(Event)>::new(|_| {
-        each_pane(Inner::handle_fonts_loaded);
-    });
-    let _ = document.fonts().add_event_listener_with_callback(
-        "loadingdone",
-        &fonts_loaded.into_js_value().unchecked_into(),
-    );
-    let resize = Closure::<dyn FnMut(Event)>::new(|_| {
-        each_pane(|i| {
-            i.check_device_pixel_ratio();
+    PAGE_LISTENERS.with(|l| {
+        let mut listeners = l.borrow_mut();
+        if !listeners.is_empty() {
+            return;
+        }
+        let fonts_loaded = Closure::<dyn FnMut(Event)>::new(|_| {
+            each_pane(Inner::handle_fonts_loaded);
         });
+        listeners.push(Listener::new(
+            &document.fonts(),
+            "loadingdone",
+            fonts_loaded,
+        ));
+        let resize = Closure::<dyn FnMut(Event)>::new(|_| {
+            each_pane(|i| {
+                i.check_device_pixel_ratio();
+            });
+        });
+        listeners.push(Listener::new(window, "resize", resize));
     });
-    let _ =
-        window.add_event_listener_with_callback("resize", &resize.into_js_value().unchecked_into());
+}
+
+fn unlisten_page() {
+    drop(PAGE_LISTENERS.with(RefCell::take));
 }
 
 fn panes() -> Vec<Rc<RefCell<Inner>>> {
@@ -394,9 +402,10 @@ impl Drop for WebglRenderer {
             p.retain(|w| w.strong_count() > 0 && !Weak::ptr_eq(w, &me));
             p.is_empty()
         });
-        // The last terminal frees the context
+        // The last terminal frees the context and the page listeners
         if empty {
             gpu::release();
+            unlisten_page();
         }
     }
 }

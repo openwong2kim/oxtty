@@ -201,6 +201,31 @@ test('no leaks over 100 terminals: DOM listeners and elements stay flat', { time
   });
 });
 
+test('the page-wide window and font listeners go with the last terminal and come back with the next one', async () => {
+  await withModules(async (page) => {
+    const session = await cdp(page);
+    const count = async (expression) => {
+      const { result } = await session.send('Runtime.evaluate', { expression });
+      const { listeners } = await session.send('DOMDebugger.getEventListeners', { objectId: result.objectId });
+      await session.send('Runtime.releaseObject', { objectId: result.objectId });
+      return listeners.filter((l) => ['resize', 'loadingdone'].includes(l.type)).length;
+    };
+    const counts = async () => [await count('window'), await count('document.fonts')];
+    const open = () => page.evaluate(() => {
+      window.term = new window.ox.Terminal({ cols: 40, rows: 10 });
+      window.term.open(document.getElementById('terminal'));
+    });
+    const before = await counts();
+    await open();
+    const opened = await counts();
+    await page.evaluate(() => window.term.dispose());
+    const disposed = await counts();
+    await open();
+    const reopened = await counts();
+    assert.deepEqual({ opened, disposed, reopened }, { opened: [before[0] + 1, before[1] + 1], disposed: before, reopened: opened });
+  });
+});
+
 test('no leaks over 100 terminals: both WebAssembly memories stay flat', { timeout: 120000 }, async () => {
   await withCycles(async (cycle, measure) => {
     const before = await measure();
