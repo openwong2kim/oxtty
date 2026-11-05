@@ -48,6 +48,10 @@ use crate::timer::{self, Timeout};
 
 /// How long a lost context may take to come back by itself before a new one is made (as in xterm.js).
 const CONTEXT_RESTORE_TIMEOUT: i32 = 3000;
+/// How long no pane draws before the shared surface lets go of its buffers on the copy path, at the least: the frame
+/// after makes them again (two reshapes, 1-4 ms of the frame in Electron), which a keystroke after a short pause in
+/// typing should not wait for.
+const COPY_TRIM_AFTER_MS: f64 = 5000.0;
 
 /// A DOM listener, removed when dropped.
 pub(super) struct Listener {
@@ -217,6 +221,8 @@ struct Gpu {
     draws: u32,
     /// When a pane last drew a new frame (`timer::now`), not counting redraws of a last frame ([`drew`]).
     last_draw: f64,
+    /// The next [`trim`] check while the surface is not idle long enough yet.
+    trim_timeout: Option<Timeout>,
 }
 
 thread_local! {
@@ -300,6 +306,7 @@ pub fn ensure(document: &Document) -> Result<(), JsValue> {
         recreate_gap: 1000.0,
         draws: 0,
         last_draw: 0.0,
+        trim_timeout: None,
     };
     gpu.listen();
     gpu.build();
@@ -386,20 +393,12 @@ pub fn drew() {
     });
 }
 
-/// Shrinks the shared surface to a pixel once no pane drew for `idle_ms`: it keeps drawing buffers of the last
-/// frame's size that no canvas shows, and on the copy path also the copy the panes' canvases read (one pane of
-/// 2512×1760 device px held two 17 MB buffers next to its canvas's one).
+/// Shrinks the shared surface to a pixel once no pane drew for `idle_ms` ([`COPY_TRIM_AFTER_MS`] at the least on the
+/// copy path), checking again until then: it keeps drawing buffers of the last frame's size that no canvas shows, and
+/// on the copy path also the copy the panes' canvases read (one pane of 2512×1760 device px held two 17 MB buffers
+/// next to its canvas's one).
 pub fn trim(idle_ms: f64) {
-    GPU.with(|g| {
-        if let Ok(Some(gpu)) = g.try_borrow().as_deref() {
-            if timer::now() - gpu.last_draw >= idle_ms && gpu.surface.size() != (1, 1) {
-                gpu.surface.set_size(1, 1);
-                if !gpu.transfer {
-                    gpu.surface.read();
-                }
-            }
-        }
-    });
+    with_gpu(move |gpu| gpu.trim(idle_ms));
 }
 
 /// What a pane draws in one frame.
@@ -699,6 +698,28 @@ impl Gpu {
             }
             keep
         });
+    }
+
+    fn trim(&mut self, idle_ms: f64) {
+        self.trim_timeout = None;
+        let idle_ms = if self.transfer {
+            idle_ms
+        } else {
+            idle_ms.max(COPY_TRIM_AFTER_MS)
+        };
+        let wait = self.last_draw + idle_ms - timer::now();
+        if wait > 0.0 {
+            self.trim_timeout = Some(Timeout::new(wait.ceil() as i32, move || {
+                with_gpu(move |gpu| gpu.trim(idle_ms))
+            }));
+            return;
+        }
+        if self.surface.size() != (1, 1) {
+            self.surface.set_size(1, 1);
+            if !self.transfer {
+                self.surface.read();
+            }
+        }
     }
 
     fn handle_context_lost(&mut self) {
