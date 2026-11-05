@@ -266,6 +266,8 @@ struct Inner {
     /// Resolved background of the last cell drawn (glyphs are clipped where it changes).
     last_bg: u32,
     full_redraw: bool,
+    /// The model holds the canvas's last frame, also while a redraw is pending that has not touched it yet.
+    model_drawn: bool,
     dirty: BTreeSet<u32>,
     /// The container takes no room: the canvas has no pixels (see [`collapse_observer`]).
     collapsed: bool,
@@ -349,6 +351,7 @@ impl WebglRenderer {
             cursor_row: -1,
             last_bg: 0,
             full_redraw: true,
+            model_drawn: false,
             dirty: BTreeSet::new(),
             collapsed: false,
             last_cursor: false,
@@ -479,9 +482,10 @@ impl Inner {
             return;
         }
         self.set_canvas_size();
-        // The last frame again until the visibility observer's redraw; when it cannot be drawn, that redraw
-        // comes as soon as possible
-        if !self.can_redraw_last_frame() || !self.draw(self.last_cursor, None) {
+        // The last frame again until the visibility observer's redraw, also when what changed while the pane was
+        // away (output, focus) waits for that redraw; when it cannot be drawn, the redraw comes as soon as possible
+        let drawn = self.can_redraw_last_frame() && self.draw(self.last_cursor, None);
+        if !drawn || self.full_redraw {
             self.request_redraw_all();
         }
     }
@@ -572,6 +576,7 @@ impl Inner {
             self.glyphs.clear();
         }
         self.full_redraw = true;
+        self.model_drawn = false;
     }
     fn update_dimensions(&mut self) {
         let (char_w, char_h) = self.char_size;
@@ -892,7 +897,8 @@ impl Inner {
             _ => self.update_model(viewport, &lines, layer.is_none() && blink_shown),
         }
         let cursor_drawn = layer.is_none() && blink_shown;
-        if self.draw(cursor_drawn, None) {
+        self.model_drawn = self.draw(cursor_drawn, None);
+        if self.model_drawn {
             self.draws = self.draws.wrapping_add(1);
             self.last_cursor = cursor_drawn;
             gpu::drew();
@@ -952,10 +958,10 @@ impl Inner {
         // After the redraw above, which read the surface at its full size
         gpu::trim(COMPACT_AFTER_MS);
     }
-    /// Whether the model, vertices and context can draw the canvas's last frame again: not when a frame is pending
-    /// that redraws everything (the model may be cleared), or the atlas moved glyphs the vertices point at.
+    /// Whether the model, vertices and context can draw the canvas's last frame again: not when the model was
+    /// cleared since, or the atlas moved glyphs the vertices point at.
     fn can_redraw_last_frame(&self) -> bool {
-        !self.full_redraw && gpu::is_live() && !self.glyphs.begin_frame()
+        self.model_drawn && gpu::is_live() && !self.glyphs.begin_frame()
     }
     /// Draws the model into the pane's canvas, or `region` of it into the cursor layer.
     fn draw(&self, cursor: bool, region: Option<Region>) -> bool {

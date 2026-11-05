@@ -147,6 +147,34 @@ test('a pane with display: none has no canvas pixels, and has its last frame bac
   assert.deepEqual(r, { hidden: [true, 0, 0], restoredSame: 0, afterSame: 0, shown: [false, true, true] });
 });
 
+// An app switching back to a pane focuses it as it shows it, and the pane's shell may have written while it was away:
+// the redraw these ask for waits for a frame, the page paints the last frame meanwhile instead of an empty canvas
+test('a pane shown again after output and a focus change has its last frame back before the page paints it', async () => {
+  const r = await inPage(async (text) => {
+    const frames = (n) => new Promise((resolve) => (n > 0 ? requestAnimationFrame(() => frames(n - 1).then(resolve)) : resolve()));
+    const p = new T.Pane(30, 4);
+    await p.write(text);
+    const before = await p.pixels();
+    p.container.style.display = 'none';
+    await frames(2);
+    await p.write('\r\nmore');
+    let restored = null;
+    const observer = new ResizeObserver(() => {
+      if (p.term.element.clientWidth > 0 && restored === null) restored = T.read(p.canvas);
+    });
+    observer.observe(p.term.element.querySelector('.xterm-screen'));
+    await frames(1);
+    p.container.style.display = '';
+    p.focus(true);
+    await frames(3);
+    observer.disconnect();
+    const out = { restoredSame: restored && T.diff(before, restored), updated: T.diff(before, await p.pixels()) > 0 };
+    p.dispose();
+    return out;
+  }, TEXT);
+  assert.deepEqual(r, { restoredSame: 0, updated: true });
+});
+
 test('a frame makes one WebGL draw call per layer that has something to draw', async () => {
   const r = await inPage(async (text) => {
     const p = new T.Pane(30, 4, { theme: { background: '#101010', cursor: '#ff0000' } });
