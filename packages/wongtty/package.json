@@ -1,6 +1,6 @@
 {
   "name": "wongtty",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Terminal emulator engine in Rust, compiled to WebAssembly. Feed it PTY bytes, render the rows that changed.",
   "type": "module",
   "main": "./dist/index.js",
